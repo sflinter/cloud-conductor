@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+dist/
+.conductor_state.json
+.conductor_cost_log.jsonl
