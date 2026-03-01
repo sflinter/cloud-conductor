@@ -31,8 +31,8 @@ Key modules:
 - `provisioner.py` — RunPod pod creation with GPU fallback list or auto-cheapest selection
 - `deployer.py` — rsync code + run setup_command (or skip for prebuilt Docker images)
 - `runner.py` — launches `run_command` via `nohup` over SSH, queries live GPU/CPU utilization
-- `monitor.py` — main loop: status checks, periodic sync, spot recovery, cost tracking, dependency resolution
-- `state.py` — `PodState` dataclass, JSON state file + JSONL cost log I/O
+- `monitor.py` — main loop: status checks, periodic sync, spot recovery, cost tracking, GPU stall detection, dependency resolution
+- `state.py` — `PodState` dataclass (includes `idle_since`, `stalled_since`), JSON state file + JSONL cost log I/O
 - `ssh.py` — SSH/rsync helpers (all connections use `-o StrictHostKeyChecking=no` for ephemeral pods)
 - `gpu_pricing.py` — queries RunPod API for GPU prices, caches 5 min
 - `notify.py` — notification dispatch (terminal-notifier, pushover, or custom command)

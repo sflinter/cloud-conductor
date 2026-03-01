@@ -154,6 +154,97 @@ def test_monitor_tick_idle_detection(mock_alive, mock_pod_exists, mock_start, mo
         mock_finish.assert_called_once()
 
 
+@patch("conductor.monitor.send_notification", return_value=False)
+@patch("conductor.monitor._start_unblocked_jobs")
+@patch("conductor.monitor.check_pod_exists", return_value=True)
+@patch("conductor.monitor.is_alive", return_value=True)
+@patch("conductor.monitor.get_utilization", return_value={"gpu_util": 2, "gpu_mem_used": 100, "gpu_mem_total": 8000})
+def test_monitor_tick_stall_detection(mock_util, mock_alive, mock_pod_exists, mock_start, mock_notify):
+    import time as _time
+    job = PodState(name="a", status="running", started_at=_time.time() - 100,
+                   gpu_cost_per_hour=0.12, ssh_host="1.2.3.4", ssh_port=22222, pid=123,
+                   pod_id="pod123", last_sync_at=_time.time())
+    state = RunState(jobs=[job], total_cost_usd=0.0, budget_usd=40.0)
+    config = _make_config(name="a", stall_timeout_minutes=0)  # immediate timeout
+    config_map = {"a": config}
+
+    with tempfile.NamedTemporaryFile(suffix=".json") as sf, \
+         tempfile.NamedTemporaryFile(suffix=".jsonl") as cf:
+        # First tick: sets stalled_since
+        config.stall_timeout_minutes = 1  # enable, but won't fire yet (just started)
+        _monitor_tick([config], config_map, state, sf.name, cf.name)
+        assert job.stalled_since is not None
+
+        # Force stalled_since into the past to trigger timeout
+        job.stalled_since = _time.time() - 120
+        with patch("conductor.monitor._finish_job") as mock_finish:
+            _monitor_tick([config], config_map, state, sf.name, cf.name)
+            mock_finish.assert_called_once()
+            assert mock_finish.call_args[1].get("error") == "gpu stall detected" or \
+                   mock_finish.call_args[0][4] == "failed"
+
+
+@patch("conductor.monitor.send_notification", return_value=False)
+@patch("conductor.monitor._start_unblocked_jobs")
+@patch("conductor.monitor.check_pod_exists", return_value=True)
+@patch("conductor.monitor.is_alive", return_value=True)
+@patch("conductor.monitor.get_utilization", return_value={"gpu_util": 80, "gpu_mem_used": 4000, "gpu_mem_total": 8000})
+def test_monitor_tick_stall_resets_on_active_gpu(mock_util, mock_alive, mock_pod_exists, mock_start, mock_notify):
+    import time as _time
+    job = PodState(name="a", status="running", started_at=_time.time() - 100,
+                   gpu_cost_per_hour=0.12, ssh_host="1.2.3.4", ssh_port=22222, pid=123,
+                   pod_id="pod123", last_sync_at=_time.time(),
+                   stalled_since=_time.time() - 60)
+    state = RunState(jobs=[job], total_cost_usd=0.0, budget_usd=40.0)
+    config = _make_config(name="a", stall_timeout_minutes=5)
+    config_map = {"a": config}
+
+    with tempfile.NamedTemporaryFile(suffix=".json") as sf, \
+         tempfile.NamedTemporaryFile(suffix=".jsonl") as cf:
+        _monitor_tick([config], config_map, state, sf.name, cf.name)
+        assert job.stalled_since is None
+
+
+@patch("conductor.monitor.send_notification", return_value=False)
+@patch("conductor.monitor._start_unblocked_jobs")
+@patch("conductor.monitor.check_pod_exists", return_value=True)
+@patch("conductor.monitor.is_alive", return_value=True)
+def test_monitor_tick_stall_noop_when_disabled(mock_alive, mock_pod_exists, mock_start, mock_notify):
+    import time as _time
+    job = PodState(name="a", status="running", started_at=_time.time() - 100,
+                   gpu_cost_per_hour=0.12, ssh_host="1.2.3.4", ssh_port=22222, pid=123,
+                   pod_id="pod123", last_sync_at=_time.time())
+    state = RunState(jobs=[job], total_cost_usd=0.0, budget_usd=40.0)
+    config = _make_config(name="a", stall_timeout_minutes=0)  # disabled
+    config_map = {"a": config}
+
+    with tempfile.NamedTemporaryFile(suffix=".json") as sf, \
+         tempfile.NamedTemporaryFile(suffix=".jsonl") as cf:
+        _monitor_tick([config], config_map, state, sf.name, cf.name)
+        assert job.stalled_since is None
+
+
+@patch("conductor.monitor.send_notification", return_value=False)
+@patch("conductor.monitor._start_unblocked_jobs")
+@patch("conductor.monitor.check_pod_exists", return_value=True)
+@patch("conductor.monitor.is_alive", return_value=True)
+@patch("conductor.monitor.get_utilization", return_value=None)
+def test_monitor_tick_stall_resets_on_util_none(mock_util, mock_alive, mock_pod_exists, mock_start, mock_notify):
+    import time as _time
+    job = PodState(name="a", status="running", started_at=_time.time() - 100,
+                   gpu_cost_per_hour=0.12, ssh_host="1.2.3.4", ssh_port=22222, pid=123,
+                   pod_id="pod123", last_sync_at=_time.time(),
+                   stalled_since=_time.time() - 60)
+    state = RunState(jobs=[job], total_cost_usd=0.0, budget_usd=40.0)
+    config = _make_config(name="a", stall_timeout_minutes=5)
+    config_map = {"a": config}
+
+    with tempfile.NamedTemporaryFile(suffix=".json") as sf, \
+         tempfile.NamedTemporaryFile(suffix=".jsonl") as cf:
+        _monitor_tick([config], config_map, state, sf.name, cf.name)
+        assert job.stalled_since is None
+
+
 @patch("conductor.monitor._provision_deploy_launch")
 def test_parallel_launch(mock_pdl):
     """Multiple unblocked jobs should launch in parallel via ThreadPoolExecutor."""

@@ -112,6 +112,31 @@ def test_ssh_key_path_expanded(sample_toml):
     assert configs[0].ssh_key_path == os.path.expanduser("~/.ssh/id_rsa")
 
 
+def test_stall_fields_propagate(tmp_dir):
+    path = os.path.join(tmp_dir, "jobs.toml")
+    with open(path, "w") as f:
+        f.write('''
+[global]
+gpu_type_id = "NVIDIA RTX A2000"
+stall_timeout_minutes = 10
+stall_gpu_threshold = 3
+
+[[jobs]]
+name = "a"
+run_command = "echo hi"
+
+[[jobs]]
+name = "b"
+run_command = "echo hi"
+stall_gpu_threshold = 8
+''')
+    configs = load_config(path)
+    assert configs[0].stall_timeout_minutes == 10
+    assert configs[0].stall_gpu_threshold == 3
+    assert configs[1].stall_timeout_minutes == 10
+    assert configs[1].stall_gpu_threshold == 8  # per-job override
+
+
 def test_notifications_config(tmp_dir):
     path = os.path.join(tmp_dir, "jobs.toml")
     with open(path, "w") as f:

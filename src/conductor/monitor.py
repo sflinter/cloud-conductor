@@ -13,7 +13,7 @@ from conductor.config import JobConfig
 from conductor.deployer import deploy
 from conductor.notify import send_notification
 from conductor.provisioner import check_pod_exists, provision_pod, teardown_pod
-from conductor.runner import get_log_path, is_alive, launch
+from conductor.runner import get_log_path, get_utilization, is_alive, launch
 from conductor.state import (
     PodState, RunState, append_cost_event, get_job, save_state,
 )
@@ -107,6 +107,26 @@ def _monitor_tick(
 
         if alive is True:
             job.idle_since = None
+
+            # GPU stall detection
+            if config.stall_timeout_minutes > 0:
+                util = get_utilization(job, config.ssh_key_path)
+                gpu_util = util.get("gpu_util") if util else None
+                if gpu_util is not None and gpu_util < config.stall_gpu_threshold:
+                    if job.stalled_since is None:
+                        job.stalled_since = time.time()
+                        log.info(f"[{job.name}] GPU util {gpu_util}% < {config.stall_gpu_threshold}%, starting stall timer")
+                    elif (time.time() - job.stalled_since) / 60 >= config.stall_timeout_minutes:
+                        log.warning(f"[{job.name}] GPU stall timeout reached ({config.stall_timeout_minutes}m)")
+                        _finish_job(job, config, state, cost_log_path, "failed", error="gpu stall detected")
+                        send_notification(config.notifications, "job_failed",
+                                          job=job.name, error="gpu stall detected")
+                        continue
+                else:
+                    if job.stalled_since is not None:
+                        log.info(f"[{job.name}] GPU active again, resetting stall timer")
+                    job.stalled_since = None
+
             # Periodic sync
             if config.sync_paths and job.last_sync_at:
                 elapsed_min = (time.time() - job.last_sync_at) / 60

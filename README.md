@@ -100,6 +100,8 @@ The TOML config has a `[global]` section for defaults and `[[jobs]]` entries for
 | `budget_usd` | `0` | Global budget limit (0 = unlimited) |
 | `job_budget_usd` | `0` | Per-job budget limit |
 | `idle_timeout_minutes` | `10` | Teardown pod if process not running for this long |
+| `stall_timeout_minutes` | `0` | Teardown if GPU util stays below threshold (0 = disabled) |
+| `stall_gpu_threshold` | `5` | GPU util % below which the job is considered stalled |
 | `keep_pod_alive` | `false` | Don't teardown on completion (for iterative dev) |
 | `depends_on` | `[]` | Job names that must complete before this job starts |
 

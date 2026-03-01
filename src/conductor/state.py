@@ -20,6 +20,7 @@ class PodState:
     started_at: float | None = None
     last_sync_at: float | None = None
     idle_since: float | None = None
+    stalled_since: float | None = None
     provision_attempts: int = 0
     cost_usd: float = 0.0
     job_budget_usd: float = 0.0

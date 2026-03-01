@@ -59,6 +59,8 @@ class JobConfig:
     budget_usd: float = 0.0
     job_budget_usd: float = 0.0
     idle_timeout_minutes: int = 10
+    stall_timeout_minutes: int = 0        # 0 = disabled
+    stall_gpu_threshold: int = 5          # GPU util % below which = stalled
     cost_per_hour_override: float = 0.0
 
     # Spot recovery

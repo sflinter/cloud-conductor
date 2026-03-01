@@ -167,6 +167,8 @@ sync_paths = [
 # Cost controls
 budget_usd = 40.00                    # global hard budget limit, teardown all when reached
 idle_timeout_minutes = 10             # teardown pod if job process not running for this long
+stall_timeout_minutes = 0             # 0 = disabled; teardown if GPU util stays below threshold
+stall_gpu_threshold = 5               # GPU util % below which the job is considered stalled
 cost_per_hour_override = 0.0          # 0 = auto-detect from RunPod API
 
 # Spot recovery
@@ -438,6 +440,7 @@ Minimal:
 | Spot interruption (pod evicted) | Automatic recovery: re-provision → re-deploy → push synced results → re-launch. Notify. |
 | Max provision attempts exceeded | Mark job as `failed`, stop retrying, notify |
 | Per-job budget exceeded | Final sync, teardown that pod, mark as `failed`, notify |
+| GPU stall (process alive, GPU idle) | Final sync, teardown pod, mark as `failed`, notify |
 | Global budget limit reached | Final sync all pods, teardown all pods, notify, exit |
 | Dependency failed | Mark dependent jobs as `skipped`, notify |
 | Ctrl+C | Graceful shutdown: final sync all pods, teardown all pods (unless `keep_pod_alive`), save state, exit |
@@ -460,6 +463,12 @@ After launching a job, the monitor periodically checks if the process is still r
 3. Mark the job as `completed` (assumption: process exited cleanly)
 
 This prevents paying for idle pods after training completes — the single most common source of wasted spend in the current system.
+
+## GPU Stall Detection
+
+Detects jobs where the process is alive but the GPU is idle (e.g. hung training loop, deadlock). When `stall_timeout_minutes > 0`, the monitor calls `get_utilization()` each tick while the process is alive. If GPU utilization stays below `stall_gpu_threshold` (default 5%) for longer than `stall_timeout_minutes`, the job is marked as `failed` with error "gpu stall detected" and the pod is torn down.
+
+Safety: if `get_utilization()` returns `None` (SSH failure, nvidia-smi missing), the stall timer is reset — no false positives from transient connectivity issues.
 
 ## Resume Behavior
 
