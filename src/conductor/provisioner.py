@@ -59,7 +59,7 @@ def provision_pod(config: JobConfig, pod_state: PodState) -> PodState:
         if config.cost_per_hour_override > 0:
             pod_state.gpu_cost_per_hour = config.cost_per_hour_override
         else:
-            pod_state.gpu_cost_per_hour = get_gpu_price(gpu_id, config.cloud_type)
+            pod_state.gpu_cost_per_hour = _get_pod_cost(pod["id"], gpu_id, config.cloud_type)
 
         # Wait for SSH details from RunPod API
         ssh_info = _wait_for_ssh_info(pod_state.pod_id)
@@ -101,6 +101,17 @@ def _get_gpu_candidates(config: JobConfig) -> list[str]:
             candidates.append(config.gpu_type_id)
         candidates.extend(config.gpu_type_ids_fallback)
         return candidates
+
+
+def _get_pod_cost(pod_id: str, gpu_id: str, cloud_type: str) -> float:
+    try:
+        pod = runpod.get_pod(pod_id)
+        cost = pod.get("costPerHr", 0) if pod else 0
+        if cost and cost > 0:
+            return float(cost)
+    except Exception:
+        pass
+    return get_gpu_price(gpu_id, cloud_type)
 
 
 def _wait_for_ssh_info(pod_id: str, timeout: int = 300) -> tuple[str, int] | None:

@@ -1,7 +1,7 @@
 from unittest.mock import patch, MagicMock
 
 from conductor.config import JobConfig
-from conductor.provisioner import provision_pod, check_pod_exists, teardown_pod, _get_gpu_candidates
+from conductor.provisioner import provision_pod, check_pod_exists, teardown_pod, _get_gpu_candidates, _get_pod_cost
 from conductor.state import PodState
 
 
@@ -19,9 +19,9 @@ def _make_pod(**overrides):
 
 
 @patch("conductor.provisioner.wait_ssh", return_value=True)
-@patch("conductor.provisioner.get_gpu_price", return_value=0.12)
+@patch("conductor.provisioner._get_pod_cost", return_value=0.12)
 @patch("conductor.provisioner.runpod")
-def test_provision_success(mock_runpod, mock_price, mock_ssh):
+def test_provision_success(mock_runpod, mock_cost, mock_ssh):
     mock_runpod.create_pod.return_value = {"id": "pod123"}
     mock_runpod.get_pod.return_value = {
         "runtime": {"ports": [{"privatePort": 22, "ip": "1.2.3.4", "publicPort": 22222}]},
@@ -47,9 +47,9 @@ def test_provision_all_fail(mock_runpod):
 
 
 @patch("conductor.provisioner.wait_ssh", return_value=True)
-@patch("conductor.provisioner.get_gpu_price", return_value=0.25)
+@patch("conductor.provisioner._get_pod_cost", return_value=0.25)
 @patch("conductor.provisioner.runpod")
-def test_provision_fallback(mock_runpod, mock_price, mock_ssh):
+def test_provision_fallback(mock_runpod, mock_cost, mock_ssh):
     # First GPU fails, second succeeds
     mock_runpod.create_pod.side_effect = [
         Exception("no capacity"),
@@ -85,6 +85,21 @@ def test_get_gpu_candidates_auto(mock_select):
     mock_select.return_value = [mock_gpu]
     config = _make_config(auto_select_cheapest_gpu=True)
     assert _get_gpu_candidates(config) == ["CHEAP_GPU"]
+
+
+@patch("conductor.provisioner.get_gpu_price", return_value=0.15)
+@patch("conductor.provisioner.runpod")
+def test_get_pod_cost_from_api(mock_runpod, mock_gpu_price):
+    mock_runpod.get_pod.return_value = {"costPerHr": 0.24}
+    assert _get_pod_cost("pod123", "GPU_X", "ALL") == 0.24
+    mock_gpu_price.assert_not_called()
+
+
+@patch("conductor.provisioner.get_gpu_price", return_value=0.15)
+@patch("conductor.provisioner.runpod")
+def test_get_pod_cost_fallback(mock_runpod, mock_gpu_price):
+    mock_runpod.get_pod.return_value = {}  # no costPerHr
+    assert _get_pod_cost("pod123", "GPU_X", "ALL") == 0.15
 
 
 @patch("conductor.provisioner.runpod")
