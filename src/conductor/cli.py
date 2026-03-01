@@ -5,14 +5,16 @@ import argparse
 import logging
 import os
 import sys
+import textwrap
 import time
 
+from conductor import __version__
 from conductor.config import load_config
 from conductor.gpu_pricing import get_gpu_price, select_cheapest_gpus
 from conductor.monitor import run_lifecycle
 from conductor.provisioner import check_pod_exists, teardown_pod
-from conductor.runner import get_log_path
-from conductor.ssh import ssh_exec, ssh_interactive, tail_remote_log
+from conductor.runner import get_log_path, get_utilization
+from conductor.ssh import ssh_exec, ssh_interactive, tail_remote_log, tail_remote_log_subprocess
 from conductor.state import (
     RunState, append_cost_event, get_job, init_state, load_state,
     read_cost_log, save_state,
@@ -21,12 +23,13 @@ from conductor.syncer import sync_pull
 from conductor.validator import validate
 
 
-def main(argv=None):
+def _build_parser() -> argparse.ArgumentParser:
     parent = argparse.ArgumentParser(add_help=False)
     parent.add_argument("--config", default=argparse.SUPPRESS, help="Path to TOML config file")
 
     parser = argparse.ArgumentParser(prog="conductor", description="Cloud Conductor — RunPod GPU orchestrator")
-    parser.add_argument("--config", default="jobs.toml", help="Path to TOML config file")
+    parser.add_argument("--config", default=None, help="Path to TOML config file")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = parser.add_subparsers(dest="command")
 
     # run
@@ -64,6 +67,65 @@ def main(argv=None):
     # report
     sub.add_parser("report", parents=[parent], help="Cost report from historical data")
 
+    # version
+    sub.add_parser("version", help="Show version")
+
+    # init
+    p_init = sub.add_parser("init", help="Generate a starter conductor.toml")
+    p_init.add_argument("--force", action="store_true", help="Overwrite existing file")
+
+    # completions
+    p_comp = sub.add_parser("completions", help="Generate shell completion script")
+    p_comp.add_argument("shell", choices=["bash", "zsh"], help="Shell type")
+
+    # attach
+    p_attach = sub.add_parser("attach", parents=[parent], help="Attach to job log with auto-reconnect")
+    p_attach.add_argument("job_name", help="Job name")
+
+    return parser
+
+
+def _resolve_config(args) -> str:
+    if args.config is not None:
+        return args.config
+    if os.path.exists("conductor.toml"):
+        return "conductor.toml"
+    return "jobs.toml"
+
+
+def _ensure_api_key():
+    api_key = os.environ.get("RUNPOD_API_KEY", "")
+    if not api_key:
+        print("Error: RUNPOD_API_KEY environment variable is not set.\n"
+              "Get your API key from https://www.runpod.io/console/user/settings\n"
+              "Then: export RUNPOD_API_KEY=your_key_here", file=sys.stderr)
+        sys.exit(1)
+    import runpod
+    runpod.api_key = api_key
+
+
+_STARTER_TOML = textwrap.dedent("""\
+    # Cloud Conductor configuration
+    # Docs: https://github.com/sflinter/cloud-conductor
+
+    [global]
+    # gpu_type_id = "NVIDIA RTX A5000"
+    # gpu_type_ids_fallback = ["NVIDIA RTX A4000"]
+    image_name = "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04"
+    ssh_key_path = "~/.ssh/id_rsa"
+    remote_project_dir = "/workspace/project"
+    # budget_usd = 10.00
+
+    [[jobs]]
+    name = "train"
+    gpu_type_id = "NVIDIA RTX A5000"
+    run_command = "python train.py"
+    # sync_paths = ["outputs/"]
+""")
+
+
+def main(argv=None):
+    parser = _build_parser()
     args = parser.parse_args(argv)
     if not args.command:
         parser.print_help()
@@ -71,6 +133,23 @@ def main(argv=None):
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
                         datefmt="%H:%M:%S")
+
+    # Commands that don't need a config file
+    if args.command in ("version", "init", "completions"):
+        dispatch_no_config = {
+            "version": cmd_version,
+            "init": cmd_init,
+            "completions": cmd_completions,
+        }
+        try:
+            dispatch_no_config[args.command](args, parser)
+        except KeyboardInterrupt:
+            print("\nInterrupted.")
+            sys.exit(130)
+        return
+
+    # Resolve config for commands that need it
+    args.config = _resolve_config(args)
 
     try:
         dispatch = {
@@ -83,6 +162,7 @@ def main(argv=None):
             "logs": cmd_logs,
             "ssh": cmd_ssh,
             "report": cmd_report,
+            "attach": cmd_attach,
         }
         dispatch[args.command](args)
     except KeyboardInterrupt:
@@ -93,12 +173,27 @@ def main(argv=None):
         sys.exit(1)
 
 
-def _ensure_api_key():
-    """Ensure RunPod API key is set on the SDK (env var may not be picked up after import)."""
-    api_key = os.environ.get("RUNPOD_API_KEY", "")
-    if api_key:
-        import runpod
-        runpod.api_key = api_key
+def cmd_version(args, parser=None):
+    print(f"conductor {__version__}")
+
+
+def cmd_init(args, parser=None):
+    dest = "conductor.toml"
+    if os.path.exists(dest) and not args.force:
+        print(f"{dest} already exists. Use --force to overwrite.")
+        sys.exit(1)
+    with open(dest, "w") as f:
+        f.write(_STARTER_TOML)
+    print(f"Created {dest}")
+
+
+def cmd_completions(args, parser=None):
+    try:
+        import shtab
+    except ImportError:
+        print("shtab is required for completions: uv add --dev shtab", file=sys.stderr)
+        sys.exit(1)
+    print(shtab.complete(parser, args.shell))
 
 
 def cmd_run(args):
@@ -141,6 +236,7 @@ def cmd_run(args):
 
 def cmd_status(args):
     configs = load_config(args.config)
+    config_map = {c.name: c for c in configs}
     state_path = configs[0].state_file
     if not os.path.exists(state_path):
         print("No state file found. Run 'conductor run' first.")
@@ -148,7 +244,17 @@ def cmd_status(args):
 
     state = load_state(state_path)
 
-    header = f"{'Job':<16} {'Pod':<14} {'GPU':<24} {'Status':<12} {'Elapsed':<10} {'Cost':<8}"
+    # Fetch utilization for running jobs
+    util_map: dict[str, dict] = {}
+    for job in state.jobs:
+        if job.status == "running" and job.ssh_host and job.pid:
+            config = config_map.get(job.name)
+            if config:
+                metrics = get_utilization(job, config.ssh_key_path)
+                if metrics:
+                    util_map[job.name] = metrics
+
+    header = f"{'Job':<16} {'Pod':<14} {'GPU':<24} {'Status':<12} {'GPU%':<6}{'CPU%':<6}{'Elapsed':<10} {'Cost':<8}"
     sep = "─" * len(header)
     print(f"{header}\n{sep}")
     for job in state.jobs:
@@ -160,10 +266,19 @@ def cmd_status(args):
             h, m = int(secs // 3600), int((secs % 3600) // 60)
             elapsed = f"{h}h {m:02d}m"
         cost = f"${job.cost_usd:.2f}" if job.cost_usd > 0 else "---"
+
+        metrics = util_map.get(job.name)
+        if metrics:
+            gpu_pct = f"{metrics['gpu_util']}%" if "gpu_util" in metrics else "---"
+            cpu_pct = f"{metrics['cpu_util']:.0f}%" if "cpu_util" in metrics else "---"
+        else:
+            gpu_pct = "---"
+            cpu_pct = "---"
+
         info = job.error or ""
         if job.depends_on and job.status == "pending":
             info = f"waiting on {', '.join(job.depends_on)}"
-        print(f"{job.name:<16} {pod_id:<14} {gpu:<24} {job.status:<12} {elapsed:<10} {cost:<8} {info}")
+        print(f"{job.name:<16} {pod_id:<14} {gpu:<24} {job.status:<12} {gpu_pct:<6}{cpu_pct:<6}{elapsed:<10} {cost:<8} {info}")
 
     if state.budget_usd > 0:
         print(f"\nBudget: ${state.budget_usd:.2f} | Spent: ${state.total_cost_usd:.2f} | "
@@ -196,6 +311,7 @@ def cmd_sync(args):
 
 
 def cmd_teardown(args):
+    _ensure_api_key()
     job_names = args.jobs.split(",") if args.jobs else None
     configs = load_config(args.config, job_names=job_names)
     state_path = configs[0].state_file
@@ -232,6 +348,7 @@ def cmd_teardown(args):
 
 
 def cmd_dry_run(args):
+    _ensure_api_key()
     configs = load_config(args.config)
 
     print("=== Dry Run ===\n")
@@ -423,6 +540,52 @@ def cmd_report(args):
     budget = configs[0].budget_usd
     if budget > 0:
         print(f"\nBudget: ${budget:.2f} | Spent: ${total_cost:.2f} | Remaining: ${max(0, budget - total_cost):.2f}")
+
+
+def cmd_attach(args):
+    configs = load_config(args.config)
+    config_map = {c.name: c for c in configs}
+    state_path = configs[0].state_file
+
+    config = config_map.get(args.job_name)
+    if not config:
+        print(f"Unknown job: {args.job_name}")
+        sys.exit(1)
+
+    log_path = get_log_path(config)
+
+    while True:
+        if not os.path.exists(state_path):
+            print("No state file found.")
+            sys.exit(1)
+
+        state = load_state(state_path)
+        job = get_job(state, args.job_name)
+        if not job:
+            print(f"Unknown job: {args.job_name}")
+            sys.exit(1)
+
+        if job.status in ("completed", "failed", "skipped"):
+            print(f"Job '{args.job_name}' is {job.status}.")
+            break
+
+        if not job.ssh_host:
+            print(f"Waiting for pod SSH to become available...")
+            time.sleep(5)
+            continue
+
+        print(f"Attaching to {args.job_name} ({job.ssh_host}:{job.ssh_port})...")
+        rc = tail_remote_log_subprocess(job.ssh_host, job.ssh_port, config.ssh_key_path, log_path)
+
+        # Reload state to check if job is still running (SSH info may have changed after spot recovery)
+        state = load_state(state_path)
+        job = get_job(state, args.job_name)
+        if not job or job.status in ("completed", "failed", "skipped"):
+            print(f"\nJob '{args.job_name}' is {job.status if job else 'gone'}.")
+            break
+
+        print(f"\nSSH disconnected (exit {rc}). Reconnecting...")
+        time.sleep(3)
 
 
 if __name__ == "__main__":

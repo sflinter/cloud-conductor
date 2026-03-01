@@ -56,11 +56,11 @@ Full lifecycle: provision → deploy → launch → monitor → sync → teardow
 Reads the state file and queries RunPod API to show a table:
 
 ```
-Job     Pod          GPU              Status     Elapsed    Cost     Info
-─────────────────────────────────────────────────────────────────────────
-3p      abc123def4   RTX 2000 Ada     running    2h 15m     $0.27    gen 5/15
-4p      xyz789ghi0   RTX A4000        completed  4h 02m     $0.97    gen 15/15
-5p      ---          ---              pending    ---        ---      queued (waiting on 4p)
+Job     Pod          GPU              Status     GPU%  CPU%  Elapsed    Cost     Info
+────────────────────────────────────────────────────────────────────────────────────────
+3p      abc123def4   RTX 2000 Ada     running    45%   23%   2h 15m     $0.27    gen 5/15
+4p      xyz789ghi0   RTX A4000        completed  ---   ---   4h 02m     $0.97    gen 15/15
+5p      ---          ---              pending    ---   ---   ---        ---      queued (waiting on 4p)
 ```
 
 ### `conductor sync`
@@ -353,7 +353,7 @@ Waits for SSH to become available (polls RunPod API for port mapping, then tests
 
 When reusing a pod (`keep_pod_alive`), rsync mode re-syncs code (fast incremental) but skips `setup_command` (deps already installed).
 
-**`runner.py`** — Launches `run_command` on the pod via `nohup bash -c '...' > log 2>&1 </dev/null &`. Checks whether the process is still running via `ps aux | grep` over SSH. Captures the remote PID for reliable process tracking.
+**`runner.py`** — Launches `run_command` on the pod via a detached launch script. Checks whether the process is still running via `kill -0` over SSH. Captures the remote PID for reliable process tracking. Queries live GPU utilization (`nvidia-smi`) and CPU utilization (`ps`) for `conductor status`.
 
 **`syncer.py`** — Rsyncs configured `sync_paths` from pod to local machine. Each sync path specifies a remote path (relative to `remote_project_dir`) and a local destination. Also supports push direction (local → remote) for spot recovery checkpoint restoration.
 

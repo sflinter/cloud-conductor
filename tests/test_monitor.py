@@ -1,6 +1,7 @@
 from unittest.mock import patch, MagicMock
 import os
 import tempfile
+import threading
 
 from conductor.config import JobConfig
 from conductor.monitor import (
@@ -151,3 +152,31 @@ def test_monitor_tick_idle_detection(mock_alive, mock_pod_exists, mock_start, mo
         # Second tick: idle timeout reached (0 minutes)
         _monitor_tick([config], config_map, state, sf.name, cf.name)
         mock_finish.assert_called_once()
+
+
+@patch("conductor.monitor._provision_deploy_launch")
+def test_parallel_launch(mock_pdl):
+    """Multiple unblocked jobs should launch in parallel via ThreadPoolExecutor."""
+    state = RunState(jobs=[
+        PodState(name="a", status="pending"),
+        PodState(name="b", status="pending"),
+        PodState(name="c", status="pending"),
+    ])
+    configs = [_make_config(name="a"), _make_config(name="b"), _make_config(name="c")]
+    config_map = {c.name: c for c in configs}
+
+    launched_threads = []
+
+    def _track_thread(job, config, state, state_path, cost_log_path, lock=None):
+        launched_threads.append(threading.current_thread().name)
+
+    mock_pdl.side_effect = _track_thread
+
+    with tempfile.NamedTemporaryFile(suffix=".json") as sf, \
+         tempfile.NamedTemporaryFile(suffix=".jsonl") as cf:
+        _start_unblocked_jobs(configs, config_map, state, sf.name, cf.name)
+
+    assert mock_pdl.call_count == 3
+    # Verify lock was passed (parallel path)
+    for call in mock_pdl.call_args_list:
+        assert call.kwargs.get("lock") is not None or (len(call.args) > 5 and call.args[5] is not None)

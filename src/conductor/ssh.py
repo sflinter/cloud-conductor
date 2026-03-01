@@ -73,3 +73,10 @@ def ssh_interactive(host: str, port: int, key_path: str) -> None:
 def tail_remote_log(host: str, port: int, key_path: str, remote_log: str) -> None:
     cmd = [*_ssh_base(host, port, key_path), f"tail -f {remote_log}"]
     os.execvp("ssh", cmd)
+
+
+def tail_remote_log_subprocess(host: str, port: int, key_path: str, remote_log: str) -> int:
+    """Like tail_remote_log but returns on disconnect instead of replacing the process."""
+    cmd = [*_ssh_base(host, port, key_path), f"tail -f {remote_log}"]
+    result = subprocess.run(cmd)
+    return result.returncode

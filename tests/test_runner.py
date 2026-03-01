@@ -2,7 +2,7 @@ from unittest.mock import patch
 import subprocess
 
 from conductor.config import JobConfig
-from conductor.runner import launch, is_alive
+from conductor.runner import launch, is_alive, get_utilization
 from conductor.state import PodState
 
 
@@ -20,12 +20,10 @@ def test_launch_success(mock_ssh):
     pod = PodState(name="test", ssh_host="1.2.3.4", ssh_port=22222)
     pid = launch(config, pod)
     assert pid == 12345
-    # Verify nohup command format
-    cmd = mock_ssh.call_args[0][3]
-    assert "nohup" in cmd
-    assert "bash -c" in cmd
-    assert "</dev/null &" in cmd
-    assert "echo $!" in cmd
+    # Two calls: write script + execute it
+    assert mock_ssh.call_count == 2
+    run_cmd = mock_ssh.call_args_list[1][0][3]
+    assert ".conductor_launch.sh" in run_cmd
 
 
 @patch("conductor.runner.ssh_exec")
@@ -60,3 +58,41 @@ def test_is_alive_unreachable(mock_ssh):
 def test_is_alive_no_pid():
     pod = PodState(name="test", ssh_host="1.2.3.4", ssh_port=22222, pid=None)
     assert is_alive(pod, "/key") is False
+
+
+@patch("conductor.runner.ssh_exec")
+def test_get_utilization_success(mock_ssh):
+    mock_ssh.return_value = subprocess.CompletedProcess(
+        [], 0, stdout="45, 12000, 24576\n---\n 23.5\n", stderr="")
+    pod = PodState(name="test", ssh_host="1.2.3.4", ssh_port=22222, pid=999)
+    result = get_utilization(pod, "/key")
+    assert result == {"gpu_util": 45, "gpu_mem_used": 12000, "gpu_mem_total": 24576, "cpu_util": 23.5}
+    cmd = mock_ssh.call_args[0][3]
+    assert "nvidia-smi" in cmd
+    assert "ps -p 999" in cmd
+
+
+@patch("conductor.runner.ssh_exec")
+def test_get_utilization_no_gpu(mock_ssh):
+    mock_ssh.return_value = subprocess.CompletedProcess(
+        [], 0, stdout="\n---\n 99.2\n", stderr="")
+    pod = PodState(name="test", ssh_host="1.2.3.4", ssh_port=22222, pid=999)
+    result = get_utilization(pod, "/key")
+    assert result == {"cpu_util": 99.2}
+
+
+@patch("conductor.runner.ssh_exec")
+def test_get_utilization_ssh_failure(mock_ssh):
+    mock_ssh.side_effect = Exception("timeout")
+    pod = PodState(name="test", ssh_host="1.2.3.4", ssh_port=22222, pid=999)
+    assert get_utilization(pod, "/key") is None
+
+
+def test_get_utilization_no_ssh_info():
+    pod = PodState(name="test", pid=999)
+    assert get_utilization(pod, "/key") is None
+
+
+def test_get_utilization_no_pid():
+    pod = PodState(name="test", ssh_host="1.2.3.4", ssh_port=22222)
+    assert get_utilization(pod, "/key") is None

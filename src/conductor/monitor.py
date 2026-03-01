@@ -1,10 +1,13 @@
 # Copyright (c) 2026 Steve Flinter. MIT License.
 from __future__ import annotations
 
+import contextlib
 import logging
 import signal
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 from conductor.config import JobConfig
 from conductor.deployer import deploy
@@ -146,6 +149,7 @@ def _start_unblocked_jobs(
     state_path: str,
     cost_log_path: str,
 ) -> None:
+    ready = []
     for job in state.jobs:
         if job.status != "pending":
             continue
@@ -166,8 +170,26 @@ def _start_unblocked_jobs(
         if not _deps_met(job, state):
             continue
 
+        ready.append((job, config))
+
+    if not ready:
+        return
+
+    if len(ready) == 1:
+        job, config = ready[0]
         log.info(f"[{job.name}] Starting job")
         _provision_deploy_launch(job, config, state, state_path, cost_log_path)
+    else:
+        lock = threading.Lock()
+        log.info(f"Starting {len(ready)} jobs in parallel: {', '.join(j.name for j, _ in ready)}")
+
+        def _launch(pair):
+            job, config = pair
+            log.info(f"[{job.name}] Starting job")
+            _provision_deploy_launch(job, config, state, state_path, cost_log_path, lock=lock)
+
+        with ThreadPoolExecutor(max_workers=len(ready)) as pool:
+            list(pool.map(_launch, ready))
 
 
 def _provision_deploy_launch(
@@ -176,7 +198,9 @@ def _provision_deploy_launch(
     state: RunState,
     state_path: str,
     cost_log_path: str,
+    lock: threading.Lock | None = None,
 ) -> None:
+    cm = lock or contextlib.nullcontext()
     is_reuse = config.keep_pod_alive and job.pod_id is not None
 
     # Provision
@@ -187,15 +211,17 @@ def _provision_deploy_launch(
                           job=job.name, error=job.error)
         return
 
-    save_state(state, state_path)
-    append_cost_event(cost_log_path, {
-        "event": "pod_started", "job": job.name, "pod_id": job.pod_id,
-        "gpu_type": job.gpu_type, "cost_per_hour": job.gpu_cost_per_hour,
-    })
+    with cm:
+        save_state(state, state_path)
+        append_cost_event(cost_log_path, {
+            "event": "pod_started", "job": job.name, "pod_id": job.pod_id,
+            "gpu_type": job.gpu_type, "cost_per_hour": job.gpu_cost_per_hour,
+        })
 
     # Deploy
     job.status = "deploying"
-    save_state(state, state_path)
+    with cm:
+        save_state(state, state_path)
     if not deploy(config, job, is_reuse=is_reuse):
         job.status = "failed"
         job.error = "deploy failed"
@@ -222,7 +248,8 @@ def _provision_deploy_launch(
     job.status = "running"
     job.started_at = job.started_at or time.time()
     job.last_sync_at = time.time()
-    save_state(state, state_path)
+    with cm:
+        save_state(state, state_path)
 
 
 def _spot_recover(

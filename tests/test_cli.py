@@ -4,7 +4,7 @@ import tempfile
 
 import pytest
 
-from conductor.cli import main
+from conductor.cli import main, _resolve_config, _STARTER_TOML
 
 
 def test_help(capsys):
@@ -13,7 +13,8 @@ def test_help(capsys):
     assert exc.value.code == 0
     captured = capsys.readouterr()
     assert "conductor" in captured.out
-    for cmd in ["run", "status", "sync", "teardown", "dry-run", "validate", "logs", "ssh", "report"]:
+    for cmd in ["run", "status", "sync", "teardown", "dry-run", "validate",
+                "logs", "ssh", "report", "version", "init", "completions", "attach"]:
         assert cmd in captured.out
 
 
@@ -116,3 +117,71 @@ run_command = "echo eval"
     assert "train" in captured.out
     assert "eval" in captured.out
     assert "Depends on: train" in captured.out
+
+
+def test_version_flag(capsys):
+    with pytest.raises(SystemExit) as exc:
+        main(["--version"])
+    assert exc.value.code == 0
+    captured = capsys.readouterr()
+    assert "conductor" in captured.out
+
+
+def test_version_subcommand(capsys):
+    main(["version"])
+    captured = capsys.readouterr()
+    assert "conductor" in captured.out
+
+
+def test_init_creates_file(capsys, tmp_dir, monkeypatch):
+    monkeypatch.chdir(tmp_dir)
+    main(["init"])
+    captured = capsys.readouterr()
+    assert "Created conductor.toml" in captured.out
+    assert os.path.exists(os.path.join(tmp_dir, "conductor.toml"))
+
+
+def test_init_refuses_overwrite(capsys, tmp_dir, monkeypatch):
+    monkeypatch.chdir(tmp_dir)
+    with open(os.path.join(tmp_dir, "conductor.toml"), "w") as f:
+        f.write("existing")
+    with pytest.raises(SystemExit) as exc:
+        main(["init"])
+    assert exc.value.code == 1
+
+
+def test_init_force_overwrite(capsys, tmp_dir, monkeypatch):
+    monkeypatch.chdir(tmp_dir)
+    with open(os.path.join(tmp_dir, "conductor.toml"), "w") as f:
+        f.write("existing")
+    main(["init", "--force"])
+    with open(os.path.join(tmp_dir, "conductor.toml")) as f:
+        assert "[[jobs]]" in f.read()
+
+
+def test_init_generates_valid_config(capsys, tmp_dir, monkeypatch):
+    monkeypatch.chdir(tmp_dir)
+    main(["init"])
+    main(["validate", "--config", os.path.join(tmp_dir, "conductor.toml")])
+    captured = capsys.readouterr()
+    assert "Config OK" in captured.out
+
+
+def test_completions_bash(capsys):
+    main(["completions", "bash"])
+    captured = capsys.readouterr()
+    assert "complete" in captured.out or "COMPREPLY" in captured.out
+
+
+def test_config_auto_discovery(tmp_dir, monkeypatch):
+    monkeypatch.chdir(tmp_dir)
+    import argparse
+    args = argparse.Namespace(config=None)
+    assert _resolve_config(args) == "jobs.toml"
+
+    with open(os.path.join(tmp_dir, "conductor.toml"), "w") as f:
+        f.write("x")
+    assert _resolve_config(args) == "conductor.toml"
+
+    args.config = "custom.toml"
+    assert _resolve_config(args) == "custom.toml"
