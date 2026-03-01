@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Steve Flinter. MIT License.
 from __future__ import annotations
 
 import argparse
@@ -22,9 +23,10 @@ from conductor.validator import validate
 
 def main(argv=None):
     parent = argparse.ArgumentParser(add_help=False)
-    parent.add_argument("--config", default="jobs.toml", help="Path to TOML config file")
+    parent.add_argument("--config", default=argparse.SUPPRESS, help="Path to TOML config file")
 
     parser = argparse.ArgumentParser(prog="conductor", description="Cloud Conductor — RunPod GPU orchestrator")
+    parser.add_argument("--config", default="jobs.toml", help="Path to TOML config file")
     sub = parser.add_subparsers(dest="command")
 
     # run
@@ -91,7 +93,16 @@ def main(argv=None):
         sys.exit(1)
 
 
+def _ensure_api_key():
+    """Ensure RunPod API key is set on the SDK (env var may not be picked up after import)."""
+    api_key = os.environ.get("RUNPOD_API_KEY", "")
+    if api_key:
+        import runpod
+        runpod.api_key = api_key
+
+
 def cmd_run(args):
+    _ensure_api_key()
     job_names = args.jobs.split(",") if args.jobs else None
     configs = load_config(args.config, job_names=job_names)
 

@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Steve Flinter. MIT License.
 from __future__ import annotations
 
 import json

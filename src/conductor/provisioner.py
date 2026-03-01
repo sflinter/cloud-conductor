@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Steve Flinter. MIT License.
 from __future__ import annotations
 
 import logging
@@ -40,6 +41,8 @@ def provision_pod(config: JobConfig, pod_state: PodState) -> PodState:
                 container_disk_in_gb=config.container_disk_in_gb,
                 volume_in_gb=config.volume_in_gb if config.volume_in_gb > 0 else None,
                 volume_mount_path=config.volume_mount_path if config.volume_in_gb > 0 else None,
+                ports="22/tcp",
+                support_public_ip=True,
             )
         except Exception as e:
             log.warning(f"[{config.name}] Failed to create pod with {gpu_id}: {e}")
