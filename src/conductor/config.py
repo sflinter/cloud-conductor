@@ -48,6 +48,7 @@ class JobConfig:
         ".venv/", "__pycache__/", "*.pyc", ".git/",
     ])
     setup_command: str = ""
+    upload_paths: list[SyncPath] = field(default_factory=list)
 
     # Sync
     sync_interval_minutes: int = 5
@@ -106,9 +107,11 @@ def load_config(path: str, job_names: list[str] | None = None) -> list[JobConfig
     if "notifications" in global_cfg:
         global_notifications = _parse_notifications(global_cfg.pop("notifications"))
 
-    # Parse global sync_paths
+    # Parse global sync_paths and upload_paths
     if "sync_paths" in global_cfg:
         global_cfg["sync_paths"] = _parse_sync_paths(global_cfg["sync_paths"])
+    if "upload_paths" in global_cfg:
+        global_cfg["upload_paths"] = _parse_sync_paths(global_cfg["upload_paths"])
 
     configs = []
     for job in jobs_raw:
@@ -128,7 +131,7 @@ def load_config(path: str, job_names: list[str] | None = None) -> list[JobConfig
         for k, v in job.items():
             if k == "notifications":
                 job_notifications = _parse_notifications(v)
-            elif k == "sync_paths":
+            elif k in ("sync_paths", "upload_paths"):
                 merged[k] = _parse_sync_paths(v)
             elif k in _ALL_FIELDS:
                 merged[k] = v

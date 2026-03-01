@@ -21,44 +21,46 @@ from conductor.validator import validate
 
 
 def main(argv=None):
+    parent = argparse.ArgumentParser(add_help=False)
+    parent.add_argument("--config", default="jobs.toml", help="Path to TOML config file")
+
     parser = argparse.ArgumentParser(prog="conductor", description="Cloud Conductor — RunPod GPU orchestrator")
-    parser.add_argument("--config", default="jobs.toml", help="Path to TOML config file")
     sub = parser.add_subparsers(dest="command")
 
     # run
-    p_run = sub.add_parser("run", help="Full lifecycle: provision → deploy → launch → monitor → teardown")
+    p_run = sub.add_parser("run", parents=[parent], help="Full lifecycle: provision → deploy → launch → monitor → teardown")
     p_run.add_argument("--jobs", help="Comma-separated job names to run")
     p_run.add_argument("--budget", type=float, default=0.0, help="Override global budget")
 
     # status
-    sub.add_parser("status", help="Show current job status")
+    sub.add_parser("status", parents=[parent], help="Show current job status")
 
     # sync
-    p_sync = sub.add_parser("sync", help="Force sync results from all running pods")
+    p_sync = sub.add_parser("sync", parents=[parent], help="Force sync results from all running pods")
     p_sync.add_argument("--jobs", help="Comma-separated job names to sync")
 
     # teardown
-    p_td = sub.add_parser("teardown", help="Terminate all tracked pods")
+    p_td = sub.add_parser("teardown", parents=[parent], help="Terminate all tracked pods")
     p_td.add_argument("--jobs", help="Comma-separated job names to teardown")
     p_td.add_argument("--force", action="store_true", help="Skip confirmation prompt")
 
     # dry-run
-    sub.add_parser("dry-run", help="Show what would be provisioned")
+    sub.add_parser("dry-run", parents=[parent], help="Show what would be provisioned")
 
     # validate
-    sub.add_parser("validate", help="Pre-flight config validation")
+    sub.add_parser("validate", parents=[parent], help="Pre-flight config validation")
 
     # logs
-    p_logs = sub.add_parser("logs", help="View remote job log")
+    p_logs = sub.add_parser("logs", parents=[parent], help="View remote job log")
     p_logs.add_argument("job_name", help="Job name")
     p_logs.add_argument("--tail", action="store_true", help="Stream log in real time")
 
     # ssh
-    p_ssh = sub.add_parser("ssh", help="SSH into a job's pod")
+    p_ssh = sub.add_parser("ssh", parents=[parent], help="SSH into a job's pod")
     p_ssh.add_argument("job_name", help="Job name")
 
     # report
-    sub.add_parser("report", help="Cost report from historical data")
+    sub.add_parser("report", parents=[parent], help="Cost report from historical data")
 
     args = parser.parse_args(argv)
     if not args.command:

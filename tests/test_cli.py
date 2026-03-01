@@ -24,7 +24,6 @@ def test_no_command(capsys):
 
 
 def test_validate_command(capsys, tmp_dir):
-    # Create a valid config with a real SSH key
     key_path = os.path.join(tmp_dir, "test_key")
     with open(key_path, "w") as f:
         f.write("fake key")
@@ -43,7 +42,7 @@ name = "test"
 run_command = "echo hi"
 ''')
 
-    main(["--config", config_path, "validate"])
+    main(["validate", "--config", config_path])
     captured = capsys.readouterr()
     assert "Config OK" in captured.out
 
@@ -59,7 +58,7 @@ ssh_key_path = "/no/such/key"
 ''')
 
     with pytest.raises(SystemExit) as exc:
-        main(["--config", config_path, "validate"])
+        main(["validate", "--config", config_path])
     assert exc.value.code == 1
 
 
@@ -73,7 +72,7 @@ run_command = "echo hi"
 state_file = "{}/state.json"
 '''.format(tmp_dir))
 
-    main(["--config", config_path, "status"])
+    main(["status", "--config", config_path])
     captured = capsys.readouterr()
     assert "No state file" in captured.out
 
@@ -88,7 +87,7 @@ run_command = "echo hi"
 cost_log_file = "{tmp_dir}/cost.jsonl"
 ''')
 
-    main(["--config", config_path, "report"])
+    main(["report", "--config", config_path])
     captured = capsys.readouterr()
     assert "No cost data" in captured.out
 
@@ -111,7 +110,7 @@ depends_on = ["train"]
 run_command = "echo eval"
 ''')
 
-    main(["--config", config_path, "dry-run"])
+    main(["dry-run", "--config", config_path])
     captured = capsys.readouterr()
     assert "Dry Run" in captured.out
     assert "train" in captured.out

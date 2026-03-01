@@ -39,12 +39,39 @@ def test_deploy_full_sequence(mock_ssh, mock_rsync):
 
 @patch("conductor.deployer.rsync")
 @patch("conductor.deployer.ssh_exec")
-def test_deploy_image_mode_skips(mock_ssh, mock_rsync):
-    config = _make_config(deploy_method="image")
+def test_deploy_image_mode_skips_rsync(mock_ssh, mock_rsync):
+    config = _make_config(deploy_method="image", setup_command="")
     pod = _make_pod()
     assert deploy(config, pod) is True
     mock_ssh.assert_not_called()
     mock_rsync.assert_not_called()
+
+
+@patch("conductor.deployer.rsync")
+@patch("conductor.deployer.ssh_exec")
+def test_deploy_image_mode_runs_setup(mock_ssh, mock_rsync):
+    mock_ssh.return_value = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+    config = _make_config(deploy_method="image")
+    pod = _make_pod()
+    assert deploy(config, pod) is True
+    setup_calls = [c for c in mock_ssh.call_args_list if "pip install" in str(c)]
+    assert len(setup_calls) == 1
+
+
+@patch("conductor.deployer.rsync")
+@patch("conductor.deployer.ssh_exec")
+def test_deploy_image_mode_upload_paths(mock_ssh, mock_rsync):
+    from conductor.config import SyncPath
+    mock_ssh.return_value = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+    mock_rsync.return_value = subprocess.CompletedProcess([], 0)
+    config = _make_config(
+        deploy_method="image", setup_command="",
+        upload_paths=[SyncPath(local="/local/seed/", remote="models/seed/")],
+    )
+    pod = _make_pod()
+    assert deploy(config, pod) is True
+    # rsync called once for the upload path (+ install rsync ssh call)
+    assert mock_rsync.call_count == 1
 
 
 @patch("conductor.deployer.rsync")
