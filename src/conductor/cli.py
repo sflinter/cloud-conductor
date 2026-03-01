@@ -38,7 +38,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--budget", type=float, default=0.0, help="Override global budget")
 
     # status
-    sub.add_parser("status", parents=[parent], help="Show current job status")
+    p_status = sub.add_parser("status", parents=[parent], help="Show current job status")
+    p_status.add_argument("--util", action="store_true", help="Query live GPU/CPU utilization (requires SSH)")
 
     # sync
     p_sync = sub.add_parser("sync", parents=[parent], help="Force sync results from all running pods")
@@ -244,17 +245,23 @@ def cmd_status(args):
 
     state = load_state(state_path)
 
-    # Fetch utilization for running jobs
-    util_map: dict[str, dict] = {}
-    for job in state.jobs:
-        if job.status == "running" and job.ssh_host and job.pid:
-            config = config_map.get(job.name)
-            if config:
-                metrics = get_utilization(job, config.ssh_key_path)
-                if metrics:
-                    util_map[job.name] = metrics
+    show_util = getattr(args, "util", False)
 
-    header = f"{'Job':<16} {'Pod':<14} {'GPU':<24} {'Status':<12} {'GPU%':<6}{'CPU%':<6}{'Elapsed':<10} {'Cost':<8}"
+    # Fetch utilization for running jobs (only with --util)
+    util_map: dict[str, dict] = {}
+    if show_util:
+        for job in state.jobs:
+            if job.status == "running" and job.ssh_host and job.pid:
+                config = config_map.get(job.name)
+                if config:
+                    metrics = get_utilization(job, config.ssh_key_path)
+                    if metrics:
+                        util_map[job.name] = metrics
+
+    if show_util:
+        header = f"{'Job':<16} {'Pod':<14} {'GPU':<24} {'Status':<12} {'GPU%':<6}{'CPU%':<6}{'Elapsed':<10} {'Cost':<8}"
+    else:
+        header = f"{'Job':<16} {'Pod':<14} {'GPU':<24} {'Status':<12} {'Elapsed':<10} {'Cost':<8}"
     sep = "─" * len(header)
     print(f"{header}\n{sep}")
     for job in state.jobs:
@@ -267,18 +274,21 @@ def cmd_status(args):
             elapsed = f"{h}h {m:02d}m"
         cost = f"${job.cost_usd:.2f}" if job.cost_usd > 0 else "---"
 
-        metrics = util_map.get(job.name)
-        if metrics:
-            gpu_pct = f"{metrics['gpu_util']}%" if "gpu_util" in metrics else "---"
-            cpu_pct = f"{metrics['cpu_util']:.0f}%" if "cpu_util" in metrics else "---"
-        else:
-            gpu_pct = "---"
-            cpu_pct = "---"
-
         info = job.error or ""
         if job.depends_on and job.status == "pending":
             info = f"waiting on {', '.join(job.depends_on)}"
-        print(f"{job.name:<16} {pod_id:<14} {gpu:<24} {job.status:<12} {gpu_pct:<6}{cpu_pct:<6}{elapsed:<10} {cost:<8} {info}")
+
+        if show_util:
+            metrics = util_map.get(job.name)
+            if metrics:
+                gpu_pct = f"{metrics['gpu_util']}%" if "gpu_util" in metrics else "---"
+                cpu_pct = f"{metrics['cpu_util']:.0f}%" if "cpu_util" in metrics else "---"
+            else:
+                gpu_pct = "---"
+                cpu_pct = "---"
+            print(f"{job.name:<16} {pod_id:<14} {gpu:<24} {job.status:<12} {gpu_pct:<6}{cpu_pct:<6}{elapsed:<10} {cost:<8} {info}")
+        else:
+            print(f"{job.name:<16} {pod_id:<14} {gpu:<24} {job.status:<12} {elapsed:<10} {cost:<8} {info}")
 
     if state.budget_usd > 0:
         print(f"\nBudget: ${state.budget_usd:.2f} | Spent: ${state.total_cost_usd:.2f} | "
