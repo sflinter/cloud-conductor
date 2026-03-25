@@ -6,22 +6,89 @@ import time
 
 import runpod
 
-from conductor.config import JobConfig
 from conductor.gpu_pricing import get_gpu_price, select_cheapest_gpus
+from conductor.registry import PodRecord
 from conductor.ssh import wait_ssh
 from conductor.state import PodState
 
 log = logging.getLogger(__name__)
 
 
-def provision_pod(config: JobConfig, pod_state: PodState) -> PodState:
-    # Pod reuse: if keep_pod_alive and pod already exists, verify it's still running
-    if config.keep_pod_alive and pod_state.pod_id:
+def provision_pod_direct(
+    gpu_type_id: str,
+    image_name: str,
+    ssh_key_path: str,
+    name: str = "",
+    cloud_type: str = "ALL",
+    container_disk_in_gb: int = 40,
+    volume_in_gb: int = 0,
+    volume_mount_path: str = "/workspace",
+) -> PodRecord | None:
+    pod_name = f"conductor-{name}" if name else "conductor-pod"
+    log.info(f"[{pod_name}] Attempting to provision with {gpu_type_id}")
+
+    try:
+        pod = runpod.create_pod(
+            name=pod_name,
+            image_name=image_name,
+            gpu_type_id=gpu_type_id,
+            cloud_type=cloud_type,
+            container_disk_in_gb=container_disk_in_gb,
+            volume_in_gb=volume_in_gb if volume_in_gb > 0 else None,
+            volume_mount_path=volume_mount_path if volume_in_gb > 0 else None,
+            ports="22/tcp",
+            support_public_ip=True,
+        )
+    except Exception as e:
+        log.error(f"[{pod_name}] Failed to create pod: {e}")
+        return None
+
+    if not pod or "id" not in pod:
+        log.error(f"[{pod_name}] No pod returned for {gpu_type_id}")
+        return None
+
+    pod_id = pod["id"]
+    cost = _get_pod_cost(pod_id, gpu_type_id, cloud_type)
+
+    ssh_info = _wait_for_ssh_info(pod_id)
+    if not ssh_info:
+        log.warning(f"[{pod_name}] Could not get SSH info for pod {pod_id}")
+        teardown_pod(pod_id)
+        return None
+
+    ssh_host, ssh_port = ssh_info
+    log.info(f"[{pod_name}] Waiting for SSH at {ssh_host}:{ssh_port}")
+
+    if not wait_ssh(ssh_host, ssh_port, ssh_key_path):
+        log.warning(f"[{pod_name}] SSH timeout for pod {pod_id}")
+        teardown_pod(pod_id)
+        return None
+
+    log.info(f"[{pod_name}] Pod {pod_id} ready with {gpu_type_id}")
+    return PodRecord(
+        pod_id=pod_id,
+        name=name or pod_id[:8],
+        gpu_type=gpu_type_id,
+        gpu_cost_per_hour=cost,
+        ssh_host=ssh_host,
+        ssh_port=ssh_port,
+        ssh_key_path=ssh_key_path,
+        image_name=image_name,
+        status="running",
+        created_at=time.time(),
+    )
+
+
+def provision_pod(config, pod_state: PodState) -> PodState:
+    from conductor.config import JobConfig
+    cfg: JobConfig = config
+
+    if cfg.keep_pod_alive and pod_state.pod_id:
         if check_pod_exists(pod_state.pod_id):
-            log.info(f"[{config.name}] Reusing existing pod {pod_state.pod_id}")
+            log.info(f"[{cfg.name}] Reusing existing pod {pod_state.pod_id}")
             return pod_state
 
-    gpu_candidates = _get_gpu_candidates(config)
+    gpu_candidates = _get_gpu_candidates(cfg)
     if not gpu_candidates:
         pod_state.status = "failed"
         pod_state.error = "No GPU candidates available"
@@ -30,65 +97,34 @@ def provision_pod(config: JobConfig, pod_state: PodState) -> PodState:
     pod_state.status = "provisioning"
     for gpu_id in gpu_candidates:
         pod_state.provision_attempts += 1
-        log.info(f"[{config.name}] Attempting to provision with {gpu_id} (attempt {pod_state.provision_attempts})")
-
-        try:
-            pod = runpod.create_pod(
-                name=f"conductor-{config.name}",
-                image_name=config.image_name,
-                gpu_type_id=gpu_id,
-                cloud_type=config.cloud_type if config.cloud_type != "ALL" else "ALL",
-                container_disk_in_gb=config.container_disk_in_gb,
-                volume_in_gb=config.volume_in_gb if config.volume_in_gb > 0 else None,
-                volume_mount_path=config.volume_mount_path if config.volume_in_gb > 0 else None,
-                ports="22/tcp",
-                support_public_ip=True,
-            )
-        except Exception as e:
-            log.warning(f"[{config.name}] Failed to create pod with {gpu_id}: {e}")
-            continue
-
-        if not pod or "id" not in pod:
-            log.warning(f"[{config.name}] No pod returned for {gpu_id}")
-            continue
-
-        pod_state.pod_id = pod["id"]
-        pod_state.gpu_type = gpu_id
-
-        # Get cost per hour
-        if config.cost_per_hour_override > 0:
-            pod_state.gpu_cost_per_hour = config.cost_per_hour_override
-        else:
-            pod_state.gpu_cost_per_hour = _get_pod_cost(pod["id"], gpu_id, config.cloud_type)
-
-        # Wait for SSH details from RunPod API
-        ssh_info = _wait_for_ssh_info(pod_state.pod_id)
-        if not ssh_info:
-            log.warning(f"[{config.name}] Could not get SSH info for pod {pod_state.pod_id}")
-            teardown_pod(pod_state.pod_id)
-            pod_state.pod_id = None
-            continue
-
-        pod_state.ssh_host, pod_state.ssh_port = ssh_info
-
-        # Wait for SSH connectivity
-        log.info(f"[{config.name}] Waiting for SSH at {pod_state.ssh_host}:{pod_state.ssh_port}")
-        if wait_ssh(pod_state.ssh_host, pod_state.ssh_port, config.ssh_key_path):
-            pod_state.started_at = time.time()
-            log.info(f"[{config.name}] Pod {pod_state.pod_id} ready with {gpu_id}")
+        record = provision_pod_direct(
+            gpu_type_id=gpu_id,
+            image_name=cfg.image_name,
+            ssh_key_path=cfg.ssh_key_path,
+            name=cfg.name,
+            cloud_type=cfg.cloud_type,
+            container_disk_in_gb=cfg.container_disk_in_gb,
+            volume_in_gb=cfg.volume_in_gb,
+            volume_mount_path=cfg.volume_mount_path,
+        )
+        if record:
+            pod_state.pod_id = record.pod_id
+            pod_state.gpu_type = record.gpu_type
+            pod_state.ssh_host = record.ssh_host
+            pod_state.ssh_port = record.ssh_port
+            pod_state.started_at = record.created_at
+            if cfg.cost_per_hour_override > 0:
+                pod_state.gpu_cost_per_hour = cfg.cost_per_hour_override
+            else:
+                pod_state.gpu_cost_per_hour = record.gpu_cost_per_hour
             return pod_state
-        else:
-            log.warning(f"[{config.name}] SSH timeout for pod {pod_state.pod_id}")
-            teardown_pod(pod_state.pod_id)
-            pod_state.pod_id = None
-            continue
 
     pod_state.status = "failed"
     pod_state.error = "All GPU types exhausted"
     return pod_state
 
 
-def _get_gpu_candidates(config: JobConfig) -> list[str]:
+def _get_gpu_candidates(config) -> list[str]:
     if config.auto_select_cheapest_gpu:
         gpus = select_cheapest_gpus(
             min_vram_gb=config.gpu_min_vram_gb,

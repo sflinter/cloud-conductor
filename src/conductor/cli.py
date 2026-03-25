@@ -12,8 +12,10 @@ from conductor import __version__
 from conductor.config import load_config
 from conductor.gpu_pricing import get_gpu_price, select_cheapest_gpus
 from conductor.monitor import run_lifecycle
-from conductor.provisioner import check_pod_exists, teardown_pod
-from conductor.runner import get_log_path, get_utilization
+from conductor.provisioner import check_pod_exists, provision_pod_direct, teardown_pod
+from conductor.registry import PodRecord, add_pod, get_pod, list_pods, update_pod
+from conductor.runner import exec_foreground, get_log_path, get_utilization, launch_direct
+from conductor.deployer import deploy_direct
 from conductor.ssh import ssh_exec, ssh_interactive, tail_remote_log, tail_remote_log_subprocess
 from conductor.state import (
     RunState, append_cost_event, get_job, init_state, load_state,
@@ -34,6 +36,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # run
     p_run = sub.add_parser("run", parents=[parent], help="Full lifecycle: provision → deploy → launch → monitor → teardown")
+    p_run.add_argument("-f", "--file", dest="config_file", default=None, help="Path to TOML config file")
     p_run.add_argument("--jobs", help="Comma-separated job names to run")
     p_run.add_argument("--budget", type=float, default=0.0, help="Override global budget")
 
@@ -82,6 +85,52 @@ def _build_parser() -> argparse.ArgumentParser:
     # attach
     p_attach = sub.add_parser("attach", parents=[parent], help="Attach to job log with auto-reconnect")
     p_attach.add_argument("job_name", help="Job name")
+
+    # pod subcommand group
+    p_pod = sub.add_parser("pod", help="Manage individual pods (no config file needed)")
+    pod_sub = p_pod.add_subparsers(dest="pod_action")
+
+    p_pp = pod_sub.add_parser("provision", help="Provision a new pod")
+    p_pp.add_argument("--gpu", required=True, help="GPU type ID (e.g. 'NVIDIA RTX 4090')")
+    p_pp.add_argument("--image", default="runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04", help="Docker image")
+    p_pp.add_argument("--disk", type=int, default=40, help="Container disk in GB (default: 40)")
+    p_pp.add_argument("--cloud", default="ALL", choices=["ALL", "COMMUNITY", "SECURE"], help="Cloud type")
+    p_pp.add_argument("--name", default="", help="Pod name (auto-generated if empty)")
+    p_pp.add_argument("--ssh-key", default="~/.ssh/id_rsa", help="SSH key path")
+    p_pp.add_argument("--volume", type=int, default=0, help="Persistent volume in GB (0 = none)")
+    p_pp.add_argument("--volume-mount", default="/workspace", help="Volume mount path")
+
+    p_pl = pod_sub.add_parser("list", help="List tracked pods")
+    p_pl.add_argument("--all", action="store_true", dest="show_all", help="Include terminated pods")
+
+    p_ps = pod_sub.add_parser("ssh", help="SSH into a pod")
+    p_ps.add_argument("pod", help="Pod name or ID prefix")
+
+    p_plg = pod_sub.add_parser("logs", help="View pod job log")
+    p_plg.add_argument("pod", help="Pod name or ID prefix")
+    p_plg.add_argument("--tail", action="store_true", help="Stream log in real time")
+    p_plg.add_argument("--path", default=None, help="Remote log path override")
+
+    p_ptd = pod_sub.add_parser("teardown", help="Terminate pod(s)")
+    p_ptd.add_argument("pod", nargs="?", help="Pod name or ID prefix")
+    p_ptd.add_argument("--all", action="store_true", dest="teardown_all", help="Terminate all running pods")
+    p_ptd.add_argument("--force", action="store_true", help="Skip confirmation")
+
+    p_pd = pod_sub.add_parser("deploy", help="Deploy code to a pod")
+    p_pd.add_argument("pod", help="Pod name or ID prefix")
+    p_pd.add_argument("--sync", default=".", help="Local directory to sync (default: .)")
+    p_pd.add_argument("--remote-dir", default="/workspace/project", help="Remote directory")
+    p_pd.add_argument("--setup", default="", help="Setup command to run after sync")
+    p_pd.add_argument("--exclude", default="", help="Comma-separated rsync excludes")
+
+    p_pe = pod_sub.add_parser("exec", help="Run a command on a pod")
+    p_pe.add_argument("pod", help="Pod name or ID prefix")
+    p_pe.add_argument("--detach", action="store_true", help="Run in background (nohup)")
+    p_pe.add_argument("--remote-dir", default="/workspace/project", help="Working directory")
+    p_pe.add_argument("cmd", nargs=argparse.REMAINDER, help="Command to run (use -- before command)")
+
+    p_pst = pod_sub.add_parser("stop", help="Kill running process, keep pod alive")
+    p_pst.add_argument("pod", help="Pod name or ID prefix")
 
     return parser
 
@@ -149,8 +198,48 @@ def main(argv=None):
             sys.exit(130)
         return
 
+    # Pod subcommand group (no config needed)
+    if args.command == "pod":
+        if not args.pod_action:
+            parser.parse_args(["pod", "--help"])
+            return
+        _pod_dispatch = {
+            "provision": cmd_pod_provision,
+            "list": cmd_pod_list,
+            "ssh": cmd_pod_ssh,
+            "logs": cmd_pod_logs,
+            "teardown": cmd_pod_teardown,
+            "deploy": cmd_pod_deploy,
+            "exec": cmd_pod_exec,
+            "stop": cmd_pod_stop,
+        }
+        try:
+            _pod_dispatch[args.pod_action](args)
+        except KeyboardInterrupt:
+            print("\nInterrupted.")
+            sys.exit(130)
+        except Exception as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        return
+
     # Resolve config for commands that need it
-    args.config = _resolve_config(args)
+    # -f on run subcommand takes priority
+    if hasattr(args, "config_file") and args.config_file:
+        args.config = args.config_file
+    else:
+        args.config = _resolve_config(args)
+
+    # status can work without config — fall back to registry
+    if args.command == "status":
+        config_path = _resolve_config(args)
+        if not os.path.exists(config_path):
+            try:
+                cmd_status_registry(args)
+            except KeyboardInterrupt:
+                print("\nInterrupted.")
+                sys.exit(130)
+            return
 
     try:
         dispatch = {
@@ -259,9 +348,9 @@ def cmd_status(args):
                         util_map[job.name] = metrics
 
     if show_util:
-        header = f"{'Job':<16} {'Pod':<14} {'GPU':<24} {'Status':<12} {'GPU%':<6}{'CPU%':<6}{'Elapsed':<10} {'Cost':<8}"
+        header = f"{'Job':<16} {'Pod':<14} {'GPU':<24} {'Status':<12} {'GPU%':<6}{'CPU%':<6}{'$/hr':<8} {'Elapsed':<10} {'Cost':<8}"
     else:
-        header = f"{'Job':<16} {'Pod':<14} {'GPU':<24} {'Status':<12} {'Elapsed':<10} {'Cost':<8}"
+        header = f"{'Job':<16} {'Pod':<14} {'GPU':<24} {'Status':<12} {'$/hr':<8} {'Elapsed':<10} {'Cost':<8}"
     sep = "─" * len(header)
     print(f"{header}\n{sep}")
     for job in state.jobs:
@@ -278,6 +367,8 @@ def cmd_status(args):
         if job.depends_on and job.status == "pending":
             info = f"waiting on {', '.join(job.depends_on)}"
 
+        rate = f"${job.gpu_cost_per_hour:.2f}" if job.gpu_cost_per_hour > 0 else "---"
+
         if show_util:
             metrics = util_map.get(job.name)
             if metrics:
@@ -286,9 +377,9 @@ def cmd_status(args):
             else:
                 gpu_pct = "---"
                 cpu_pct = "---"
-            print(f"{job.name:<16} {pod_id:<14} {gpu:<24} {job.status:<12} {gpu_pct:<6}{cpu_pct:<6}{elapsed:<10} {cost:<8} {info}")
+            print(f"{job.name:<16} {pod_id:<14} {gpu:<24} {job.status:<12} {gpu_pct:<6}{cpu_pct:<6}{rate:<8} {elapsed:<10} {cost:<8} {info}")
         else:
-            print(f"{job.name:<16} {pod_id:<14} {gpu:<24} {job.status:<12} {elapsed:<10} {cost:<8} {info}")
+            print(f"{job.name:<16} {pod_id:<14} {gpu:<24} {job.status:<12} {rate:<8} {elapsed:<10} {cost:<8} {info}")
 
     if state.budget_usd > 0:
         print(f"\nBudget: ${state.budget_usd:.2f} | Spent: ${state.total_cost_usd:.2f} | "
@@ -596,6 +687,246 @@ def cmd_attach(args):
 
         print(f"\nSSH disconnected (exit {rc}). Reconnecting...")
         time.sleep(3)
+
+
+# --- Pod subcommands (config-free) ---
+
+def _resolve_pod(identifier: str) -> PodRecord:
+    record = get_pod(identifier)
+    if not record:
+        print(f"Pod not found: {identifier}")
+        sys.exit(1)
+    return record
+
+
+def cmd_pod_provision(args):
+    _ensure_api_key()
+    ssh_key = os.path.expanduser(args.ssh_key)
+    print(f"Provisioning pod with {args.gpu}...")
+    record = provision_pod_direct(
+        gpu_type_id=args.gpu,
+        image_name=args.image,
+        ssh_key_path=ssh_key,
+        name=args.name,
+        cloud_type=args.cloud,
+        container_disk_in_gb=args.disk,
+        volume_in_gb=args.volume,
+        volume_mount_path=args.volume_mount,
+    )
+    if not record:
+        print("Provisioning failed.")
+        sys.exit(1)
+
+    add_pod(record)
+    print(f"\nPod ready:")
+    print(f"  Name:    {record.name}")
+    print(f"  ID:      {record.pod_id}")
+    print(f"  GPU:     {record.gpu_type}")
+    print(f"  SSH:     ssh -i {ssh_key} -p {record.ssh_port} root@{record.ssh_host}")
+    print(f"  Cost:    ${record.gpu_cost_per_hour:.2f}/hr")
+
+
+def cmd_pod_list(args):
+    pods = list_pods()
+    if not getattr(args, "show_all", False):
+        pods = [p for p in pods if p.status != "terminated"]
+
+    if not pods:
+        print("No tracked pods.")
+        return
+
+    header = f"{'Name':<16} {'ID':<14} {'GPU':<24} {'Status':<12} {'$/hr':<8} {'Cost':<8} {'Age':<10}"
+    sep = "─" * len(header)
+    print(f"{header}\n{sep}")
+    for p in pods:
+        pod_id = p.pod_id[:12]
+        gpu = (p.gpu_type or "---")[:22]
+        rate = f"${p.gpu_cost_per_hour:.2f}" if p.gpu_cost_per_hour else "---"
+        cost = f"${p.cost_usd:.2f}" if p.cost_usd > 0 else "---"
+        age = "---"
+        if p.created_at:
+            secs = time.time() - p.created_at
+            h, m = int(secs // 3600), int((secs % 3600) // 60)
+            age = f"{h}h {m:02d}m"
+        print(f"{p.name:<16} {pod_id:<14} {gpu:<24} {p.status:<12} {rate:<8} {cost:<8} {age:<10}")
+
+
+def cmd_pod_ssh(args):
+    record = _resolve_pod(args.pod)
+    if not record.ssh_host:
+        print(f"Pod '{record.name}' has no SSH info.")
+        sys.exit(1)
+    ssh_interactive(record.ssh_host, record.ssh_port, record.ssh_key_path)
+
+
+def cmd_pod_logs(args):
+    record = _resolve_pod(args.pod)
+    if not record.ssh_host:
+        print(f"Pod '{record.name}' has no SSH info.")
+        sys.exit(1)
+
+    log_path = args.path or f"{record.remote_project_dir}/conductor_job.log"
+    if args.tail:
+        tail_remote_log(record.ssh_host, record.ssh_port, record.ssh_key_path, log_path)
+    else:
+        result = ssh_exec(record.ssh_host, record.ssh_port, record.ssh_key_path,
+                          f"cat {log_path}")
+        if result.returncode == 0:
+            print(result.stdout)
+        else:
+            print(f"Could not read log: {result.stderr}")
+            sys.exit(1)
+
+
+def cmd_pod_teardown(args):
+    _ensure_api_key()
+
+    if getattr(args, "teardown_all", False):
+        pods = [p for p in list_pods() if p.status == "running"]
+        if not pods:
+            print("No running pods.")
+            return
+        if not args.force:
+            print(f"About to teardown {len(pods)} pod(s):")
+            for p in pods:
+                print(f"  {p.name}: {p.pod_id}")
+            answer = input("Continue? [y/N] ").strip().lower()
+            if answer != "y":
+                print("Aborted.")
+                return
+        for p in pods:
+            print(f"Tearing down {p.name} ({p.pod_id})...")
+            teardown_pod(p.pod_id)
+            update_pod(p.pod_id, status="terminated")
+        print("All pods terminated.")
+        return
+
+    if not args.pod:
+        print("Specify a pod name/ID or use --all.")
+        sys.exit(1)
+
+    record = _resolve_pod(args.pod)
+    if not args.force:
+        answer = input(f"Teardown {record.name} ({record.pod_id})? [y/N] ").strip().lower()
+        if answer != "y":
+            print("Aborted.")
+            return
+
+    print(f"Tearing down {record.name} ({record.pod_id})...")
+    teardown_pod(record.pod_id)
+    update_pod(record.pod_id, status="terminated")
+    print("Done.")
+
+
+def cmd_pod_deploy(args):
+    record = _resolve_pod(args.pod)
+    if not record.ssh_host:
+        print(f"Pod '{record.name}' has no SSH info.")
+        sys.exit(1)
+
+    excludes = [e.strip() for e in args.exclude.split(",") if e.strip()] if args.exclude else None
+    local_dir = os.path.abspath(args.sync)
+    print(f"Deploying {local_dir} → {record.ssh_host}:{args.remote_dir}...")
+
+    ok = deploy_direct(
+        ssh_host=record.ssh_host,
+        ssh_port=record.ssh_port,
+        ssh_key_path=record.ssh_key_path,
+        local_dir=local_dir,
+        remote_dir=args.remote_dir,
+        setup_command=args.setup,
+        excludes=excludes,
+    )
+    if ok:
+        update_pod(record.pod_id, remote_project_dir=args.remote_dir)
+        print("Deploy complete.")
+    else:
+        print("Deploy failed.")
+        sys.exit(1)
+
+
+def cmd_pod_exec(args):
+    record = _resolve_pod(args.pod)
+    if not record.ssh_host:
+        print(f"Pod '{record.name}' has no SSH info.")
+        sys.exit(1)
+
+    cmd_parts = args.cmd
+    if cmd_parts and cmd_parts[0] == "--":
+        cmd_parts = cmd_parts[1:]
+    if not cmd_parts:
+        print("No command specified. Use: conductor pod exec <pod> -- <command>")
+        sys.exit(1)
+
+    command = " ".join(cmd_parts)
+    remote_dir = args.remote_dir
+
+    if args.detach:
+        pid = launch_direct(
+            ssh_host=record.ssh_host,
+            ssh_port=record.ssh_port,
+            ssh_key_path=record.ssh_key_path,
+            command=command,
+            remote_dir=remote_dir,
+            name=record.name,
+        )
+        if pid:
+            update_pod(record.pod_id, pid=pid)
+            print(f"Launched (PID {pid}). Logs: conductor pod logs {record.name}")
+        else:
+            print("Launch failed.")
+            sys.exit(1)
+    else:
+        exec_foreground(
+            ssh_host=record.ssh_host,
+            ssh_port=record.ssh_port,
+            ssh_key_path=record.ssh_key_path,
+            command=command,
+            remote_dir=remote_dir,
+        )
+
+
+def cmd_pod_stop(args):
+    record = _resolve_pod(args.pod)
+    if not record.pid:
+        print(f"No tracked process for pod '{record.name}'.")
+        sys.exit(1)
+    if not record.ssh_host:
+        print(f"Pod '{record.name}' has no SSH info.")
+        sys.exit(1)
+
+    print(f"Killing PID {record.pid} on {record.name}...")
+    result = ssh_exec(record.ssh_host, record.ssh_port, record.ssh_key_path,
+                      f"kill {record.pid} 2>/dev/null; echo ok")
+    if result.returncode == 0:
+        update_pod(record.pod_id, pid=None)
+        print("Process stopped. Pod is still running.")
+    else:
+        print(f"Failed to stop process: {result.stderr}")
+        sys.exit(1)
+
+
+def cmd_status_registry(args):
+    pods = [p for p in list_pods() if p.status != "terminated"]
+    if not pods:
+        print("No active pods. Use 'conductor pod provision' to create one,")
+        print("or 'conductor run -f jobs.toml' for batch mode.")
+        return
+
+    header = f"{'Name':<16} {'ID':<14} {'GPU':<24} {'Status':<12} {'$/hr':<8} {'Cost':<8} {'Age':<10}"
+    sep = "─" * len(header)
+    print(f"{header}\n{sep}")
+    for p in pods:
+        pod_id = p.pod_id[:12]
+        gpu = (p.gpu_type or "---")[:22]
+        rate = f"${p.gpu_cost_per_hour:.2f}" if p.gpu_cost_per_hour else "---"
+        cost = f"${p.cost_usd:.2f}" if p.cost_usd > 0 else "---"
+        age = "---"
+        if p.created_at:
+            secs = time.time() - p.created_at
+            h, m = int(secs // 3600), int((secs % 3600) // 60)
+            age = f"{h}h {m:02d}m"
+        print(f"{p.name:<16} {pod_id:<14} {gpu:<24} {p.status:<12} {rate:<8} {cost:<8} {age:<10}")
 
 
 if __name__ == "__main__":

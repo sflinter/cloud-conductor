@@ -13,6 +13,7 @@ from conductor.config import JobConfig
 from conductor.deployer import deploy
 from conductor.notify import send_notification
 from conductor.provisioner import check_pod_exists, provision_pod, teardown_pod
+from conductor.registry import PodRecord, add_pod as registry_add, update_pod as registry_update
 from conductor.runner import get_log_path, get_utilization, is_alive, launch
 from conductor.state import (
     PodState, RunState, append_cost_event, get_job, save_state,
@@ -238,6 +239,26 @@ def _provision_deploy_launch(
             "gpu_type": job.gpu_type, "cost_per_hour": job.gpu_cost_per_hour,
         })
 
+    # Register in global pod registry
+    try:
+        registry_add(PodRecord(
+            pod_id=job.pod_id,
+            name=job.name,
+            gpu_type=job.gpu_type or "",
+            gpu_cost_per_hour=job.gpu_cost_per_hour,
+            ssh_host=job.ssh_host,
+            ssh_port=job.ssh_port,
+            ssh_key_path=config.ssh_key_path,
+            image_name=config.image_name,
+            status="running",
+            created_at=job.started_at or time.time(),
+            source="declarative",
+            remote_project_dir=config.remote_project_dir,
+            job_name=job.name,
+        ))
+    except Exception:
+        pass  # registry is best-effort
+
     # Deploy
     job.status = "deploying"
     with cm:
@@ -340,6 +361,13 @@ def _finish_job(
 
     job.status = status
     job.error = error
+
+    # Update global registry
+    if job.pod_id:
+        try:
+            registry_update(job.pod_id, status="terminated", cost_usd=job.cost_usd)
+        except Exception:
+            pass
 
     if status == "failed":
         _propagate_failure(job, state)
@@ -446,7 +474,7 @@ def _graceful_shutdown(
 
 
 def _print_status(state: RunState) -> None:
-    header = f"{'Job':<16} {'Pod':<14} {'GPU':<24} {'Status':<12} {'Elapsed':<10} {'Cost':<8}"
+    header = f"{'Job':<16} {'Pod':<14} {'GPU':<24} {'Status':<12} {'$/hr':<8} {'Elapsed':<10} {'Cost':<8}"
     sep = "─" * len(header)
     print(f"\n{header}\n{sep}")
     for job in state.jobs:
@@ -458,7 +486,8 @@ def _print_status(state: RunState) -> None:
             h, m = int(secs // 3600), int((secs % 3600) // 60)
             elapsed = f"{h}h {m:02d}m"
         cost = f"${job.cost_usd:.2f}" if job.cost_usd > 0 else "---"
-        print(f"{job.name:<16} {pod_id:<14} {gpu:<24} {job.status:<12} {elapsed:<10} {cost:<8}")
+        rate = f"${job.gpu_cost_per_hour:.2f}" if job.gpu_cost_per_hour > 0 else "---"
+        print(f"{job.name:<16} {pod_id:<14} {gpu:<24} {job.status:<12} {rate:<8} {elapsed:<10} {cost:<8}")
 
     if state.budget_usd > 0:
         print(f"\nBudget: ${state.budget_usd:.2f} | Spent: ${state.total_cost_usd:.2f} | "

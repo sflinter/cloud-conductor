@@ -17,16 +17,33 @@ Cloud Conductor extracts the orchestration concerns into a standalone, project-a
 ## Design Principles
 
 - **Project-agnostic**: Conductor knows nothing about poker, training, or ML. It runs arbitrary shell commands on provisioned pods.
-- **TOML-driven**: All configuration lives in a single TOML file. No CLI flags for job-specific settings.
-- **Stateful**: Pod state is persisted to a JSON file so the conductor can be stopped and restarted without losing track of pods.
-- **Observable**: Status is always queryable via `conductor status`, even if the main process is not running.
-- **Cost-aware**: Built-in budget limits, per-pod cost tracking, and automatic teardown of idle or over-budget pods.
-- **Composable**: Each phase (provision, deploy, run, sync, teardown) can be invoked independently.
+- **Dual-mode CLI**: Imperative commands (`conductor pod`) for direct pod management without config files; declarative mode (`conductor run -f`) for batch orchestration via TOML.
+- **Stateful**: A global pod registry (`~/.conductor/pods.json`) tracks all pods. Per-project batch state is persisted to `.conductor_state.json`.
+- **Observable**: `conductor status` and `conductor pod list` always work — with or without a config file.
+- **Cost-aware**: GPU stall detection and idle timeout enabled by default. Built-in budget limits, per-pod cost tracking, and automatic teardown of idle or over-budget pods.
+- **Composable**: Each phase (provision, deploy, run, sync, teardown) can be invoked independently via imperative commands.
 
 ## CLI Interface
 
+### Imperative commands (no config file needed)
+
 ```
-conductor run [--config jobs.toml] [--jobs name1,name2] [--budget 40.00]
+conductor pod provision --gpu "NVIDIA RTX 4090" [--image IMAGE] [--disk 40] [--cloud COMMUNITY] [--name my-pod] [--ssh-key ~/.ssh/id_rsa]
+conductor pod list [--all]
+conductor pod ssh <pod>
+conductor pod logs <pod> [--tail] [--path /custom/log]
+conductor pod teardown <pod> [--all] [--force]
+conductor pod deploy <pod> [--sync ./src] [--remote-dir /workspace/project] [--setup "pip install -r req.txt"] [--exclude .git,.venv]
+conductor pod exec <pod> [--detach] [--remote-dir /workspace/project] -- <command>
+conductor pod stop <pod>
+```
+
+The `<pod>` argument accepts a pod name or pod ID prefix (like `docker ps`). Pods are resolved via the global registry at `~/.conductor/pods.json`.
+
+### Declarative commands (TOML config)
+
+```
+conductor run [-f jobs.toml] [--jobs name1,name2] [--budget 40.00]
 conductor status [--config jobs.toml]
 conductor sync [--config jobs.toml] [--jobs name1,name2]
 conductor teardown [--config jobs.toml] [--jobs name1,name2]
@@ -36,6 +53,28 @@ conductor logs <job-name> [--tail] [--config jobs.toml]
 conductor ssh <job-name> [--config jobs.toml]
 conductor report [--config jobs.toml]
 ```
+
+`conductor status` without a config file falls back to showing the global pod registry.
+
+### `conductor pod provision`
+
+Provisions a single RunPod pod and registers it in the global pod registry. Prints SSH connection info and cost per hour. No config file needed.
+
+### `conductor pod list`
+
+Shows all tracked pods from the global registry. Default: running pods only. `--all` includes terminated pods. Columns: Name, ID, GPU, Status, $/hr, Cost, Age.
+
+### `conductor pod deploy`
+
+Rsyncs a local directory to a pod and optionally runs a setup command. Works independently of any config file.
+
+### `conductor pod exec`
+
+Runs a command on a pod. Default: foreground (replaces the conductor process with SSH). `--detach` runs via nohup and returns the PID.
+
+### `conductor pod stop`
+
+Kills the tracked process on a pod but keeps the pod running. Useful for stopping a job without losing the pod.
 
 ### `conductor run`
 
@@ -166,8 +205,8 @@ sync_paths = [
 
 # Cost controls
 budget_usd = 40.00                    # global hard budget limit, teardown all when reached
-idle_timeout_minutes = 10             # teardown pod if job process not running for this long
-stall_timeout_minutes = 0             # 0 = disabled; teardown if GPU util stays below threshold
+idle_timeout_minutes = 5              # teardown pod if job process not running for this long
+stall_timeout_minutes = 30            # teardown if GPU util stays below threshold for this long (0 = disabled)
 stall_gpu_threshold = 5               # GPU util % below which the job is considered stalled
 cost_per_hour_override = 0.0          # 0 = auto-detect from RunPod API
 
@@ -316,20 +355,22 @@ cloud-conductor/
 ├── src/
 │   └── conductor/
 │       ├── __init__.py
-│       ├── cli.py          # argparse CLI with subcommands, dispatches to commands
+│       ├── cli.py          # argparse CLI: `pod` subcommand group (imperative) + declarative commands
 │       ├── config.py       # TOML config loading, merging global+job, validation
-│       ├── provisioner.py  # RunPod pod creation, GPU fallback/auto-select, SSH wait
-│       ├── deployer.py     # rsync code, run setup_command (or skip for prebuilt image)
-│       ├── runner.py       # launch run_command via nohup, check if process alive
+│       ├── registry.py     # global pod registry (~/.conductor/pods.json), PodRecord dataclass
+│       ├── provisioner.py  # provision_pod_direct() (imperative) + provision_pod() (declarative wrapper)
+│       ├── deployer.py     # deploy_direct() (imperative) + deploy() (declarative wrapper)
+│       ├── runner.py       # launch_direct(), exec_foreground() (imperative) + launch() (declarative wrapper)
 │       ├── syncer.py       # rsync sync_paths from pod to local
 │       ├── monitor.py      # main loop: check status, sync, spot recovery, cost tracking, deps
-│       ├── state.py        # state file + cost log read/write, PodState dataclass
+│       ├── state.py        # per-run state file + cost log read/write, PodState dataclass
 │       ├── ssh.py          # SSH/rsync helpers (shared by all modules)
 │       ├── gpu_pricing.py  # query RunPod API for GPU types/prices, auto-select cheapest
 │       ├── notify.py       # notification dispatch (terminal-notifier, pushover, command)
 │       └── validator.py    # pre-flight config validation (SSH keys, paths, GPU IDs, etc.)
 └── tests/
     ├── test_config.py
+    ├── test_registry.py
     ├── test_provisioner.py
     ├── test_state.py
     ├── test_validator.py
@@ -339,23 +380,25 @@ cloud-conductor/
 
 ### Module responsibilities
 
-**`cli.py`** — Entry point. Parses args, loads config, dispatches to the appropriate command function. Uses `argparse` with subcommands. Registers subcommands: `run`, `status`, `sync`, `teardown`, `dry-run`, `validate`, `logs`, `ssh`, `report`.
+**`cli.py`** — Entry point. Uses `argparse` with nested subparsers. The `pod` subcommand group handles imperative pod management (no config needed). Traditional subcommands (`run`, `status`, `sync`, etc.) handle declarative/batch workflows. `conductor status` falls back to the global registry when no config file exists.
 
 **`config.py`** — Reads TOML config file. Merges `[global]` defaults with per-`[[jobs]]` overrides. Resolves `depends_on` references. Returns a list of `JobConfig` dataclasses. Validates required fields and types.
 
-**`provisioner.py`** — Creates RunPod pods via the `runpod` Python SDK. Two GPU selection modes:
+**`registry.py`** — Global pod registry persisted at `~/.conductor/pods.json`. Stores `PodRecord` dataclasses with pod ID, name, GPU type, SSH info, cost, and source (imperative vs declarative). Supports lookup by name or pod ID prefix. Both imperative commands and declarative runs register pods here.
+
+**`provisioner.py`** — Creates RunPod pods via the `runpod` Python SDK. `provision_pod_direct()` takes explicit parameters and returns a `PodRecord` (used by imperative commands). `provision_pod()` wraps it for declarative mode (takes `JobConfig`, populates `PodState`). Two GPU selection modes:
 - Manual: tries the primary `gpu_type_id`, then falls through `gpu_type_ids_fallback`
 - Auto: delegates to `gpu_pricing.py` to find the cheapest available GPU meeting minimum VRAM requirements
 
 Waits for SSH to become available (polls RunPod API for port mapping, then tests SSH connectivity). Returns `PodInfo` with host/port/pod_id/gpu_type/cost_per_hour. Supports pod reuse: if `keep_pod_alive` is set and a pod from a previous run still exists, skips provisioning and reuses it.
 
-**`deployer.py`** — Two modes:
+**`deployer.py`** — `deploy_direct()` takes explicit SSH/path parameters (used by `conductor pod deploy`). `deploy()` wraps it for declarative mode. Two deploy methods:
 - `rsync`: Installs rsync on the pod (if needed), rsyncs `local_project_dir` to `remote_project_dir` with configured excludes, then runs `setup_command` via SSH.
 - `image`: Skips rsync and setup (image has everything). Optionally syncs specific files (like seed checkpoints) listed in the config.
 
 When reusing a pod (`keep_pod_alive`), rsync mode re-syncs code (fast incremental) but skips `setup_command` (deps already installed).
 
-**`runner.py`** — Launches `run_command` on the pod via a detached launch script. Checks whether the process is still running via `kill -0` over SSH. Captures the remote PID for reliable process tracking. Queries live GPU utilization (`nvidia-smi`) and CPU utilization (`ps`) for `conductor status`.
+**`runner.py`** — `launch_direct()` launches a detached command and returns PID (used by `conductor pod exec --detach`). `exec_foreground()` replaces the process with SSH (used by `conductor pod exec`). `launch()` wraps `launch_direct()` for declarative mode. Also provides `is_alive()` for process checking and `get_utilization()` for GPU/CPU metrics.
 
 **`syncer.py`** — Rsyncs configured `sync_paths` from pod to local machine. Each sync path specifies a remote path (relative to `remote_project_dir`) and a local destination. Also supports push direction (local → remote) for spot recovery checkpoint restoration.
 
@@ -376,7 +419,7 @@ When reusing a pod (`keep_pod_alive`), rsync mode re-syncs code (fast incrementa
 11. Print status table
 12. Append cost event to cost log
 
-**`state.py`** — Serializes/deserializes the state file. Provides `PodState` dataclass with fields for pod_id, ssh_host, ssh_port, gpu_type, gpu_cost_per_hour, status, timing, cost, provision attempts, idle_since, job_budget_usd. Also manages the append-only cost log (JSONL) for historical reporting.
+**`state.py`** — Serializes/deserializes the per-run state file (`.conductor_state.json`). Provides `PodState` dataclass for declarative batch runs. Also manages the append-only cost log (JSONL) for historical reporting. Note: the global pod registry (`registry.py`) is separate from per-run state.
 
 **`ssh.py`** — Low-level SSH and rsync wrappers. All SSH commands use `-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null` for ephemeral pod connections. Provides `ssh_exec()` for commands and `ssh_interactive()` for `conductor ssh`. Provides `tail_remote_log()` for `conductor logs --tail` (opens persistent SSH + `tail -f`).
 
@@ -466,7 +509,7 @@ This prevents paying for idle pods after training completes — the single most 
 
 ## GPU Stall Detection
 
-Detects jobs where the process is alive but the GPU is idle (e.g. hung training loop, deadlock). When `stall_timeout_minutes > 0`, the monitor calls `get_utilization()` each tick while the process is alive. If GPU utilization stays below `stall_gpu_threshold` (default 5%) for longer than `stall_timeout_minutes`, the job is marked as `failed` with error "gpu stall detected" and the pod is torn down.
+Detects jobs where the process is alive but the GPU is idle (e.g. hung training loop, deadlock). Enabled by default (`stall_timeout_minutes = 30`). The monitor calls `get_utilization()` each tick while the process is alive. If GPU utilization stays below `stall_gpu_threshold` (default 5%) for longer than `stall_timeout_minutes`, the job is marked as `failed` with error "gpu stall detected" and the pod is torn down. Set `stall_timeout_minutes = 0` to disable.
 
 Safety: if `get_utilization()` returns `None` (SSH failure, nvidia-smi missing), the stall timer is reset — no false positives from transient connectivity issues.
 

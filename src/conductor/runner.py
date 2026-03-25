@@ -2,52 +2,78 @@
 from __future__ import annotations
 
 import logging
+import os
 
-from conductor.config import JobConfig
-from conductor.ssh import ssh_exec
+from conductor.ssh import ssh_exec, _ssh_base
 from conductor.state import PodState
 
 log = logging.getLogger(__name__)
 
 
-def launch(config: JobConfig, pod_state: PodState) -> int | None:
-    host = pod_state.ssh_host
-    port = pod_state.ssh_port
-    key = config.ssh_key_path
-    remote_dir = config.remote_project_dir
+def launch_direct(
+    ssh_host: str,
+    ssh_port: int,
+    ssh_key_path: str,
+    command: str,
+    remote_dir: str = "/workspace/project",
+    name: str = "pod",
+) -> int | None:
     log_file = f"{remote_dir}/conductor_job.log"
     pid_file = f"{remote_dir}/.conductor_pid"
     script_file = f"{remote_dir}/.conductor_launch.sh"
 
-    # Write a launch script that fully detaches the job from the SSH session.
-    # The subshell + FD redirection ensures no inherited SSH channel FDs.
     script = (
         f"#!/bin/bash\n"
         f"cd {remote_dir}\n"
-        f"( {config.run_command} ) > {log_file} 2>&1 < /dev/null &\n"
+        f"( {command} ) > {log_file} 2>&1 < /dev/null &\n"
         f"echo $! > {pid_file}\n"
     )
-    write_result = ssh_exec(host, port, key,
+    write_result = ssh_exec(ssh_host, ssh_port, ssh_key_path,
                             f"cat > {script_file} << 'CONDUCTOR_EOF'\n{script}CONDUCTOR_EOF")
     if write_result.returncode != 0:
-        log.error(f"[{config.name}] Failed to write launch script: {write_result.stderr}")
+        log.error(f"[{name}] Failed to write launch script: {write_result.stderr}")
         return None
 
-    log.info(f"[{config.name}] Launching job")
-    result = ssh_exec(host, port, key,
+    log.info(f"[{name}] Launching job")
+    result = ssh_exec(ssh_host, ssh_port, ssh_key_path,
                       f"bash {script_file} && cat {pid_file}", timeout=30)
     if result.returncode != 0:
-        log.error(f"[{config.name}] Launch failed: {result.stderr}")
+        log.error(f"[{name}] Launch failed: {result.stderr}")
         return None
 
     pid_str = result.stdout.strip()
     try:
         pid = int(pid_str)
-        log.info(f"[{config.name}] Job launched with PID {pid}")
+        log.info(f"[{name}] Job launched with PID {pid}")
         return pid
     except ValueError:
-        log.error(f"[{config.name}] Could not parse PID from: {pid_str!r}")
+        log.error(f"[{name}] Could not parse PID from: {pid_str!r}")
         return None
+
+
+def exec_foreground(
+    ssh_host: str,
+    ssh_port: int,
+    ssh_key_path: str,
+    command: str,
+    remote_dir: str = "/workspace/project",
+) -> None:
+    cmd = [*_ssh_base(ssh_host, ssh_port, ssh_key_path),
+           f"cd {remote_dir} && {command}"]
+    os.execvp("ssh", cmd)
+
+
+def launch(config, pod_state: PodState) -> int | None:
+    from conductor.config import JobConfig
+    cfg: JobConfig = config
+    return launch_direct(
+        ssh_host=pod_state.ssh_host,
+        ssh_port=pod_state.ssh_port,
+        ssh_key_path=cfg.ssh_key_path,
+        command=cfg.run_command,
+        remote_dir=cfg.remote_project_dir,
+        name=cfg.name,
+    )
 
 
 def is_alive(pod_state: PodState, key_path: str) -> bool | None:
@@ -108,5 +134,5 @@ def get_utilization(pod_state: PodState, key_path: str) -> dict | None:
         return None
 
 
-def get_log_path(config: JobConfig) -> str:
+def get_log_path(config) -> str:
     return f"{config.remote_project_dir}/conductor_job.log"
