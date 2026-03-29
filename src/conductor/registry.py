@@ -114,7 +114,10 @@ def list_pods(status: str | None = None) -> list[PodRecord]:
 
 
 def reconcile_with_provider() -> list[PodRecord]:
-    """Check all non-terminated pods against their provider and update stale entries.
+    """Check all pods against their provider and update stale entries.
+
+    Marks running pods as terminated if the provider says they're gone,
+    and resurrects terminated pods if the provider says they're still alive.
 
     Returns the updated list of all pods."""
     from conductor.providers import get_provider
@@ -124,8 +127,6 @@ def reconcile_with_provider() -> list[PodRecord]:
     providers: dict[str, object] = {}
 
     for p in pods:
-        if p.status == "terminated":
-            continue
         if p.provider not in providers:
             try:
                 providers[p.provider] = get_provider(p.provider)
@@ -133,11 +134,15 @@ def reconcile_with_provider() -> list[PodRecord]:
                 continue
         prov = providers[p.provider]
         try:
-            if not prov.check_exists(p.pod_id):
-                p.status = "terminated"
-                changed = True
+            exists = prov.check_exists(p.pod_id)
         except Exception:
-            pass
+            continue
+        if exists and p.status == "terminated":
+            p.status = "running"
+            changed = True
+        elif not exists and p.status != "terminated":
+            p.status = "terminated"
+            changed = True
 
     if changed:
         save_registry(pods)
