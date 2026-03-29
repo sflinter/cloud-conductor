@@ -374,7 +374,8 @@ def _finish_job(
     sync_pull(config, job)
 
     # Teardown (unless keep_pod_alive)
-    if job.pod_id and not (status == "completed" and config.keep_pod_alive):
+    pod_kept_alive = status == "completed" and config.keep_pod_alive
+    if job.pod_id and not pod_kept_alive:
         teardown_pod(provider, job.pod_id)
 
     elapsed_hours = 0.0
@@ -392,7 +393,8 @@ def _finish_job(
     # Update global registry
     if job.pod_id:
         try:
-            registry_update(job.pod_id, status="terminated", cost_usd=job.cost_usd)
+            reg_status = "running" if pod_kept_alive else "terminated"
+            registry_update(job.pod_id, status=reg_status, cost_usd=job.cost_usd)
         except Exception:
             pass
 

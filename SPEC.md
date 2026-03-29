@@ -566,7 +566,7 @@ When `auto_select_cheapest_gpu = false` (default), the manual `gpu_type_id` + `g
 
 When `keep_pod_alive = true`:
 
-1. On job completion, the pod is NOT terminated. It remains running (and billing).
+1. On job completion, the pod is NOT terminated. It remains running (and billing). The global pod registry (`~/.conductor/pods.json`) reflects the pod as `running`.
 2. On the next `conductor run`, the conductor detects the existing pod in the state file, verifies it is still alive via the RunPod API, and reuses it.
 3. For rsync deploy: only re-syncs code (fast incremental rsync), skips `setup_command` (deps already installed from the previous run).
 4. For image deploy: skips entirely (nothing to do).
