@@ -25,6 +25,7 @@ class PodRecord:
     status: str = "running"  # running, stopped, terminated
     created_at: float = 0.0
     source: str = "imperative"  # imperative, declarative
+    provider: str = "runpod"  # runpod, vastai
     remote_project_dir: str = "/workspace/project"
     cost_usd: float = 0.0
     pid: int | None = None
@@ -109,4 +110,35 @@ def list_pods(status: str | None = None) -> list[PodRecord]:
     pods = load_registry()
     if status:
         return [p for p in pods if p.status == status]
+    return pods
+
+
+def reconcile_with_provider() -> list[PodRecord]:
+    """Check all non-terminated pods against their provider and update stale entries.
+
+    Returns the updated list of all pods."""
+    from conductor.providers import get_provider
+
+    pods = load_registry()
+    changed = False
+    providers: dict[str, object] = {}
+
+    for p in pods:
+        if p.status == "terminated":
+            continue
+        if p.provider not in providers:
+            try:
+                providers[p.provider] = get_provider(p.provider)
+            except Exception:
+                continue
+        prov = providers[p.provider]
+        try:
+            if not prov.check_exists(p.pod_id):
+                p.status = "terminated"
+                changed = True
+        except Exception:
+            pass
+
+    if changed:
+        save_registry(pods)
     return pods

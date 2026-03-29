@@ -126,20 +126,32 @@ def _check_budgets(configs: list[JobConfig], result: ValidationResult) -> None:
 def _check_gpu_ids(configs: list[JobConfig], result: ValidationResult) -> None:
     try:
         from conductor.gpu_pricing import validate_gpu_id
+        from conductor.providers import get_provider
     except Exception:
         result.warnings.append("Could not import gpu_pricing, skipping GPU validation")
         return
 
-    checked = set()
+    # Group by provider to avoid creating multiple instances
+    providers: dict[str, object] = {}
+    checked: dict[str, set[str]] = {}
     for cfg in configs:
         if cfg.auto_select_cheapest_gpu:
             continue
-        for gpu_id in [cfg.gpu_type_id] + cfg.gpu_type_ids_fallback:
-            if not gpu_id or gpu_id in checked:
-                continue
-            checked.add(gpu_id)
+        if cfg.provider not in providers:
             try:
-                if not validate_gpu_id(gpu_id):
-                    result.warnings.append(f"GPU type '{gpu_id}' not found in RunPod API")
+                providers[cfg.provider] = get_provider(cfg.provider)
+            except Exception:
+                result.warnings.append(f"Unknown provider '{cfg.provider}', skipping GPU validation")
+                continue
+            checked[cfg.provider] = set()
+
+        provider = providers[cfg.provider]
+        for gpu_id in [cfg.gpu_type_id] + cfg.gpu_type_ids_fallback:
+            if not gpu_id or gpu_id in checked[cfg.provider]:
+                continue
+            checked[cfg.provider].add(gpu_id)
+            try:
+                if not validate_gpu_id(provider, gpu_id):
+                    result.warnings.append(f"GPU type '{gpu_id}' not found in {cfg.provider} API")
             except Exception:
                 result.warnings.append(f"Could not validate GPU type '{gpu_id}' (API error)")

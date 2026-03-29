@@ -1,16 +1,14 @@
 # Copyright (c) 2026 Steve Flinter. MIT License.
 [project]
 name = "cloud-conductor"
-version = "0.4.0"
-description = "Lightweight CLI orchestrator for RunPod GPU workloads"
+version = "0.5.0"
+description = "Lightweight CLI orchestrator for GPU cloud workloads (RunPod, Vast.ai)"
 license = "MIT"
 requires-python = ">=3.12"
 dependencies = [
+    "httpx",
     "runpod",
 ]
-
-[project.optional-dependencies]
-notify = ["httpx"]
 
 [project.scripts]
 conductor = "conductor.cli:main"

@@ -1,7 +1,7 @@
 from unittest.mock import patch, MagicMock
 
 from conductor.config import JobConfig
-from conductor.provisioner import provision_pod, check_pod_exists, teardown_pod, _get_gpu_candidates, _get_pod_cost
+from conductor.provisioner import provision_pod, check_pod_exists, teardown_pod, _get_gpu_candidates
 from conductor.state import PodState
 
 
@@ -18,100 +18,91 @@ def _make_pod(**overrides):
     return PodState(**defaults)
 
 
+def _mock_provider():
+    p = MagicMock()
+    p.name = "runpod"
+    return p
+
+
 @patch("conductor.provisioner.wait_ssh", return_value=True)
-@patch("conductor.provisioner._get_pod_cost", return_value=0.12)
-@patch("conductor.provisioner.runpod")
-def test_provision_success(mock_runpod, mock_cost, mock_ssh):
-    mock_runpod.create_pod.return_value = {"id": "pod123"}
-    mock_runpod.get_pod.return_value = {
-        "runtime": {"ports": [{"privatePort": 22, "ip": "1.2.3.4", "publicPort": 22222}]},
-        "desiredStatus": "RUNNING",
-    }
+def test_provision_success(mock_ssh):
+    provider = _mock_provider()
+    provider.create_instance.return_value = {"id": "pod123", "cost_per_hour": 0.12}
+    provider.wait_for_ssh.return_value = ("1.2.3.4", 22222)
+
     config = _make_config()
     pod = _make_pod()
-    result = provision_pod(config, pod)
+    result = provision_pod(provider, config, pod)
     assert result.pod_id == "pod123"
     assert result.ssh_host == "1.2.3.4"
     assert result.ssh_port == 22222
     assert result.gpu_cost_per_hour == 0.12
 
 
-@patch("conductor.provisioner.runpod")
-def test_provision_all_fail(mock_runpod):
-    mock_runpod.create_pod.side_effect = Exception("no capacity")
+def test_provision_all_fail():
+    provider = _mock_provider()
+    provider.create_instance.return_value = None
+
     config = _make_config()
     pod = _make_pod()
-    result = provision_pod(config, pod)
+    result = provision_pod(provider, config, pod)
     assert result.status == "failed"
     assert "exhausted" in result.error
 
 
 @patch("conductor.provisioner.wait_ssh", return_value=True)
-@patch("conductor.provisioner._get_pod_cost", return_value=0.25)
-@patch("conductor.provisioner.runpod")
-def test_provision_fallback(mock_runpod, mock_cost, mock_ssh):
+def test_provision_fallback(mock_ssh):
+    provider = _mock_provider()
     # First GPU fails, second succeeds
-    mock_runpod.create_pod.side_effect = [
-        Exception("no capacity"),
-        {"id": "pod456"},
+    provider.create_instance.side_effect = [
+        None,
+        {"id": "pod456", "cost_per_hour": 0.25},
     ]
-    mock_runpod.get_pod.return_value = {
-        "runtime": {"ports": [{"privatePort": 22, "ip": "5.6.7.8", "publicPort": 33333}]},
-    }
+    provider.wait_for_ssh.return_value = ("5.6.7.8", 33333)
+
     config = _make_config(gpu_type_ids_fallback=["NVIDIA RTX A4000"])
     pod = _make_pod()
-    result = provision_pod(config, pod)
+    result = provision_pod(provider, config, pod)
     assert result.pod_id == "pod456"
     assert result.provision_attempts == 2
 
 
 @patch("conductor.provisioner.check_pod_exists", return_value=True)
 def test_pod_reuse(mock_exists):
+    provider = _mock_provider()
     config = _make_config(keep_pod_alive=True)
     pod = _make_pod(pod_id="existing123", ssh_host="1.2.3.4", ssh_port=22222)
-    result = provision_pod(config, pod)
+    result = provision_pod(provider, config, pod)
     assert result.pod_id == "existing123"  # reused, not re-provisioned
 
 
 def test_get_gpu_candidates_manual():
+    provider = _mock_provider()
     config = _make_config(gpu_type_id="A", gpu_type_ids_fallback=["B", "C"])
-    assert _get_gpu_candidates(config) == ["A", "B", "C"]
+    assert _get_gpu_candidates(provider, config) == ["A", "B", "C"]
 
 
 @patch("conductor.provisioner.select_cheapest_gpus")
 def test_get_gpu_candidates_auto(mock_select):
+    provider = _mock_provider()
     mock_gpu = MagicMock()
     mock_gpu.id = "CHEAP_GPU"
     mock_select.return_value = [mock_gpu]
     config = _make_config(auto_select_cheapest_gpu=True)
-    assert _get_gpu_candidates(config) == ["CHEAP_GPU"]
+    assert _get_gpu_candidates(provider, config) == ["CHEAP_GPU"]
 
 
-@patch("conductor.provisioner.get_gpu_price", return_value=0.15)
-@patch("conductor.provisioner.runpod")
-def test_get_pod_cost_from_api(mock_runpod, mock_gpu_price):
-    mock_runpod.get_pod.return_value = {"costPerHr": 0.24}
-    assert _get_pod_cost("pod123", "GPU_X", "ALL") == 0.24
-    mock_gpu_price.assert_not_called()
+def test_check_pod_exists():
+    provider = _mock_provider()
+    provider.check_exists.return_value = True
+    assert check_pod_exists(provider, "pod123") is True
+
+    provider.check_exists.return_value = False
+    assert check_pod_exists(provider, "pod123") is False
 
 
-@patch("conductor.provisioner.get_gpu_price", return_value=0.15)
-@patch("conductor.provisioner.runpod")
-def test_get_pod_cost_fallback(mock_runpod, mock_gpu_price):
-    mock_runpod.get_pod.return_value = {}  # no costPerHr
-    assert _get_pod_cost("pod123", "GPU_X", "ALL") == 0.15
-
-
-@patch("conductor.provisioner.runpod")
-def test_check_pod_exists(mock_runpod):
-    mock_runpod.get_pod.return_value = {"desiredStatus": "RUNNING"}
-    assert check_pod_exists("pod123") is True
-
-    mock_runpod.get_pod.return_value = {"desiredStatus": "EXITED"}
-    assert check_pod_exists("pod123") is False
-
-
-@patch("conductor.provisioner.runpod")
-def test_teardown_pod(mock_runpod):
-    assert teardown_pod("pod123") is True
-    mock_runpod.terminate_pod.assert_called_once_with("pod123")
+def test_teardown_pod():
+    provider = _mock_provider()
+    provider.terminate.return_value = True
+    assert teardown_pod(provider, "pod123") is True
+    provider.terminate.assert_called_once_with("pod123")

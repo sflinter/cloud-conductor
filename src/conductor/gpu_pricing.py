@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
-import runpod
+if TYPE_CHECKING:
+    from conductor.providers import CloudProvider
 
-_cache: list[dict] | None = None
-_cache_time: float = 0.0
+_cache: dict[str, list[GpuInfo]] = {}
+_cache_time: dict[str, float] = {}
 _CACHE_TTL = 300  # 5 minutes
 
 
@@ -22,34 +24,24 @@ class GpuInfo:
     secure_available: bool
 
 
-def get_gpu_types(force_refresh: bool = False) -> list[GpuInfo]:
-    global _cache, _cache_time
-    if not force_refresh and _cache is not None and (time.time() - _cache_time) < _CACHE_TTL:
-        return _parse_gpu_list(_cache)
+def get_gpu_types(provider: CloudProvider, force_refresh: bool = False) -> list[GpuInfo]:
+    name = provider.name
+    if (not force_refresh and name in _cache
+            and (time.time() - _cache_time.get(name, 0)) < _CACHE_TTL):
+        return _cache[name]
 
-    raw = runpod.get_gpus()
-    _cache = raw
-    _cache_time = time.time()
-    return _parse_gpu_list(raw)
-
-
-def _parse_gpu_list(raw: list[dict]) -> list[GpuInfo]:
-    results = []
-    for gpu in raw:
-        results.append(GpuInfo(
-            id=gpu.get("id", ""),
-            display_name=gpu.get("displayName", gpu.get("id", "")),
-            memory_mb=gpu.get("memoryInGb", 0) * 1024,
-            community_price=gpu.get("communityPrice", 0.0) or 0.0,
-            secure_price=gpu.get("securePrice", 0.0) or 0.0,
-            community_available=bool(gpu.get("communityAvailable")),
-            secure_available=bool(gpu.get("secureAvailable")),
-        ))
-    return results
+    result = provider.get_gpu_catalog()
+    _cache[name] = result
+    _cache_time[name] = time.time()
+    return result
 
 
-def select_cheapest_gpus(min_vram_gb: int = 0, cloud_type: str = "ALL") -> list[GpuInfo]:
-    gpus = get_gpu_types()
+def select_cheapest_gpus(
+    provider: CloudProvider,
+    min_vram_gb: int = 0,
+    cloud_type: str = "ALL",
+) -> list[GpuInfo]:
+    gpus = get_gpu_types(provider)
     filtered = []
     for gpu in gpus:
         vram_gb = gpu.memory_mb / 1024
@@ -85,13 +77,13 @@ def _get_best_price(gpu: GpuInfo, cloud_type: str) -> float:
     return min(prices) if prices else 0.0
 
 
-def validate_gpu_id(gpu_id: str) -> bool:
-    gpus = get_gpu_types()
+def validate_gpu_id(provider: CloudProvider, gpu_id: str) -> bool:
+    gpus = get_gpu_types(provider)
     return any(g.id == gpu_id for g in gpus)
 
 
-def get_gpu_price(gpu_id: str, cloud_type: str = "ALL") -> float:
-    gpus = get_gpu_types()
+def get_gpu_price(provider: CloudProvider, gpu_id: str, cloud_type: str = "ALL") -> float:
+    gpus = get_gpu_types(provider)
     for g in gpus:
         if g.id == gpu_id:
             return _get_best_price(g, cloud_type)
@@ -99,6 +91,5 @@ def get_gpu_price(gpu_id: str, cloud_type: str = "ALL") -> float:
 
 
 def clear_cache() -> None:
-    global _cache, _cache_time
-    _cache = None
-    _cache_time = 0.0
+    _cache.clear()
+    _cache_time.clear()

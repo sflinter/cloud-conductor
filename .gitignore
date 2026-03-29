@@ -3,5 +3,6 @@ __pycache__/
 .venv/
 *.egg-info/
 dist/
-.conductor_state.json
-.conductor_cost_log.jsonl
+.conductor_*state*.json
+.conductor_*cost_log*.jsonl
+models/

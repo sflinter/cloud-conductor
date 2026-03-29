@@ -29,7 +29,10 @@ class JobConfig:
     name: str
     run_command: str
 
-    # RunPod settings
+    # Provider
+    provider: str = "runpod"  # "runpod" or "vastai"
+
+    # GPU / provisioning
     gpu_type_id: str = ""
     gpu_type_ids_fallback: list[str] = field(default_factory=list)
     auto_select_cheapest_gpu: bool = False
@@ -76,6 +79,12 @@ class JobConfig:
 
     # Notifications
     notifications: NotificationConfig | None = None
+
+    # Vast.ai-specific (ignored by RunPod)
+    vastai_min_reliability: float = 0.95
+    vastai_bid_price: float = 0.0
+    vastai_num_gpus: int = 1
+    vastai_geolocation: str = ""
 
     # Dependencies
     depends_on: list[str] = field(default_factory=list)

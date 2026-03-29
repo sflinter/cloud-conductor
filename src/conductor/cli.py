@@ -7,13 +7,15 @@ import os
 import sys
 import textwrap
 import time
+from pathlib import Path
 
 from conductor import __version__
 from conductor.config import load_config
 from conductor.gpu_pricing import get_gpu_price, select_cheapest_gpus
 from conductor.monitor import run_lifecycle
-from conductor.provisioner import check_pod_exists, provision_pod_direct, teardown_pod
-from conductor.registry import PodRecord, add_pod, get_pod, list_pods, update_pod
+from conductor.providers import CloudProvider, get_provider
+from conductor.provisioner import provision_pod_direct, teardown_pod
+from conductor.registry import PodRecord, add_pod, get_pod, list_pods, reconcile_with_provider, update_pod
 from conductor.runner import exec_foreground, get_log_path, get_utilization, launch_direct
 from conductor.deployer import deploy_direct
 from conductor.ssh import ssh_exec, ssh_interactive, tail_remote_log, tail_remote_log_subprocess
@@ -29,7 +31,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parent = argparse.ArgumentParser(add_help=False)
     parent.add_argument("--config", default=argparse.SUPPRESS, help="Path to TOML config file")
 
-    parser = argparse.ArgumentParser(prog="conductor", description="Cloud Conductor — RunPod GPU orchestrator")
+    parser = argparse.ArgumentParser(prog="conductor", description="Cloud Conductor — GPU orchestrator for RunPod and Vast.ai")
     parser.add_argument("--config", default=None, help="Path to TOML config file")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = parser.add_subparsers(dest="command")
@@ -91,14 +93,15 @@ def _build_parser() -> argparse.ArgumentParser:
     pod_sub = p_pod.add_subparsers(dest="pod_action")
 
     p_pp = pod_sub.add_parser("provision", help="Provision a new pod")
+    p_pp.add_argument("--provider", default="runpod", choices=["runpod", "vastai"], help="Cloud provider (default: runpod)")
     p_pp.add_argument("--gpu", required=True, help="GPU type ID (e.g. 'NVIDIA RTX 4090')")
-    p_pp.add_argument("--image", default="runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04", help="Docker image")
+    p_pp.add_argument("--image", default=None, help="Docker image (default: provider-specific)")
     p_pp.add_argument("--disk", type=int, default=40, help="Container disk in GB (default: 40)")
-    p_pp.add_argument("--cloud", default="ALL", choices=["ALL", "COMMUNITY", "SECURE"], help="Cloud type")
+    p_pp.add_argument("--cloud", default="ALL", choices=["ALL", "COMMUNITY", "SECURE"], help="Cloud type (RunPod only)")
     p_pp.add_argument("--name", default="", help="Pod name (auto-generated if empty)")
     p_pp.add_argument("--ssh-key", default="~/.ssh/id_rsa", help="SSH key path")
-    p_pp.add_argument("--volume", type=int, default=0, help="Persistent volume in GB (0 = none)")
-    p_pp.add_argument("--volume-mount", default="/workspace", help="Volume mount path")
+    p_pp.add_argument("--volume", type=int, default=0, help="Persistent volume in GB (0 = none, RunPod only)")
+    p_pp.add_argument("--volume-mount", default="/workspace", help="Volume mount path (RunPod only)")
 
     p_pl = pod_sub.add_parser("list", help="List tracked pods")
     p_pl.add_argument("--all", action="store_true", dest="show_all", help="Include terminated pods")
@@ -143,15 +146,38 @@ def _resolve_config(args) -> str:
     return "jobs.toml"
 
 
-def _ensure_api_key():
-    api_key = os.environ.get("RUNPOD_API_KEY", "")
-    if not api_key:
-        print("Error: RUNPOD_API_KEY environment variable is not set.\n"
-              "Get your API key from https://www.runpod.io/console/user/settings\n"
-              "Then: export RUNPOD_API_KEY=your_key_here", file=sys.stderr)
-        sys.exit(1)
-    import runpod
-    runpod.api_key = api_key
+_DEFAULT_IMAGES = {
+    "runpod": "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04",
+    "vastai": "pytorch/pytorch:2.4.0-cuda12.4-cudnn9-devel",
+}
+
+
+def _configure_provider(provider_name: str) -> CloudProvider:
+    provider = get_provider(provider_name)
+
+    if provider_name == "runpod":
+        api_key = os.environ.get("RUNPOD_API_KEY", "")
+        if not api_key:
+            print("Error: RUNPOD_API_KEY environment variable is not set.\n"
+                  "Get your API key from https://www.runpod.io/console/user/settings\n"
+                  "Then: export RUNPOD_API_KEY=your_key_here", file=sys.stderr)
+            sys.exit(1)
+    elif provider_name == "vastai":
+        api_key = os.environ.get("VASTAI_API_KEY", "")
+        if not api_key:
+            key_file = Path.home() / ".config" / "vastai" / "vast_api_key"
+            if key_file.exists():
+                api_key = key_file.read_text().strip()
+        if not api_key:
+            print("Error: VASTAI_API_KEY environment variable is not set.\n"
+                  "Get your API key from https://cloud.vast.ai/cli/\n"
+                  "Then: export VASTAI_API_KEY=your_key_here", file=sys.stderr)
+            sys.exit(1)
+    else:
+        raise ValueError(f"Unknown provider: {provider_name}")
+
+    provider.configure(api_key)
+    return provider
 
 
 _STARTER_TOML = textwrap.dedent("""\
@@ -159,6 +185,7 @@ _STARTER_TOML = textwrap.dedent("""\
     # Docs: https://github.com/sflinter/cloud-conductor
 
     [global]
+    # provider = "runpod"                    # "runpod" or "vastai"
     # gpu_type_id = "NVIDIA RTX A5000"
     # gpu_type_ids_fallback = ["NVIDIA RTX A4000"]
     image_name = "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04"
@@ -287,9 +314,13 @@ def cmd_completions(args, parser=None):
 
 
 def cmd_run(args):
-    _ensure_api_key()
     job_names = args.jobs.split(",") if args.jobs else None
     configs = load_config(args.config, job_names=job_names)
+
+    # Configure providers for all jobs
+    provider_names = {c.provider for c in configs}
+    for name in provider_names:
+        _configure_provider(name)
 
     # Validate first
     result = validate(configs, check_gpu=False)
@@ -327,12 +358,34 @@ def cmd_run(args):
 def cmd_status(args):
     configs = load_config(args.config)
     config_map = {c.name: c for c in configs}
+    reconcile_with_provider()
     state_path = configs[0].state_file
     if not os.path.exists(state_path):
         print("No state file found. Run 'conductor run' first.")
         return
 
     state = load_state(state_path)
+
+    # Reconcile running jobs against provider to detect terminated pods
+    provider_cache: dict[str, CloudProvider] = {}
+    for job in state.jobs:
+        if job.status not in ("running", "deploying") or not job.pod_id:
+            continue
+        config = config_map.get(job.name)
+        if not config:
+            continue
+        prov_name = config.provider
+        if prov_name not in provider_cache:
+            try:
+                provider_cache[prov_name] = get_provider(prov_name)
+            except Exception:
+                continue
+        prov = provider_cache[prov_name]
+        try:
+            if not prov.check_exists(job.pod_id):
+                job.status = "terminated"
+        except Exception:
+            pass
 
     show_util = getattr(args, "util", False)
 
@@ -412,9 +465,14 @@ def cmd_sync(args):
 
 
 def cmd_teardown(args):
-    _ensure_api_key()
     job_names = args.jobs.split(",") if args.jobs else None
     configs = load_config(args.config, job_names=job_names)
+
+    # Configure providers
+    provider_names = {c.provider for c in configs}
+    providers = {name: _configure_provider(name) for name in provider_names}
+    config_map = {c.name: c for c in configs}
+
     state_path = configs[0].state_file
 
     if not os.path.exists(state_path):
@@ -439,8 +497,10 @@ def cmd_teardown(args):
     for job in state.jobs:
         if not job.pod_id:
             continue
+        cfg = config_map.get(job.name)
+        prov = providers.get(cfg.provider) if cfg else providers.get("runpod")
         print(f"Tearing down {job.name} ({job.pod_id})...")
-        teardown_pod(job.pod_id)
+        teardown_pod(prov, job.pod_id)
         job.status = "failed"
         job.error = "manual teardown"
 
@@ -449,12 +509,17 @@ def cmd_teardown(args):
 
 
 def cmd_dry_run(args):
-    _ensure_api_key()
     configs = load_config(args.config)
+
+    # Configure providers
+    provider_names = {c.provider for c in configs}
+    providers = {name: _configure_provider(name) for name in provider_names}
 
     print("=== Dry Run ===\n")
     for cfg in configs:
+        prov = providers.get(cfg.provider)
         print(f"Job: {cfg.name}")
+        print(f"  Provider: {cfg.provider}")
         print(f"  GPU: {cfg.gpu_type_id or '(auto-select cheapest)'}")
         if cfg.gpu_type_ids_fallback:
             print(f"  Fallback: {', '.join(cfg.gpu_type_ids_fallback)}")
@@ -467,14 +532,14 @@ def cmd_dry_run(args):
         # Try to get price estimate
         if cfg.auto_select_cheapest_gpu:
             try:
-                gpus = select_cheapest_gpus(cfg.gpu_min_vram_gb, cfg.cloud_type)
+                gpus = select_cheapest_gpus(prov, cfg.gpu_min_vram_gb, cfg.cloud_type)
                 if gpus:
                     print(f"  Cheapest GPU: {gpus[0].id} (${gpus[0].community_price:.2f}/hr)")
             except Exception:
                 print("  (Could not fetch GPU prices)")
         elif cfg.gpu_type_id:
             try:
-                price = get_gpu_price(cfg.gpu_type_id, cfg.cloud_type)
+                price = get_gpu_price(prov, cfg.gpu_type_id, cfg.cloud_type)
                 if price > 0:
                     print(f"  Est. cost: ${price:.2f}/hr")
             except Exception:
@@ -700,16 +765,19 @@ def _resolve_pod(identifier: str) -> PodRecord:
 
 
 def cmd_pod_provision(args):
-    _ensure_api_key()
+    provider_name = args.provider
+    provider = _configure_provider(provider_name)
     ssh_key = os.path.expanduser(args.ssh_key)
-    print(f"Provisioning pod with {args.gpu}...")
+    image = args.image or _DEFAULT_IMAGES.get(provider_name, "ubuntu:22.04")
+    print(f"Provisioning on {provider_name} with {args.gpu}...")
     record = provision_pod_direct(
+        provider=provider,
         gpu_type_id=args.gpu,
-        image_name=args.image,
+        image_name=image,
         ssh_key_path=ssh_key,
         name=args.name,
+        disk_gb=args.disk,
         cloud_type=args.cloud,
-        container_disk_in_gb=args.disk,
         volume_in_gb=args.volume,
         volume_mount_path=args.volume_mount,
     )
@@ -719,6 +787,7 @@ def cmd_pod_provision(args):
 
     add_pod(record)
     print(f"\nPod ready:")
+    print(f"  Provider: {record.provider}")
     print(f"  Name:    {record.name}")
     print(f"  ID:      {record.pod_id}")
     print(f"  GPU:     {record.gpu_type}")
@@ -779,8 +848,6 @@ def cmd_pod_logs(args):
 
 
 def cmd_pod_teardown(args):
-    _ensure_api_key()
-
     if getattr(args, "teardown_all", False):
         pods = [p for p in list_pods() if p.status == "running"]
         if not pods:
@@ -794,9 +861,15 @@ def cmd_pod_teardown(args):
             if answer != "y":
                 print("Aborted.")
                 return
+        # Configure providers needed
+        provider_cache: dict[str, CloudProvider] = {}
         for p in pods:
+            if p.provider not in provider_cache:
+                provider_cache[p.provider] = _configure_provider(p.provider)
+        for p in pods:
+            prov = provider_cache[p.provider]
             print(f"Tearing down {p.name} ({p.pod_id})...")
-            teardown_pod(p.pod_id)
+            teardown_pod(prov, p.pod_id)
             update_pod(p.pod_id, status="terminated")
         print("All pods terminated.")
         return
@@ -812,8 +885,9 @@ def cmd_pod_teardown(args):
             print("Aborted.")
             return
 
+    provider = _configure_provider(record.provider)
     print(f"Tearing down {record.name} ({record.pod_id})...")
-    teardown_pod(record.pod_id)
+    teardown_pod(provider, record.pod_id)
     update_pod(record.pod_id, status="terminated")
     print("Done.")
 
@@ -907,7 +981,7 @@ def cmd_pod_stop(args):
 
 
 def cmd_status_registry(args):
-    pods = [p for p in list_pods() if p.status != "terminated"]
+    pods = [p for p in reconcile_with_provider() if p.status != "terminated"]
     if not pods:
         print("No active pods. Use 'conductor pod provision' to create one,")
         print("or 'conductor run -f jobs.toml' for batch mode.")

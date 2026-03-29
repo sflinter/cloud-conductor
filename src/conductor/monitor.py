@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from conductor.config import JobConfig
 from conductor.deployer import deploy
 from conductor.notify import send_notification
+from conductor.providers import CloudProvider, get_provider
 from conductor.provisioner import check_pod_exists, provision_pod, teardown_pod
 from conductor.registry import PodRecord, add_pod as registry_add, update_pod as registry_update
 from conductor.runner import get_log_path, get_utilization, is_alive, launch
@@ -31,11 +32,17 @@ def run_lifecycle(
     state_path: str,
     cost_log_path: str,
     budget_override: float = 0.0,
+    provider: CloudProvider | None = None,
 ) -> RunState:
     if budget_override > 0:
         state.budget_usd = budget_override
 
+    # Create provider if not supplied (backward compat)
+    if provider is None:
+        provider = get_provider(configs[0].provider)
+
     config_map = {c.name: c for c in configs}
+    provider_map = {c.name: get_provider(c.provider) for c in configs}
     shutdown = {"requested": False}
 
     def _sigint_handler(sig, frame):
@@ -49,11 +56,11 @@ def run_lifecycle(
 
     try:
         # Start jobs that have no dependencies (or deps already met)
-        _start_unblocked_jobs(configs, config_map, state, state_path, cost_log_path)
+        _start_unblocked_jobs(configs, config_map, provider_map, state, state_path, cost_log_path)
         save_state(state, state_path)
 
         while not _all_done(state) and not shutdown["requested"]:
-            _monitor_tick(configs, config_map, state, state_path, cost_log_path)
+            _monitor_tick(configs, config_map, provider_map, state, state_path, cost_log_path)
             save_state(state, state_path)
 
             if shutdown["requested"]:
@@ -62,14 +69,14 @@ def run_lifecycle(
             # Check global budget
             if state.budget_usd > 0 and state.total_cost_usd >= state.budget_usd:
                 log.warning("Global budget exceeded! Tearing down all pods.")
-                _teardown_all(configs, config_map, state, state_path, cost_log_path, reason="budget_exceeded")
+                _teardown_all(configs, config_map, provider_map, state, state_path, cost_log_path, reason="budget_exceeded")
                 break
 
             _print_status(state)
             time.sleep(POLL_INTERVAL)
 
         if shutdown["requested"]:
-            _graceful_shutdown(configs, config_map, state, state_path, cost_log_path)
+            _graceful_shutdown(configs, config_map, provider_map, state, state_path, cost_log_path)
     finally:
         signal.signal(signal.SIGINT, prev_handler)
         save_state(state, state_path)
@@ -80,6 +87,7 @@ def run_lifecycle(
 def _monitor_tick(
     configs: list[JobConfig],
     config_map: dict[str, JobConfig],
+    provider_map: dict[str, CloudProvider],
     state: RunState,
     state_path: str,
     cost_log_path: str,
@@ -98,10 +106,13 @@ def _monitor_tick(
         # Check per-job budget
         if config.job_budget_usd > 0 and job.cost_usd >= config.job_budget_usd:
             log.warning(f"[{job.name}] Per-job budget exceeded (${job.cost_usd:.2f} >= ${config.job_budget_usd:.2f})")
-            _finish_job(job, config, state, cost_log_path, "failed", error="job budget exceeded")
+            prov = provider_map.get(job.name)
+            _finish_job(prov, job, config, state, cost_log_path, "failed", error="job budget exceeded")
             send_notification(config.notifications, "job_budget_exceeded",
                               job=job.name, cost_usd=job.cost_usd)
             continue
+
+        prov = provider_map.get(job.name)
 
         # Check if process is alive
         alive = is_alive(job, config.ssh_key_path)
@@ -119,7 +130,7 @@ def _monitor_tick(
                         log.info(f"[{job.name}] GPU util {gpu_util}% < {config.stall_gpu_threshold}%, starting stall timer")
                     elif (time.time() - job.stalled_since) / 60 >= config.stall_timeout_minutes:
                         log.warning(f"[{job.name}] GPU stall timeout reached ({config.stall_timeout_minutes}m)")
-                        _finish_job(job, config, state, cost_log_path, "failed", error="gpu stall detected")
+                        _finish_job(prov, job, config, state, cost_log_path, "failed", error="gpu stall detected")
                         send_notification(config.notifications, "job_failed",
                                           job=job.name, error="gpu stall detected")
                         continue
@@ -136,14 +147,14 @@ def _monitor_tick(
                     job.last_sync_at = time.time()
         elif alive is False:
             # Process not running — check if pod is still alive
-            if job.pod_id and check_pod_exists(job.pod_id):
+            if job.pod_id and check_pod_exists(prov, job.pod_id):
                 # Pod alive but process gone — idle detection
                 if job.idle_since is None:
                     job.idle_since = time.time()
                     log.info(f"[{job.name}] Process not running, starting idle timer")
                 elif (time.time() - job.idle_since) / 60 >= config.idle_timeout_minutes:
                     log.info(f"[{job.name}] Idle timeout reached, marking completed")
-                    _finish_job(job, config, state, cost_log_path, "completed")
+                    _finish_job(prov, job, config, state, cost_log_path, "completed")
                     send_notification(config.notifications, "job_complete",
                                       job=job.name, cost_usd=job.cost_usd,
                                       gpu_type=job.gpu_type)
@@ -151,21 +162,22 @@ def _monitor_tick(
                 # Pod gone — spot interruption
                 log.warning(f"[{job.name}] Spot interruption detected")
                 send_notification(config.notifications, "spot_recovery", job=job.name)
-                _spot_recover(job, config, state, state_path, cost_log_path)
+                _spot_recover(prov, job, config, state, state_path, cost_log_path)
         elif alive is None:
             # SSH unreachable — likely spot interruption
-            if job.pod_id and not check_pod_exists(job.pod_id):
+            if job.pod_id and not check_pod_exists(prov, job.pod_id):
                 log.warning(f"[{job.name}] Pod gone (spot interruption)")
                 send_notification(config.notifications, "spot_recovery", job=job.name)
-                _spot_recover(job, config, state, state_path, cost_log_path)
+                _spot_recover(prov, job, config, state, state_path, cost_log_path)
 
     # Start newly unblocked jobs
-    _start_unblocked_jobs(configs, config_map, state, state_path, cost_log_path)
+    _start_unblocked_jobs(configs, config_map, provider_map, state, state_path, cost_log_path)
 
 
 def _start_unblocked_jobs(
     configs: list[JobConfig],
     config_map: dict[str, JobConfig],
+    provider_map: dict[str, CloudProvider],
     state: RunState,
     state_path: str,
     cost_log_path: str,
@@ -198,22 +210,25 @@ def _start_unblocked_jobs(
 
     if len(ready) == 1:
         job, config = ready[0]
+        prov = provider_map.get(job.name)
         log.info(f"[{job.name}] Starting job")
-        _provision_deploy_launch(job, config, state, state_path, cost_log_path)
+        _provision_deploy_launch(prov, job, config, state, state_path, cost_log_path)
     else:
         lock = threading.Lock()
         log.info(f"Starting {len(ready)} jobs in parallel: {', '.join(j.name for j, _ in ready)}")
 
         def _launch(pair):
             job, config = pair
+            prov = provider_map.get(job.name)
             log.info(f"[{job.name}] Starting job")
-            _provision_deploy_launch(job, config, state, state_path, cost_log_path, lock=lock)
+            _provision_deploy_launch(prov, job, config, state, state_path, cost_log_path, lock=lock)
 
         with ThreadPoolExecutor(max_workers=len(ready)) as pool:
             list(pool.map(_launch, ready))
 
 
 def _provision_deploy_launch(
+    provider: CloudProvider,
     job: PodState,
     config: JobConfig,
     state: RunState,
@@ -224,8 +239,16 @@ def _provision_deploy_launch(
     cm = lock or contextlib.nullcontext()
     is_reuse = config.keep_pod_alive and job.pod_id is not None
 
+    # Terminate any existing pod before provisioning a replacement
+    if job.pod_id and not is_reuse:
+        try:
+            teardown_pod(provider, job.pod_id)
+            registry_update(job.pod_id, status="terminated")
+        except Exception:
+            pass
+
     # Provision
-    provision_pod(config, job)
+    provision_pod(provider, config, job)
     if job.status == "failed":
         _propagate_failure(job, state)
         send_notification(config.notifications, "job_failed",
@@ -253,6 +276,7 @@ def _provision_deploy_launch(
             status="running",
             created_at=job.started_at or time.time(),
             source="declarative",
+            provider=config.provider,
             remote_project_dir=config.remote_project_dir,
             job_name=job.name,
         ))
@@ -267,7 +291,7 @@ def _provision_deploy_launch(
         job.status = "failed"
         job.error = "deploy failed"
         if job.pod_id:
-            teardown_pod(job.pod_id)
+            teardown_pod(provider, job.pod_id)
         _propagate_failure(job, state)
         send_notification(config.notifications, "job_failed",
                           job=job.name, error=job.error)
@@ -279,7 +303,7 @@ def _provision_deploy_launch(
         job.status = "failed"
         job.error = "launch failed"
         if job.pod_id:
-            teardown_pod(job.pod_id)
+            teardown_pod(provider, job.pod_id)
         _propagate_failure(job, state)
         send_notification(config.notifications, "job_failed",
                           job=job.name, error=job.error)
@@ -294,6 +318,7 @@ def _provision_deploy_launch(
 
 
 def _spot_recover(
+    provider: CloudProvider,
     job: PodState,
     config: JobConfig,
     state: RunState,
@@ -310,7 +335,8 @@ def _spot_recover(
 
     # Teardown dead pod
     if job.pod_id:
-        teardown_pod(job.pod_id)
+        teardown_pod(provider, job.pod_id)
+        registry_update(job.pod_id, status="terminated", cost_usd=job.cost_usd)
         append_cost_event(cost_log_path, {
             "event": "pod_stopped", "job": job.name, "pod_id": job.pod_id,
             "reason": "spot_interruption", "total_cost_usd": job.cost_usd,
@@ -328,7 +354,7 @@ def _spot_recover(
     job.pid = None
 
     # Re-provision, re-deploy, push synced results, re-launch
-    _provision_deploy_launch(job, config, state, state_path, cost_log_path)
+    _provision_deploy_launch(provider, job, config, state, state_path, cost_log_path)
 
     if job.status == "running" and config.sync_paths:
         # Push previously synced results back to pod
@@ -336,6 +362,7 @@ def _spot_recover(
 
 
 def _finish_job(
+    provider: CloudProvider,
     job: PodState,
     config: JobConfig,
     state: RunState,
@@ -348,7 +375,7 @@ def _finish_job(
 
     # Teardown (unless keep_pod_alive)
     if job.pod_id and not (status == "completed" and config.keep_pod_alive):
-        teardown_pod(job.pod_id)
+        teardown_pod(provider, job.pod_id)
 
     elapsed_hours = 0.0
     if job.started_at:
@@ -424,6 +451,7 @@ def _all_done(state: RunState) -> bool:
 def _teardown_all(
     configs: list[JobConfig],
     config_map: dict[str, JobConfig],
+    provider_map: dict[str, CloudProvider],
     state: RunState,
     state_path: str,
     cost_log_path: str,
@@ -434,13 +462,15 @@ def _teardown_all(
             continue
         config = config_map.get(job.name)
         if config:
-            _finish_job(job, config, state, cost_log_path, "failed", error=reason)
+            prov = provider_map.get(job.name)
+            _finish_job(prov, job, config, state, cost_log_path, "failed", error=reason)
     save_state(state, state_path)
 
 
 def _graceful_shutdown(
     configs: list[JobConfig],
     config_map: dict[str, JobConfig],
+    provider_map: dict[str, CloudProvider],
     state: RunState,
     state_path: str,
     cost_log_path: str,
@@ -452,11 +482,12 @@ def _graceful_shutdown(
         config = config_map.get(job.name)
         if not config:
             continue
+        prov = provider_map.get(job.name)
         # Final sync
         sync_pull(config, job)
         # Teardown unless keep_pod_alive
         if job.pod_id and not config.keep_pod_alive:
-            teardown_pod(job.pod_id)
+            teardown_pod(prov, job.pod_id)
             job.status = "failed"
             job.error = "interrupted"
         elif config.keep_pod_alive:

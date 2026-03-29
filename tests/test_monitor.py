@@ -18,6 +18,12 @@ def _make_config(**overrides):
     return JobConfig(**defaults)
 
 
+def _mock_provider_map(configs):
+    provider = MagicMock()
+    provider.name = "runpod"
+    return {c.name: provider for c in configs}
+
+
 def test_all_done():
     state = RunState(jobs=[
         PodState(name="a", status="completed"),
@@ -86,10 +92,11 @@ def test_start_unblocked_jobs(mock_pdl):
     ])
     configs = [_make_config(name="a"), _make_config(name="b", depends_on=["a"])]
     config_map = {c.name: c for c in configs}
+    provider_map = _mock_provider_map(configs)
 
     with tempfile.NamedTemporaryFile(suffix=".json") as sf, \
          tempfile.NamedTemporaryFile(suffix=".jsonl") as cf:
-        _start_unblocked_jobs(configs, config_map, state, sf.name, cf.name)
+        _start_unblocked_jobs(configs, config_map, provider_map, state, sf.name, cf.name)
         mock_pdl.assert_called_once()
 
 
@@ -101,10 +108,11 @@ def test_start_unblocked_skips_on_failed_dep(mock_pdl):
     ])
     configs = [_make_config(name="a"), _make_config(name="b", depends_on=["a"])]
     config_map = {c.name: c for c in configs}
+    provider_map = _mock_provider_map(configs)
 
     with tempfile.NamedTemporaryFile(suffix=".json") as sf, \
          tempfile.NamedTemporaryFile(suffix=".jsonl") as cf:
-        _start_unblocked_jobs(configs, config_map, state, sf.name, cf.name)
+        _start_unblocked_jobs(configs, config_map, provider_map, state, sf.name, cf.name)
         mock_pdl.assert_not_called()
         assert state.jobs[1].status == "skipped"
 
@@ -120,11 +128,13 @@ def test_monitor_tick_running_job(mock_alive, mock_pod_exists, mock_start, mock_
                    last_sync_at=_time.time())
     state = RunState(jobs=[job], total_cost_usd=0.0, budget_usd=40.0)
     config = _make_config(name="a")
+    configs = [config]
     config_map = {"a": config}
+    provider_map = _mock_provider_map(configs)
 
     with tempfile.NamedTemporaryFile(suffix=".json") as sf, \
          tempfile.NamedTemporaryFile(suffix=".jsonl") as cf:
-        _monitor_tick([config], config_map, state, sf.name, cf.name)
+        _monitor_tick(configs, config_map, provider_map, state, sf.name, cf.name)
         assert job.idle_since is None  # process alive, no idle
 
 
@@ -141,16 +151,18 @@ def test_monitor_tick_idle_detection(mock_alive, mock_pod_exists, mock_start, mo
                    pod_id="pod123", last_sync_at=_time.time())
     state = RunState(jobs=[job], total_cost_usd=0.0, budget_usd=40.0)
     config = _make_config(name="a", idle_timeout_minutes=0)  # immediate timeout
+    configs = [config]
     config_map = {"a": config}
+    provider_map = _mock_provider_map(configs)
 
     with tempfile.NamedTemporaryFile(suffix=".json") as sf, \
          tempfile.NamedTemporaryFile(suffix=".jsonl") as cf:
         # First tick: sets idle_since
-        _monitor_tick([config], config_map, state, sf.name, cf.name)
+        _monitor_tick(configs, config_map, provider_map, state, sf.name, cf.name)
         assert job.idle_since is not None
 
         # Second tick: idle timeout reached (0 minutes)
-        _monitor_tick([config], config_map, state, sf.name, cf.name)
+        _monitor_tick(configs, config_map, provider_map, state, sf.name, cf.name)
         mock_finish.assert_called_once()
 
 
@@ -166,22 +178,24 @@ def test_monitor_tick_stall_detection(mock_util, mock_alive, mock_pod_exists, mo
                    pod_id="pod123", last_sync_at=_time.time())
     state = RunState(jobs=[job], total_cost_usd=0.0, budget_usd=40.0)
     config = _make_config(name="a", stall_timeout_minutes=0)  # immediate timeout
+    configs = [config]
     config_map = {"a": config}
+    provider_map = _mock_provider_map(configs)
 
     with tempfile.NamedTemporaryFile(suffix=".json") as sf, \
          tempfile.NamedTemporaryFile(suffix=".jsonl") as cf:
         # First tick: sets stalled_since
         config.stall_timeout_minutes = 1  # enable, but won't fire yet (just started)
-        _monitor_tick([config], config_map, state, sf.name, cf.name)
+        _monitor_tick(configs, config_map, provider_map, state, sf.name, cf.name)
         assert job.stalled_since is not None
 
         # Force stalled_since into the past to trigger timeout
         job.stalled_since = _time.time() - 120
         with patch("conductor.monitor._finish_job") as mock_finish:
-            _monitor_tick([config], config_map, state, sf.name, cf.name)
+            _monitor_tick(configs, config_map, provider_map, state, sf.name, cf.name)
             mock_finish.assert_called_once()
             assert mock_finish.call_args[1].get("error") == "gpu stall detected" or \
-                   mock_finish.call_args[0][4] == "failed"
+                   mock_finish.call_args[0][5] == "failed"
 
 
 @patch("conductor.monitor.send_notification", return_value=False)
@@ -197,11 +211,13 @@ def test_monitor_tick_stall_resets_on_active_gpu(mock_util, mock_alive, mock_pod
                    stalled_since=_time.time() - 60)
     state = RunState(jobs=[job], total_cost_usd=0.0, budget_usd=40.0)
     config = _make_config(name="a", stall_timeout_minutes=5)
+    configs = [config]
     config_map = {"a": config}
+    provider_map = _mock_provider_map(configs)
 
     with tempfile.NamedTemporaryFile(suffix=".json") as sf, \
          tempfile.NamedTemporaryFile(suffix=".jsonl") as cf:
-        _monitor_tick([config], config_map, state, sf.name, cf.name)
+        _monitor_tick(configs, config_map, provider_map, state, sf.name, cf.name)
         assert job.stalled_since is None
 
 
@@ -216,11 +232,13 @@ def test_monitor_tick_stall_noop_when_disabled(mock_alive, mock_pod_exists, mock
                    pod_id="pod123", last_sync_at=_time.time())
     state = RunState(jobs=[job], total_cost_usd=0.0, budget_usd=40.0)
     config = _make_config(name="a", stall_timeout_minutes=0)  # disabled
+    configs = [config]
     config_map = {"a": config}
+    provider_map = _mock_provider_map(configs)
 
     with tempfile.NamedTemporaryFile(suffix=".json") as sf, \
          tempfile.NamedTemporaryFile(suffix=".jsonl") as cf:
-        _monitor_tick([config], config_map, state, sf.name, cf.name)
+        _monitor_tick(configs, config_map, provider_map, state, sf.name, cf.name)
         assert job.stalled_since is None
 
 
@@ -237,11 +255,13 @@ def test_monitor_tick_stall_resets_on_util_none(mock_util, mock_alive, mock_pod_
                    stalled_since=_time.time() - 60)
     state = RunState(jobs=[job], total_cost_usd=0.0, budget_usd=40.0)
     config = _make_config(name="a", stall_timeout_minutes=5)
+    configs = [config]
     config_map = {"a": config}
+    provider_map = _mock_provider_map(configs)
 
     with tempfile.NamedTemporaryFile(suffix=".json") as sf, \
          tempfile.NamedTemporaryFile(suffix=".jsonl") as cf:
-        _monitor_tick([config], config_map, state, sf.name, cf.name)
+        _monitor_tick(configs, config_map, provider_map, state, sf.name, cf.name)
         assert job.stalled_since is None
 
 
@@ -255,19 +275,20 @@ def test_parallel_launch(mock_pdl):
     ])
     configs = [_make_config(name="a"), _make_config(name="b"), _make_config(name="c")]
     config_map = {c.name: c for c in configs}
+    provider_map = _mock_provider_map(configs)
 
     launched_threads = []
 
-    def _track_thread(job, config, state, state_path, cost_log_path, lock=None):
+    def _track_thread(provider, job, config, state, state_path, cost_log_path, lock=None):
         launched_threads.append(threading.current_thread().name)
 
     mock_pdl.side_effect = _track_thread
 
     with tempfile.NamedTemporaryFile(suffix=".json") as sf, \
          tempfile.NamedTemporaryFile(suffix=".jsonl") as cf:
-        _start_unblocked_jobs(configs, config_map, state, sf.name, cf.name)
+        _start_unblocked_jobs(configs, config_map, provider_map, state, sf.name, cf.name)
 
     assert mock_pdl.call_count == 3
     # Verify lock was passed (parallel path)
     for call in mock_pdl.call_args_list:
-        assert call.kwargs.get("lock") is not None or (len(call.args) > 5 and call.args[5] is not None)
+        assert call.kwargs.get("lock") is not None or (len(call.args) > 6 and call.args[6] is not None)

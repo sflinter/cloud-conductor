@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Cloud Conductor is a lightweight CLI orchestrator for RunPod GPU workloads. It supports two modes: **imperative** (`conductor pod` commands for direct pod management without any config file) and **declarative** (`conductor run -f jobs.toml` for batch orchestration). It is **project-agnostic**: it runs arbitrary shell commands on GPU pods and knows nothing about the specific workloads.
+Cloud Conductor is a lightweight CLI orchestrator for GPU cloud workloads (RunPod and Vast.ai). It supports two modes: **imperative** (`conductor pod` commands for direct pod management without any config file) and **declarative** (`conductor run -f jobs.toml` for batch orchestration). It is **project-agnostic**: it runs arbitrary shell commands on GPU pods and knows nothing about the specific workloads.
 
 The full specification is in `SPEC.md`. Read it before making architectural decisions.
 
@@ -32,14 +32,17 @@ Python 3.12+. Uses `uv` for package management (never pip/conda).
 Key modules:
 - `cli.py` — argparse entry point with `pod` subcommand group (imperative) and traditional subcommands (declarative)
 - `config.py` — TOML loading, merges `[global]` defaults with per-`[[jobs]]` overrides into `JobConfig` dataclasses
-- `registry.py` — global pod registry (`~/.conductor/pods.json`), tracks all pods regardless of creation mode
-- `provisioner.py` — RunPod pod creation; `provision_pod_direct()` for imperative use, `provision_pod()` wrapper for declarative
+- `providers/__init__.py` — `CloudProvider` protocol + `get_provider()` registry
+- `providers/runpod.py` — `RunPodProvider`: wraps `runpod` SDK for pod CRUD, SSH discovery, GPU catalog
+- `providers/vastai.py` — `VastaiProvider`: REST calls via `httpx` to `console.vast.ai/api/v0/` for instance CRUD
+- `registry.py` — global pod registry (`~/.conductor/pods.json`), tracks all pods regardless of creation mode; `reconcile_with_provider()` verifies pod status against the actual cloud provider
+- `provisioner.py` — provider-agnostic provisioning; `provision_pod_direct()` for imperative, `provision_pod()` for declarative
 - `deployer.py` — `deploy_direct()` for imperative rsync, `deploy()` wrapper for declarative
 - `runner.py` — `launch_direct()` and `exec_foreground()` for imperative, `launch()` wrapper for declarative
 - `monitor.py` — main loop: status checks, periodic sync, spot recovery, cost tracking, GPU stall detection, dependency resolution
 - `state.py` — `PodState` dataclass (includes `idle_since`, `stalled_since`), JSON state file + JSONL cost log I/O
 - `ssh.py` — SSH/rsync helpers (all connections use `-o StrictHostKeyChecking=no` for ephemeral pods)
-- `gpu_pricing.py` — queries RunPod API for GPU prices, caches 5 min
+- `gpu_pricing.py` — queries provider GPU catalog for prices, caches 5 min
 - `notify.py` — notification dispatch (terminal-notifier, pushover, or custom command)
 - `validator.py` — pre-flight checks (SSH keys, paths, GPU IDs, dependency cycles)
 
@@ -52,20 +55,22 @@ Key modules:
 
 Intentionally minimal:
 - `runpod` — RunPod Python SDK for pod CRUD
-- `httpx` — HTTP client (only for pushover notifications; optional)
+- `httpx` — HTTP client for Vast.ai REST API and pushover notifications
 - stdlib only for everything else (no click, no rich)
 - System: `ssh`, `rsync`
 
 ## Key Design Decisions
 
+- **Multi-provider**: `CloudProvider` protocol in `providers/` with RunPod and Vast.ai implementations. Provider selected via `provider` config field or `--provider` CLI flag
 - **Dual-mode CLI**: imperative `conductor pod` commands for ad-hoc work, declarative `conductor run -f` for batch orchestration
 - Core operations (`provision_pod_direct`, `deploy_direct`, `launch_direct`) are decoupled from config — imperative commands use them directly
-- Global pod registry at `~/.conductor/pods.json` tracks all pods; declarative runs also register here
+- Global pod registry at `~/.conductor/pods.json` tracks all pods (includes `provider` field for teardown without config); `conductor status` reconciles registry against provider API so stale entries are auto-corrected
+- Before provisioning a replacement pod (spot recovery or re-provision), the old pod is always terminated first to prevent orphans
 - `run_command` is an opaque user-supplied shell string — the conductor never parses it
 - Per-job overrides: any `[global]` config field can be overridden in a `[[jobs]]` entry
 - `depends_on` supports job ordering with cycle detection; failed dependencies cascade as `skipped`
 - `keep_pod_alive` enables pod reuse across runs (re-syncs code, skips setup)
-- `auto_select_cheapest_gpu` queries RunPod API at provision time instead of using manual fallback lists
+- `auto_select_cheapest_gpu` queries provider API at provision time instead of using manual fallback lists
 - Aggressive cost defaults: GPU stall detection enabled (30 min), idle timeout 5 min
 
 ## RunPod Operational Notes
