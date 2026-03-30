@@ -64,7 +64,7 @@ Intentionally minimal:
 - **Multi-provider**: `CloudProvider` protocol in `providers/` with RunPod and Vast.ai implementations. Provider selected via `provider` config field or `--provider` CLI flag
 - **Dual-mode CLI**: imperative `conductor pod` commands for ad-hoc work, declarative `conductor run -f` for batch orchestration
 - Core operations (`provision_pod_direct`, `deploy_direct`, `launch_direct`) are decoupled from config — imperative commands use them directly
-- Global pod registry at `~/.conductor/pods.json` tracks all pods (includes `provider` field for teardown without config); `conductor status` reconciles registry against provider API so stale entries are auto-corrected
+- Global pod registry at `~/.conductor/pods.json` tracks all pods (includes `provider` field for teardown without config); `conductor status` reconciles registry bidirectionally against the provider API — marks missing pods as terminated and resurrects terminated pods found still running
 - Before provisioning a replacement pod (spot recovery or re-provision), the old pod is always terminated first to prevent orphans
 - `run_command` is an opaque user-supplied shell string — the conductor never parses it
 - Per-job overrides: any `[global]` config field can be overridden in a `[[jobs]]` entry
