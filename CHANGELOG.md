@@ -4,6 +4,7 @@
 
 - Fix `keep_pod_alive` registry bug: pods kept alive on completion were incorrectly marked as `terminated` in the global registry, making them invisible to `conductor status` and preventing reuse
 - Fix one-way reconciliation: `reconcile_with_provider()` now resurrects pods that are marked `terminated` in the registry but still running on the provider
+- Fix reconciliation using unconfigured providers: provider API keys were not being set, causing all API calls to fail silently. Extract `get_configured_provider()` for shared use
 
 ## 0.5.0
 

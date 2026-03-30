@@ -13,7 +13,7 @@ from conductor import __version__
 from conductor.config import load_config
 from conductor.gpu_pricing import get_gpu_price, select_cheapest_gpus
 from conductor.monitor import run_lifecycle
-from conductor.providers import CloudProvider, get_provider
+from conductor.providers import CloudProvider
 from conductor.provisioner import provision_pod_direct, teardown_pod
 from conductor.registry import PodRecord, add_pod, get_pod, list_pods, reconcile_with_provider, update_pod
 from conductor.runner import exec_foreground, get_log_path, get_utilization, launch_direct
@@ -153,31 +153,23 @@ _DEFAULT_IMAGES = {
 
 
 def _configure_provider(provider_name: str) -> CloudProvider:
-    provider = get_provider(provider_name)
+    from conductor.providers import get_configured_provider
+
+    provider = get_configured_provider(provider_name)
+    if provider:
+        return provider
 
     if provider_name == "runpod":
-        api_key = os.environ.get("RUNPOD_API_KEY", "")
-        if not api_key:
-            print("Error: RUNPOD_API_KEY environment variable is not set.\n"
-                  "Get your API key from https://www.runpod.io/console/user/settings\n"
-                  "Then: export RUNPOD_API_KEY=your_key_here", file=sys.stderr)
-            sys.exit(1)
+        print("Error: RUNPOD_API_KEY environment variable is not set.\n"
+              "Get your API key from https://www.runpod.io/console/user/settings\n"
+              "Then: export RUNPOD_API_KEY=your_key_here", file=sys.stderr)
     elif provider_name == "vastai":
-        api_key = os.environ.get("VASTAI_API_KEY", "")
-        if not api_key:
-            key_file = Path.home() / ".config" / "vastai" / "vast_api_key"
-            if key_file.exists():
-                api_key = key_file.read_text().strip()
-        if not api_key:
-            print("Error: VASTAI_API_KEY environment variable is not set.\n"
-                  "Get your API key from https://cloud.vast.ai/cli/\n"
-                  "Then: export VASTAI_API_KEY=your_key_here", file=sys.stderr)
-            sys.exit(1)
+        print("Error: VASTAI_API_KEY environment variable is not set.\n"
+              "Get your API key from https://cloud.vast.ai/cli/\n"
+              "Then: export VASTAI_API_KEY=your_key_here", file=sys.stderr)
     else:
-        raise ValueError(f"Unknown provider: {provider_name}")
-
-    provider.configure(api_key)
-    return provider
+        print(f"Unknown provider: {provider_name}", file=sys.stderr)
+    sys.exit(1)
 
 
 _STARTER_TOML = textwrap.dedent("""\
@@ -376,10 +368,7 @@ def cmd_status(args):
             continue
         prov_name = config.provider
         if prov_name not in provider_cache:
-            try:
-                provider_cache[prov_name] = get_provider(prov_name)
-            except Exception:
-                continue
+            provider_cache[prov_name] = _configure_provider(prov_name)
         prov = provider_cache[prov_name]
         try:
             if not prov.check_exists(job.pod_id):

@@ -32,7 +32,7 @@ Python 3.12+. Uses `uv` for package management (never pip/conda).
 Key modules:
 - `cli.py` — argparse entry point with `pod` subcommand group (imperative) and traditional subcommands (declarative)
 - `config.py` — TOML loading, merges `[global]` defaults with per-`[[jobs]]` overrides into `JobConfig` dataclasses
-- `providers/__init__.py` — `CloudProvider` protocol + `get_provider()` registry
+- `providers/__init__.py` — `CloudProvider` protocol + `get_provider()` registry + `get_configured_provider()` (with API key setup)
 - `providers/runpod.py` — `RunPodProvider`: wraps `runpod` SDK for pod CRUD, SSH discovery, GPU catalog
 - `providers/vastai.py` — `VastaiProvider`: REST calls via `httpx` to `console.vast.ai/api/v0/` for instance CRUD
 - `registry.py` — global pod registry (`~/.conductor/pods.json`), tracks all pods regardless of creation mode; `reconcile_with_provider()` verifies pod status against the actual cloud provider

@@ -45,3 +45,30 @@ def get_provider(provider_name: str) -> CloudProvider:
     if not cls:
         raise ValueError(f"Unknown provider: {provider_name}. Available: {', '.join(providers)}")
     return cls()
+
+
+def get_configured_provider(provider_name: str) -> CloudProvider | None:
+    """Create and configure a provider using environment variables.
+
+    Returns None if the required API key is not available."""
+    import os
+    from pathlib import Path
+
+    provider = get_provider(provider_name)
+
+    if provider_name == "runpod":
+        api_key = os.environ.get("RUNPOD_API_KEY", "")
+    elif provider_name == "vastai":
+        api_key = os.environ.get("VASTAI_API_KEY", "")
+        if not api_key:
+            key_file = Path.home() / ".config" / "vastai" / "vast_api_key"
+            if key_file.exists():
+                api_key = key_file.read_text().strip()
+    else:
+        return None
+
+    if not api_key:
+        return None
+
+    provider.configure(api_key)
+    return provider

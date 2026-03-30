@@ -120,7 +120,7 @@ def reconcile_with_provider() -> list[PodRecord]:
     and resurrects terminated pods if the provider says they're still alive.
 
     Returns the updated list of all pods."""
-    from conductor.providers import get_provider
+    from conductor.providers import get_configured_provider
 
     pods = load_registry()
     changed = False
@@ -128,10 +128,10 @@ def reconcile_with_provider() -> list[PodRecord]:
 
     for p in pods:
         if p.provider not in providers:
-            try:
-                providers[p.provider] = get_provider(p.provider)
-            except Exception:
+            prov = get_configured_provider(p.provider)
+            if not prov:
                 continue
+            providers[p.provider] = prov
         prov = providers[p.provider]
         try:
             exists = prov.check_exists(p.pod_id)
