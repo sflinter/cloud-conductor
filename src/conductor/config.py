@@ -70,9 +70,10 @@ class JobConfig:
     stall_gpu_threshold: int = 5          # GPU util % below which = stalled
     cost_per_hour_override: float = 0.0
 
-    # Spot recovery
+    # Spot recovery / provisioning
     max_provision_attempts: int = 5
     backoff_base_seconds: int = 30
+    provision_retries: int = 3            # passes over the GPU candidate list when none has capacity
     recovery_confirmations: int = 3       # consecutive "pod gone" ticks before recovering
 
     # Pod reuse

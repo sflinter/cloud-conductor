@@ -2,13 +2,16 @@
 from __future__ import annotations
 
 import logging
+import random
 import time
 from typing import Callable
 
-from conductor.errors import ConductorError, SshAuthError
+from conductor import shutdown
+from conductor.errors import ConductorError, NoCapacityError, SshAuthError
 from conductor.gpu_pricing import select_cheapest_gpus
 from conductor.providers import CloudProvider
 from conductor.registry import PodRecord
+from conductor.shutdown import Interrupted
 from conductor.ssh import wait_ssh
 from conductor.state import PodState, pod_name_for
 
@@ -117,7 +120,12 @@ def provision_pod(
     """Provision a pod for a declarative job. on_created(pod_state) is called
     as soon as the pod ID is known so the caller can persist it;
     on_released(pod_id, terminated) when a pod that never became reachable
-    has been (or could not be) terminated."""
+    has been (or could not be) terminated.
+
+    The candidate list is walked once per pass; when a pass found no
+    capacity on at least one candidate it is repeated after a jittered
+    backoff, up to cfg.provision_retries passes. Each pass (not each
+    candidate) counts one provision attempt."""
     from conductor.config import JobConfig
     cfg: JobConfig = config
 
@@ -152,31 +160,47 @@ def provision_pod(
             on_created(pod_state)
 
     pod_state.status = "provisioning"
-    for gpu_id in gpu_candidates:
+    passes = max(1, cfg.provision_retries)
+    for attempt in range(1, passes + 1):
         pod_state.provision_attempts += 1
-        try:
-            record = _provision_candidate(provider, cfg, gpu_id, run_id, _created, on_released)
-        except SshAuthError as e:
-            # Another GPU with the same key would fail the same way
+        no_capacity = []
+        for gpu_id in gpu_candidates:
+            try:
+                record = _provision_candidate(provider, cfg, gpu_id, run_id, _created, on_released)
+            except NoCapacityError as e:
+                log.warning(f"[{cfg.name}] No capacity: {e}")
+                no_capacity.append(gpu_id)
+                continue
+            except SshAuthError as e:
+                # Another GPU with the same key would fail the same way
+                _forget_released_pod(pod_state)
+                pod_state.status = "failed"
+                pod_state.error = str(e)
+                return pod_state
+            if record:
+                pod_state.pod_id = record.pod_id
+                pod_state.gpu_type = record.gpu_type
+                pod_state.ssh_host = record.ssh_host
+                pod_state.ssh_port = record.ssh_port
+                pod_state.started_at = pod_state.started_at or record.created_at
+                if cfg.cost_per_hour_override > 0:
+                    pod_state.gpu_cost_per_hour = cfg.cost_per_hour_override
+                else:
+                    pod_state.gpu_cost_per_hour = record.gpu_cost_per_hour
+                return pod_state
             _forget_released_pod(pod_state)
-            pod_state.status = "failed"
-            pod_state.error = str(e)
-            return pod_state
-        if record:
-            pod_state.pod_id = record.pod_id
-            pod_state.gpu_type = record.gpu_type
-            pod_state.ssh_host = record.ssh_host
-            pod_state.ssh_port = record.ssh_port
-            pod_state.started_at = pod_state.started_at or record.created_at
-            if cfg.cost_per_hour_override > 0:
-                pod_state.gpu_cost_per_hour = cfg.cost_per_hour_override
-            else:
-                pod_state.gpu_cost_per_hour = record.gpu_cost_per_hour
-            return pod_state
-        _forget_released_pod(pod_state)
+
+        if not no_capacity or attempt >= passes:
+            break
+        wait = cfg.backoff_base_seconds * (2 ** (attempt - 1)) * (0.5 + random.random())
+        log.warning(f"[{cfg.name}] No capacity on {len(no_capacity)}/{len(gpu_candidates)} GPU "
+                    f"type(s) (pass {attempt}/{passes}); retrying the list in {wait:.0f}s")
+        if shutdown.wait(wait):
+            raise Interrupted(f"shutdown requested while waiting to retry provisioning of {cfg.name}")
 
     pod_state.status = "failed"
-    pod_state.error = "All GPU types exhausted"
+    pod_state.error = (f"All GPU types exhausted after {passes} pass(es)" if passes > 1
+                       else "All GPU types exhausted")
     return pod_state
 
 

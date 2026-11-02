@@ -212,3 +212,29 @@ def test_vastai_wait_for_ssh_is_interruptible():
         with pytest.raises(Interrupted):
             provider.wait_for_ssh("1", timeout=900)
         assert req.call_count == 1
+
+
+@patch("conductor.providers.runpod.runpod")
+def test_runpod_create_raises_no_capacity_on_availability_message(mock_runpod):
+    from conductor.errors import NoCapacityError
+    from runpod import error as runpod_error
+    mock_runpod.create_pod.side_effect = runpod_error.QueryError(
+        "There are no longer any instances available with the requested specifications. "
+        "Please refresh and try again.")
+    with pytest.raises(NoCapacityError) as exc:
+        RunPodProvider().create_instance("NVIDIA RTX A2000", "img", name="conductor-x-a")
+    assert "NVIDIA RTX A2000" in str(exc.value)
+
+    # Any other create failure is still a plain None (not retried as capacity)
+    mock_runpod.create_pod.side_effect = runpod_error.QueryError("Invalid GPU type id")
+    assert RunPodProvider().create_instance("bogus", "img") is None
+
+
+def test_vastai_no_offers_is_no_capacity():
+    from conductor.errors import NoCapacityError
+    from conductor.providers.vastai import VastaiProvider
+    provider = VastaiProvider()
+    with patch.object(provider, "_req") as req:
+        req.return_value = _vast_response({"offers": []})
+        with pytest.raises(NoCapacityError):
+            provider.create_instance("RTX 4090", "img")

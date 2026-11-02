@@ -207,3 +207,24 @@ run_command = "echo hi"
     assert cfg.provision_timeout_seconds == 1200
     assert cfg.recovery_confirmations == 5
     assert JobConfig(name="x", run_command="y").provision_timeout_seconds == 900
+
+
+def test_provision_retries_field(tmp_dir):
+    path = os.path.join(tmp_dir, "jobs.toml")
+    with open(path, "w") as f:
+        f.write('''
+[global]
+provision_retries = 5
+
+[[jobs]]
+name = "a"
+run_command = "echo hi"
+
+[[jobs]]
+name = "b"
+run_command = "echo hi"
+provision_retries = 1
+''')
+    cfgs = load_config(path)
+    assert cfgs[0].provision_retries == 5 and cfgs[1].provision_retries == 1
+    assert JobConfig(name="x", run_command="y").provision_retries == 3

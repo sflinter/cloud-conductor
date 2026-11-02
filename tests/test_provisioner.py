@@ -64,7 +64,7 @@ def test_provision_fallback(mock_ssh):
     pod = _make_pod()
     result = provision_pod(provider, config, pod)
     assert result.pod_id == "pod456"
-    assert result.provision_attempts == 2
+    assert result.provision_attempts == 1  # one pass over the list, not one per candidate
 
 
 @patch("conductor.provisioner.check_pod_exists", return_value=True)
@@ -296,3 +296,85 @@ def test_provision_auth_error_fails_job_without_trying_next_gpu():
     provider.terminate.assert_called_once_with("pod-key")  # the pod is not left billing
     assert released == [("pod-key", True)]
     assert result.pod_id is None
+
+
+def _no_capacity(gpu):
+    from conductor.errors import NoCapacityError
+    return NoCapacityError(f"{gpu}: There are no longer any instances available")
+
+
+@patch("conductor.provisioner.wait_ssh", return_value=True)
+def test_provision_retries_candidate_list_when_no_capacity(mock_ssh):
+    provider = _mock_provider()
+    provider.create_instance.side_effect = [
+        _no_capacity("A"), _no_capacity("B"),          # pass 1: nothing anywhere
+        _no_capacity("A"), {"id": "pod-b", "cost_per_hour": 0.2},  # pass 2: B has capacity
+    ]
+    provider.wait_for_ssh.return_value = ("1.1.1.1", 1)
+    waits = []
+    config = _make_config(gpu_type_id="A", gpu_type_ids_fallback=["B"], provision_retries=3,
+                          backoff_base_seconds=30)
+    with patch("conductor.provisioner.shutdown.wait", side_effect=lambda s: waits.append(s) or False), \
+         patch("conductor.provisioner.random.random", return_value=0.5):
+        result = provision_pod(provider, config, _make_pod())
+    assert result.pod_id == "pod-b" and result.gpu_type == "B"
+    assert result.provision_attempts == 2          # two passes
+    assert waits == [30.0]                         # base * 2**0 * (0.5 + 0.5), one backoff
+
+
+@patch("conductor.provisioner.wait_ssh", return_value=True)
+def test_provision_gives_up_after_provision_retries_passes(mock_ssh):
+    provider = _mock_provider()
+    provider.create_instance.side_effect = lambda gpu_type_id, **kw: (_ for _ in ()).throw(_no_capacity(gpu_type_id))
+    waits = []
+    config = _make_config(gpu_type_id="A", gpu_type_ids_fallback=["B", "C"], provision_retries=3,
+                          backoff_base_seconds=10)
+    with patch("conductor.provisioner.shutdown.wait", side_effect=lambda s: waits.append(s) or False), \
+         patch("conductor.provisioner.random.random", return_value=0.0):
+        result = provision_pod(provider, config, _make_pod())
+    assert result.status == "failed" and "3 pass" in result.error
+    assert provider.create_instance.call_count == 9
+    assert result.provision_attempts == 3
+    assert waits == [5.0, 10.0]                     # jittered exponential backoff between passes
+
+
+@patch("conductor.provisioner.wait_ssh", return_value=True)
+def test_provision_does_not_retry_non_capacity_failures(mock_ssh):
+    provider = _mock_provider()
+    provider.create_instance.return_value = None   # e.g. bad request
+    config = _make_config(gpu_type_id="A", gpu_type_ids_fallback=["B"], provision_retries=3)
+    with patch("conductor.provisioner.shutdown.wait") as mock_wait:
+        result = provision_pod(provider, config, _make_pod())
+    assert result.status == "failed"
+    assert provider.create_instance.call_count == 2
+    mock_wait.assert_not_called()
+    assert result.provision_attempts == 1
+
+
+@patch("conductor.provisioner.wait_ssh", return_value=True)
+def test_provision_backoff_is_interruptible(mock_ssh):
+    from conductor import shutdown
+    from conductor.shutdown import Interrupted
+    provider = _mock_provider()
+    provider.create_instance.side_effect = _no_capacity("A")
+    config = _make_config(gpu_type_id="A", provision_retries=3, backoff_base_seconds=600)
+    shutdown.request()
+    import time as _t
+    t0 = _t.time()
+    with patch("conductor.provisioner.random.random", return_value=0.5):
+        import pytest
+        with pytest.raises(Interrupted):
+            provision_pod(provider, config, _make_pod())
+    assert _t.time() - t0 < 2
+    assert provider.create_instance.call_count == 1
+
+
+@patch("conductor.provisioner.wait_ssh", return_value=True)
+def test_provision_retries_disabled_with_single_pass(mock_ssh):
+    provider = _mock_provider()
+    provider.create_instance.side_effect = _no_capacity("A")
+    config = _make_config(gpu_type_id="A", provision_retries=1)
+    with patch("conductor.provisioner.shutdown.wait") as mock_wait:
+        result = provision_pod(provider, config, _make_pod())
+    assert result.status == "failed" and result.error == "All GPU types exhausted"
+    mock_wait.assert_not_called()

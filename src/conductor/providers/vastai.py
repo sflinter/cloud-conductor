@@ -8,7 +8,7 @@ from pathlib import Path
 import httpx
 
 from conductor import shutdown
-from conductor.errors import guarded
+from conductor.errors import NoCapacityError, guarded
 from conductor.gpu_pricing import GpuInfo
 from conductor.retry import retry
 from conductor.shutdown import Interrupted
@@ -81,8 +81,7 @@ class VastaiProvider:
             return None
 
         if not offers:
-            log.error(f"[{name}] No vast.ai offers found for {gpu_type_id}")
-            return None
+            raise NoCapacityError(f"{gpu_type_id}: no vast.ai offers match")
 
         offer = offers[0]  # cheapest (sorted by dph_total)
         offer_id = offer["id"]

@@ -7,7 +7,7 @@ import time
 import runpod
 
 from conductor import shutdown
-from conductor.errors import guarded
+from conductor.errors import NoCapacityError, guarded, is_capacity_message
 from conductor.gpu_pricing import GpuInfo
 from conductor.retry import retry
 from conductor.shutdown import Interrupted
@@ -53,6 +53,8 @@ class RunPodProvider:
                 support_public_ip=True,
             )
         except Exception as e:
+            if is_capacity_message(str(e)):
+                raise NoCapacityError(f"{gpu_type_id}: {e}") from e
             log.error(f"[{name}] Failed to create pod: {e}")
             return None
 

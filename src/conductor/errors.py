@@ -32,6 +32,29 @@ class SshAuthError(ConductorError):
     GPU with the same key cannot help, so the job fails immediately."""
 
 
+class NoCapacityError(ConductorError):
+    """The provider had no instance of the requested GPU type right now.
+    Worth retrying the whole candidate list after a backoff."""
+
+
+# Provider messages that mean "nothing available right now", not "bad request"
+CAPACITY_PATTERNS = (
+    "no longer any instances available",
+    "no instances available",
+    "not available",
+    "no available",
+    "out of capacity",
+    "insufficient capacity",
+    "no capacity",
+    "out of stock",
+)
+
+
+def is_capacity_message(text: str) -> bool:
+    lowered = (text or "").lower()
+    return any(p in lowered for p in CAPACITY_PATTERNS)
+
+
 # Exceptions that mean "the outside world misbehaved", not "the code is wrong".
 TRANSIENT_ERRORS: tuple[type[BaseException], ...] = (
     subprocess.TimeoutExpired,
