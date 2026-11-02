@@ -58,6 +58,8 @@ conductor validate --config jobs.toml
 conductor run --config jobs.toml
 ```
 
+`validate` checks, among other things, that the SSH key can be used without a prompt: a passphrase-protected key must be loaded in `ssh-agent` (`ssh-add --apple-use-keychain ~/.ssh/id_rsa` on macOS), otherwise both `validate` and `run` stop before creating a pod.
+
 3. While running, use other subcommands in a separate terminal:
 
 ```bash
@@ -108,6 +110,7 @@ The TOML config has a `[global]` section for defaults and `[[jobs]]` entries for
 | `stall_timeout_minutes` | `0` | Teardown if GPU util stays below threshold (0 = disabled) |
 | `stall_gpu_threshold` | `5` | GPU util % below which the job is considered stalled |
 | `recovery_confirmations` | `3` | Consecutive ticks the provider must report a pod gone before spot recovery starts |
+| `provision_retries` | `3` | Passes over the GPU candidate list when none has capacity right now, with jittered backoff between passes |
 | `keep_pod_alive` | `false` | Don't teardown on completion (for iterative dev) |
 | `teardown_on_crash` | `false` | If the orchestrator process itself dies, tear down all live pods (default: leave them and print their IDs) |
 | `depends_on` | `[]` | Job names that must complete before this job starts |
@@ -135,9 +138,11 @@ Running `conductor run` again with an existing state file:
 - resumes jobs persisted as `provisioning`/`deploying` on their existing pod (re-deploy, launch) and relaunches a `running` job that has no recorded pid
 - skips `completed`/`failed`/`skipped` jobs unless you pass `--retry-failed` (also un-skips their dependents) or `--retry-completed`
 
-**Ctrl-C detaches.** The orchestrator stops after its current step, prints the live pod IDs and exits; nothing is marked failed and no pod is terminated. Run `conductor run` again to resume monitoring, or `conductor teardown` to terminate. Use `conductor run --teardown-on-interrupt` for the old behaviour (final sync, then terminate everything). A second Ctrl-C hard-exits after printing the pod IDs.
+**Ctrl-C detaches.** The orchestrator stops after its current step (within one poll interval, even while it is still waiting for a new pod's SSH), prints the live pod IDs and exits; nothing is marked failed and no pod is terminated. Run `conductor run` again to resume monitoring, or `conductor teardown` to terminate. Use `conductor run --teardown-on-interrupt` for the old behaviour (final sync, then terminate everything). A second Ctrl-C hard-exits after printing the pod IDs.
 
-**One orchestrator per state file.** A live run writes a heartbeat to the state file every tick. `conductor run` refuses to start while another run is live, and `conductor teardown` / `conductor sync` refuse too, so two processes never fight over the same pods; pass `--force` if the other process is really dead. `conductor status` shows whether the orchestrator is live.
+**One orchestrator per state file.** A live run writes a heartbeat to the state file every 15 s from a background thread, so it stays live throughout provisioning. `conductor run` refuses to start while another run is live, and `conductor teardown` / `conductor sync` refuse too, so two processes never fight over the same pods; pass `--force` if the other process is really dead. `conductor status` shows whether the orchestrator is live. `run`, `teardown` and `sync` also write a rotating `conductor.log` next to the state file.
+
+**`conductor teardown`** records what it did: the registry, a `pod_stopped` cost event (reason `manual_teardown`, with the cost accrued since the pod was created) and the job's status (`failed`, "torn down manually"), so `conductor status` and `conductor report` agree with the provider afterwards.
 
 ## Lifecycle
 

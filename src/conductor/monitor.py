@@ -23,8 +23,7 @@ from conductor.runner import LOG_TAIL_LINES, fetch_log_tail, get_log_path, get_u
 from conductor.shutdown import Interrupted
 from conductor.ssh import wait_ssh
 from conductor.state import (
-    LIVE_STATUSES, PodState, RunState, accrue_cost, append_cost_event, get_job, pod_name_for,
-    save_state,
+    PodState, RunState, accrue_cost, append_cost_event, get_job, pod_name_for, save_state,
 )
 from conductor.syncer import sync_pull, sync_push
 

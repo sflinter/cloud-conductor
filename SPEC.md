@@ -90,12 +90,13 @@ Full lifecycle: provision → deploy → launch → monitor → sync → teardow
 - Tears down each pod when its job completes or fails
 - Sends notifications on job completion, failure, or budget threshold
 - Exits when all jobs are done
-- Refuses to start if the state file's heartbeat shows another `conductor run` is live (override with `--force`)
-- Ctrl+C detaches: prints the live pod IDs, marks nothing failed, exits; `--teardown-on-interrupt` instead does a final sync and tears down all pods. A second Ctrl+C hard-exits after printing the pod IDs
+- Refuses to start if the state file's heartbeat shows another `conductor run` is live (override with `--force`). Its own heartbeat is written by a daemon thread every 15 s for the whole run, including while the main thread is blocked provisioning
+- Ctrl+C detaches: prints the live pod IDs, marks nothing failed, exits; `--teardown-on-interrupt` instead does a final sync and tears down all pods. A second Ctrl+C hard-exits after printing the pod IDs. The first Ctrl+C also takes effect while a pod is still being provisioned: the SSH waits and backoffs check a shutdown flag between polls, so the run detaches within one poll interval and the job keeps its pod ID and status for the next `conductor run`
+- Logs to stderr and to a rotating `conductor.log` next to the state file (so do `teardown` and `sync`)
 
 ### `conductor status`
 
-Reads the state file and queries RunPod API to show a table:
+Reads the state file and queries RunPod API to show a table. Cost is accrued from pod creation for every job whose pod is live (`provisioning`, `deploying`, `running`, `sync_failed`), not only from the last monitor tick:
 
 ```
 Job     Pod          GPU              Status     GPU%  CPU%  Elapsed    Cost     Info
@@ -111,7 +112,7 @@ Forces an immediate rsync of results from all running pods. Refuses while a `con
 
 ### `conductor teardown`
 
-Terminates all pods tracked in the state file. Prompts for confirmation unless `--force` is passed. Refuses while a `conductor run` is live on the state file unless `--force` is passed.
+Terminates all pods tracked in the state file. Prompts for confirmation unless `--force` is passed. Refuses while a `conductor run` is live on the state file unless `--force` is passed. For each pod it accrues the cost, updates the registry record (`terminated`, or left as `running` if the provider did not confirm the termination), appends a `pod_stopped` cost event with reason `manual_teardown`, and marks the job `failed` with `error = "torn down manually"` (an unverified teardown is noted in the error). A completed job whose kept-alive pod is released keeps its `completed` status.
 
 ### `conductor dry-run`
 
@@ -122,6 +123,7 @@ Prints what would be provisioned (GPU type, image, disk, estimated cost) without
 Pre-flight checks before provisioning. Catches configuration errors early:
 
 - SSH key file exists and has correct permissions
+- SSH key is usable non-interactively (the conductor runs ssh with `BatchMode=yes`): `ssh-keygen -y -P '' -f <key>` succeeds, or `ssh-add -l` lists the key's fingerprint. Otherwise: "SSH key is passphrase-protected and not loaded in ssh-agent: run `ssh-add --apple-use-keychain <key>` or use an unencrypted key". Skipped if `ssh-keygen` is not installed
 - Local project directory exists (for rsync deploy)
 - Seed checkpoint / file paths referenced in `run_command` exist locally
 - GPU type IDs are valid (queries `runpod.get_gpu_types()`)
@@ -217,9 +219,10 @@ stall_timeout_minutes = 30            # teardown if GPU util stays below thresho
 stall_gpu_threshold = 5               # GPU util % below which the job is considered stalled
 cost_per_hour_override = 0.0          # 0 = auto-detect from RunPod API
 
-# Spot recovery
-max_provision_attempts = 5
-backoff_base_seconds = 30
+# Spot recovery / provisioning
+max_provision_attempts = 5            # provisioning passes (initial + spot recoveries) before the job fails
+backoff_base_seconds = 30             # base of the jittered exponential backoff between passes
+provision_retries = 3                 # passes over the GPU candidate list when none has capacity right now
 recovery_confirmations = 3            # consecutive polls reporting the pod gone before re-provisioning
 
 # Pod reuse
@@ -352,7 +355,7 @@ PYTHONUNBUFFERED=1 .venv/bin/python scripts/eval_with_search.py \
 }
 ```
 
-`orchestrator_pid` and `heartbeat_at` identify the live `conductor run`; the heartbeat is refreshed every poll and cleared when the run detaches or finishes. A run is considered live while the heartbeat is fresher than two poll intervals (60 s). `run_id` names this run's pods (`conductor-<run_id>-<job>`) so they can be matched to the run from the provider's pod list. The state file and the registry are protected by a cross-process lock (`flock` on a hidden `.lock` sibling) for every read-modify-write.
+`orchestrator_pid` and `heartbeat_at` identify the live `conductor run`; the heartbeat is refreshed every 15 s by a daemon thread (so it stays fresh while the main thread is blocked provisioning) and cleared when the run detaches or finishes. A run is considered live while the heartbeat is fresher than two poll intervals (60 s). `run_id` names this run's pods (`conductor-<run_id>-<job>`) so they can be matched to the run from the provider's pod list. The state file and the registry are protected by a cross-process lock (`flock` on a hidden `.lock` sibling) for every read-modify-write.
 
 The state file is updated after every significant event (provision, deploy, sync, status check, teardown). It is the source of truth for `conductor status`.
 
@@ -388,6 +391,7 @@ cloud-conductor/
 │       ├── ssh.py          # SSH/rsync helpers (shared by all modules), never raise, retry transient rc
 │       ├── errors.py       # ConductorError + guarded(): one exception type for transport/SDK failures
 │       ├── retry.py        # retry(): exponential backoff with jitter for provider calls
+│       ├── shutdown.py     # process-wide Ctrl-C flag checked by every long wait; Interrupted
 │       ├── filelock.py     # flock on a hidden .lock sibling for state file and registry
 │       ├── gpu_pricing.py  # query RunPod API for GPU types/prices, auto-select cheapest
 │       ├── notify.py       # notification dispatch (terminal-notifier, pushover, command)
@@ -414,7 +418,7 @@ cloud-conductor/
 - Manual: tries the primary `gpu_type_id`, then falls through `gpu_type_ids_fallback`
 - Auto: delegates to `gpu_pricing.py` to find the cheapest available GPU meeting minimum VRAM requirements
 
-Calls `on_created(instance_id, gpu, cost)` the instant the provider returns an ID so the caller can persist it, then waits for SSH to become available (polls the provider API for port mapping, then tests SSH connectivity). A pod that never becomes reachable is terminated and reported through `on_released(instance_id, terminated)`. Returns a `PodRecord` with host/port/pod_id/gpu_type/cost_per_hour. Supports pod reuse: if `keep_pod_alive` is set and a pod from a previous run still exists, skips provisioning, refreshes its SSH info and reuses it.
+Calls `on_created(instance_id, gpu, cost)` the instant the provider returns an ID so the caller can persist it, then waits for SSH to become available (polls the provider API for port mapping, then tests SSH connectivity). A pod that never becomes reachable is terminated and reported through `on_released(instance_id, terminated)`. If sshd rejects the key three probes in a row (`SshAuthError`) the pod is terminated and the job fails at once, without trying another GPU. When a provider reports no capacity for a candidate (`NoCapacityError`), the rest of the list is tried and, if nothing was created, the whole list is walked again after a jittered backoff, up to `provision_retries` passes; each pass counts one provision attempt. Returns a `PodRecord` with host/port/pod_id/gpu_type/cost_per_hour. Supports pod reuse: if `keep_pod_alive` is set and a pod from a previous run still exists, skips provisioning, refreshes its SSH info and reuses it.
 
 **`deployer.py`** — `deploy_direct()` takes explicit SSH/path parameters (used by `conductor pod deploy`). `deploy()` wraps it for declarative mode. Two deploy methods:
 - `rsync`: Installs rsync on the pod (if needed), rsyncs `local_project_dir` to `remote_project_dir` with configured excludes, then runs `setup_command` via SSH.
@@ -450,6 +454,8 @@ When reusing a pod (`keep_pod_alive`), rsync mode re-syncs code (fast incrementa
 
 **`filelock.py`** — `locked(path)`: `flock` on a hidden `.lock` sibling, used for every read-modify-write of the state file and the registry.
 
+**`shutdown.py`** — Process-wide shutdown flag set by the first Ctrl-C. `wait_ssh`, the providers' `wait_for_ssh` loops and every retry/backoff sleep check it between polls (`shutdown.wait()`); the SSH waits raise `Interrupted`, which the pipeline treats as "stop here, keep the job as persisted".
+
 **`gpu_pricing.py`** — Queries `runpod.get_gpu_types()` to get current GPU availability and pricing. Filters by minimum VRAM, sorts by price ascending, returns ordered list of candidates. Caches results for 5 minutes to avoid hammering the API during parallel provisioning.
 
 **`notify.py`** — Dispatches notifications based on configured backend:
@@ -461,6 +467,7 @@ Events that trigger notifications: `job_complete`, `job_failed`, `spot_recovery`
 
 **`validator.py`** — Pre-flight configuration validation. Checks:
 - SSH key file exists at `ssh_key_path` and has correct permissions (600/644)
+- SSH key is usable without a prompt (`ssh-keygen -y -P ''` or loaded in ssh-agent)
 - `local_project_dir` exists (for rsync deploy)
 - GPU type IDs are valid (queries `runpod.get_gpu_types()` and checks names match)
 - Docker image is reachable (for prebuilt image deploy — runs `docker manifest inspect`)
@@ -503,7 +510,8 @@ Minimal:
 | Scenario | Behavior |
 |---|---|
 | Config validation fails | Abort before provisioning, print errors |
-| All GPU types unavailable | Mark job as `failed`, notify, continue other jobs |
+| All GPU types unavailable | Walk the candidate list again after a jittered backoff, up to `provision_retries` passes; then mark job as `failed`, notify, continue other jobs |
+| sshd rejects the key (`Permission denied`, 3 probes in a row) | Terminate the pod, mark job as `failed` with the reason, do not try further GPUs with the same key |
 | SSH never becomes ready (`provision_timeout_seconds`, default 15 min) | Terminate the pod (verified), try the next GPU candidate; when all are exhausted mark job as `failed`, notify |
 | Final sync fails after 3 attempts | Keep the pod alive, mark the job `sync_failed`, notify. `conductor sync --jobs X` then `conductor teardown --jobs X` releases it. A budget stop still tears the pod down |
 | Terminate not confirmed by the provider | Registry keeps the pod as `running`, `job.error` records it, status shows it; never assumed gone |
@@ -519,7 +527,7 @@ Minimal:
 | GPU stall (process alive, GPU idle) | Final sync, teardown pod, mark as `failed`, notify |
 | Global budget limit reached | Final sync all pods, teardown all pods, notify, exit |
 | Dependency failed | Mark dependent jobs as `skipped`, notify |
-| Ctrl+C | Detach: save state, print live pod IDs and how to resume, exit. Nothing marked failed, nothing terminated. With `--teardown-on-interrupt`: final sync all pods, teardown all pods (unless `keep_pod_alive`), save state, exit |
+| Ctrl+C | Detach: save state, print live pod IDs and how to resume, exit. Nothing marked failed, nothing terminated. Works during provisioning too (the waits check the shutdown flag between polls). With `--teardown-on-interrupt`: final sync all pods, teardown all pods (unless `keep_pod_alive`), save state, exit |
 | Second Ctrl+C | Print live pod IDs, hard exit |
 | Conductor process dies | State saved, every live pod ID printed with its job, `orchestrator_crashed` notification sent. Pods are left running unless `teardown_on_crash = true`. `conductor status` still works; `conductor run` resumes from saved state. |
 | Transport error (SSH timeout, rsync failure, provider API/SDK error) | Returned as a failed result or `ConductorError`; the affected job is marked `failed` with `error` set. The orchestrator never dies from one. |

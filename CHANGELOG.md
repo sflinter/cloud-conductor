@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.6.1
+
+Fixes from the first live RunPod trial of 0.6.0.
+
+- The heartbeat is now refreshed by a daemon thread every `POLL_INTERVAL/2` for the whole lifecycle, not once per monitor tick. Previously `conductor status` reported "orchestrator not running" and the live-run guards in `run`/`teardown`/`sync` stopped refusing during exactly the window in which pods were being created, because `_start_unblocked_jobs` blocks for up to `provision_timeout_seconds`. `save_state` snapshots and writes under a process-wide lock so the heartbeat can never overwrite a newer save
+- A single Ctrl-C now detaches during provisioning. The first Ctrl-C sets a process-wide shutdown flag that `wait_ssh`, both providers' `wait_for_ssh` loops, the ssh/rsync and provider retry backoffs, the spot-recovery backoff and the new provisioning backoff all check between polls; the pipeline stops at the next check, keeps the job's persisted status and pod ID, and the run detaches printing the live pod IDs. Deploy and launch are not started once the flag is set. The second Ctrl-C hard-exit is unchanged
+- An SSH key that sshd rejects fails the job fast: three consecutive probes answered with `Permission denied`, `Too many authentication failures` or `no such identity` raise `SshAuthError`; the pod is terminated and no further GPU candidate is tried with the same key (previously every candidate was billed for the whole `provision_timeout_seconds`). `conductor validate` and `conductor run` now also check that the key is usable non-interactively (`ssh-keygen -y -P '' -f <key>` succeeds, or `ssh-add -l` lists its fingerprint) and otherwise stop with "SSH key is passphrase-protected and not loaded in ssh-agent: run `ssh-add --apple-use-keychain <key>` or use an unencrypted key"
+- `conductor teardown` records what it did: the registry record becomes `terminated` (or stays `running` when the terminate could not be verified), a `pod_stopped` cost event with reason `manual_teardown` and the accrued cost is written, and the job is marked `failed` with `error = "torn down manually"`. Cost is accrued from pod creation (`started_at`) for every job in `provisioning`/`deploying`/`running`/`sync_failed` by `conductor status`, `conductor teardown` and the monitor (which previously only counted `running` jobs), so a pod that has been billing for minutes no longer shows `$0.00`. `conductor report` pairs start/stop events by pod ID and records `gpu_type` on stop events
+- GPU availability: a create failure that is an availability error (RunPod's "no longer any instances available" and similar; no matching Vast.ai offer) raises `NoCapacityError`, and `provision_pod` walks the whole candidate list again after a jittered `backoff_base_seconds * 2^(pass-1)` wait, up to `provision_retries` passes (new config key, default 3). A pass, not a candidate, counts towards `max_provision_attempts`. Other create failures are not retried
+- Logging: the `runpod` SDK calls `logging.basicConfig()` with its own format at import, which made the conductor's own configuration a no-op (hence `monitor.py :435 <time>` lines in the run log). The root logger is now configured explicitly with `force=True` after importing the SDK. `run`, `teardown` and `sync` also log to a rotating `conductor.log` (5 MB x 3, full timestamps and logger names) next to the state file
+- New config field: `provision_retries` (default 3)
+
 ## 0.6.0
 
 Reliability release — see `RELIABILITY_REVIEW.md` for the findings that drove it.
