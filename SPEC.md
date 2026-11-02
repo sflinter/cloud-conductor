@@ -112,7 +112,7 @@ Forces an immediate rsync of results from all running pods. Refuses while a `con
 
 ### `conductor teardown`
 
-Terminates all pods tracked in the state file. Prompts for confirmation unless `--force` is passed. Refuses while a `conductor run` is live on the state file unless `--force` is passed. For each pod it accrues the cost, updates the registry record (`terminated`, or left as `running` if the provider did not confirm the termination), appends a `pod_stopped` cost event with reason `manual_teardown`, and marks the job `failed` with `error = "torn down manually"` (an unverified teardown is noted in the error). A completed job whose kept-alive pod is released keeps its `completed` status.
+Terminates the pods tracked in the state file (only those of the jobs named with `--jobs`, when given). Prompts for confirmation unless `--force` is passed. Refuses while a `conductor run` is live on the state file unless `--force` is passed. For each pod it accrues the cost, updates the registry record (`terminated`, or left as `running` if the provider did not confirm the termination), appends a `pod_stopped` cost event with reason `manual_teardown`, and marks the job `failed` with `error = "torn down manually"` (an unverified teardown is noted in the error). A pod the provider reports as not found (RunPod `pod not found to terminate`, Vast.ai 404 / "not found") is already gone: that counts as a verified teardown, is not retried, and a pod that already has a `pod_stopped` event (the job finished) is neither billed further nor given a second event. A finished job (`completed`, `failed`, `skipped`) keeps its status and error; only an unverified teardown is appended to the error.
 
 ### `conductor dry-run`
 
@@ -340,7 +340,8 @@ PYTHONUNBUFFERED=1 .venv/bin/python scripts/eval_with_search.py \
       "job_budget_usd": 5.00,
       "pid": 4242,
       "pid_start": "1234567",
-      "exit_code": null
+      "exit_code": null,
+      "finished_at": null
     },
     {
       "name": "eval_4p",
@@ -358,13 +359,13 @@ PYTHONUNBUFFERED=1 .venv/bin/python scripts/eval_with_search.py \
 }
 ```
 
-`orchestrator_pid` and `heartbeat_at` identify the live `conductor run`; the heartbeat is refreshed every 15 s by a daemon thread (so it stays fresh while the main thread is blocked provisioning) and cleared when the run detaches or finishes. A run is considered live while the heartbeat is fresher than two poll intervals (60 s). `run_id` names this run's pods (`conductor-<run_id>-<job>`) so they can be matched to the run from the provider's pod list. The state file and the registry are protected by a cross-process lock (`flock` on a hidden `.lock` sibling) for every read-modify-write.
+`finished_at` is set when the pod stops billing for the job (final teardown, manual teardown, interrupt): cost never accrues past it and the status table's `Elapsed` stops there. `orchestrator_pid` and `heartbeat_at` identify the live `conductor run`; the heartbeat is refreshed every 15 s by a daemon thread (so it stays fresh while the main thread is blocked provisioning) and cleared when the run detaches or finishes. A run is considered live while the heartbeat is fresher than two poll intervals (60 s). `run_id` names this run's pods (`conductor-<run_id>-<job>`) so they can be matched to the run from the provider's pod list. The state file and the registry are protected by a cross-process lock (`flock` on a hidden `.lock` sibling) for every read-modify-write.
 
 The state file is updated after every significant event (provision, deploy, sync, status check, teardown). It is the source of truth for `conductor status`.
 
 ## Cost Log (`.conductor_cost_log.jsonl`)
 
-Append-only JSONL file recording every cost-relevant event. Used by `conductor report` for historical analysis.
+Append-only JSONL file recording every cost-relevant event. Used by `conductor report` for historical analysis. A pod gets at most one `pod_stopped` event: every writer checks the log for the pod ID first, so releasing an already-released pod (e.g. `conductor teardown` after the job finished) never records a second stop or a second cost.
 
 ```jsonl
 {"ts": 1709142301.5, "event": "pod_started", "job": "3p", "pod_id": "abc123", "gpu_type": "RTX 2000 Ada", "cost_per_hour": 0.12}

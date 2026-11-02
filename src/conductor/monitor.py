@@ -23,7 +23,8 @@ from conductor.runner import LOG_TAIL_LINES, fetch_log_tail, get_log_path, get_u
 from conductor.shutdown import Interrupted
 from conductor.ssh import wait_ssh
 from conductor.state import (
-    PodState, RunState, accrue_cost, append_cost_event, get_job, pod_name_for, save_state,
+    PodState, RunState, accrue_cost, append_cost_event, get_job, pod_name_for,
+    record_pod_stopped, save_state,
 )
 from conductor.syncer import sync_pull, sync_push
 
@@ -801,8 +802,8 @@ def _terminate_stray(
     print(msg, file=sys.stderr)
     ok = teardown_pod(provider, inst_id)
     registry_update(inst_id, status="terminated" if ok else "running")
-    append_cost_event(cost_log_path, {
-        "event": "pod_stopped", "job": inst_name, "pod_id": inst_id,
+    record_pod_stopped(cost_log_path, {
+        "job": inst_name, "pod_id": inst_id,
         "reason": "stray_terminated" if ok else "stray_terminate_failed",
     })
     if not ok:
@@ -829,8 +830,8 @@ def _spot_recover(
     if job.pod_id:
         teardown_pod(provider, job.pod_id)
         registry_update(job.pod_id, status="terminated", cost_usd=job.cost_usd)
-        append_cost_event(cost_log_path, {
-            "event": "pod_stopped", "job": job.name, "pod_id": job.pod_id,
+        record_pod_stopped(cost_log_path, {
+            "job": job.name, "pod_id": job.pod_id,
             "gpu_type": job.gpu_type, "reason": "spot_interruption",
             "total_cost_usd": job.cost_usd,
         })
@@ -912,12 +913,15 @@ def _finish_job(
             log.error(f"[{job.name}] {msg}")
             error = _with_note(error, msg)
 
+    # The pod stops billing for this job now: cost is final from here on
+    job.finished_at = time.time()
+    accrue_cost(job, state)
     elapsed_hours = 0.0
     if job.started_at:
-        elapsed_hours = (time.time() - job.started_at) / 3600
+        elapsed_hours = (job.finished_at - job.started_at) / 3600
 
-    append_cost_event(cost_log_path, {
-        "event": "pod_stopped", "job": job.name, "pod_id": job.pod_id,
+    record_pod_stopped(cost_log_path, {
+        "job": job.name, "pod_id": job.pod_id,
         "gpu_type": job.gpu_type, "reason": status, "total_hours": elapsed_hours,
         "total_cost_usd": job.cost_usd,
     })
@@ -1065,9 +1069,11 @@ def _graceful_shutdown(
             job.error = "interrupted (pod kept alive)"
 
         if job.started_at:
-            elapsed_hours = (time.time() - job.started_at) / 3600
-            append_cost_event(cost_log_path, {
-                "event": "pod_stopped", "job": job.name, "pod_id": job.pod_id,
+            job.finished_at = time.time()
+            accrue_cost(job, state)
+            elapsed_hours = (job.finished_at - job.started_at) / 3600
+            record_pod_stopped(cost_log_path, {
+                "job": job.name, "pod_id": job.pod_id,
                 "gpu_type": job.gpu_type, "reason": "interrupted",
                 "total_hours": elapsed_hours, "total_cost_usd": job.cost_usd,
             })

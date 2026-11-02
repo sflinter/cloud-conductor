@@ -55,6 +55,20 @@ def is_capacity_message(text: str) -> bool:
     return any(p in lowered for p in CAPACITY_PATTERNS)
 
 
+# Provider answers to a terminate/delete of an instance that is already gone
+NOT_FOUND_PATTERNS = (
+    "not found",
+    "no such instance",
+    "does not exist",
+    "no longer exists",
+)
+
+
+def is_not_found_message(text: str) -> bool:
+    lowered = (text or "").lower()
+    return any(p in lowered for p in NOT_FOUND_PATTERNS)
+
+
 # Exceptions that mean "the outside world misbehaved", not "the code is wrong".
 TRANSIENT_ERRORS: tuple[type[BaseException], ...] = (
     subprocess.TimeoutExpired,

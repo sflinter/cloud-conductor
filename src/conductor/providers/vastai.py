@@ -8,9 +8,9 @@ from pathlib import Path
 import httpx
 
 from conductor import shutdown
-from conductor.errors import NoCapacityError, guarded
+from conductor.errors import ConductorError, NoCapacityError, guarded, is_not_found_message
 from conductor.gpu_pricing import GpuInfo
-from conductor.retry import retry
+from conductor.retry import is_retryable, retry
 from conductor.shutdown import Interrupted
 
 log = logging.getLogger(__name__)
@@ -22,6 +22,10 @@ WAIT_POLL_SECONDS = 5.0
 def _pause(instance_id: str) -> None:
     if shutdown.wait(WAIT_POLL_SECONDS):
         raise Interrupted(f"shutdown requested while waiting for SSH info of {instance_id}")
+
+
+def _retry_unless_gone(exc: BaseException) -> bool:
+    return is_retryable(exc) and not is_not_found_message(str(exc))
 
 
 class VastaiProvider:
@@ -182,13 +186,28 @@ class VastaiProvider:
         return inst.get("actual_status") not in ("exited", "error")
 
     def terminate(self, instance_id: str) -> bool:
+        """True when the instance is destroyed or was already gone (404, or
+        a "not found" answer, neither retried); False on any other failure."""
         def _delete():
             resp = self._req("DELETE", f"/instances/{instance_id}/", json={})
+            if resp.status_code == 404:
+                raise ConductorError(f"vast.ai instance {instance_id} not found")
             resp.raise_for_status()
+            try:
+                body = resp.json()
+            except ValueError:
+                return
+            if isinstance(body, dict) and body.get("success") is False:
+                raise ConductorError(f"vast.ai DELETE /instances/{instance_id}: "
+                                     f"{body.get('msg') or body}")
         try:
-            retry(guarded, "vast.ai DELETE /instances", _delete, what="vast.ai DELETE /instances")
+            retry(guarded, "vast.ai DELETE /instances", _delete, what="vast.ai DELETE /instances",
+                  should_retry=_retry_unless_gone)
             return True
         except Exception as e:
+            if is_not_found_message(str(e)):
+                log.info(f"vast.ai instance {instance_id} is already gone: {e}")
+                return True
             log.warning(f"Failed to terminate vast.ai instance {instance_id}: {e}")
             return False
 

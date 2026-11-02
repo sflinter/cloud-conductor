@@ -21,9 +21,9 @@ from conductor.runner import exec_foreground, get_log_path, get_utilization, lau
 from conductor.deployer import deploy_direct
 from conductor.ssh import ssh_exec, ssh_interactive, tail_remote_log, tail_remote_log_subprocess
 from conductor.state import (
-    LIVE_STATUSES, PodState, RunState, accrue_cost, append_cost_event, describe_owner, get_job,
-    init_state, load_state, new_run_id, read_cost_log, reset_job_for_retry, run_is_live,
-    save_state,
+    LIVE_STATUSES, PodState, RunState, accrue_cost, describe_owner, get_job,
+    init_state, load_state, new_run_id, pod_stop_recorded, read_cost_log, record_pod_stopped,
+    reset_job_for_retry, run_is_live, save_state,
 )
 from conductor.syncer import sync_pull
 from conductor.validator import validate
@@ -636,24 +636,31 @@ def cmd_teardown(args):
 
 def _record_manual_teardown(job: PodState, state: RunState, cost_log_path: str, verified: bool) -> None:
     """Account for a pod released by `conductor teardown`: registry,
-    cost log and the job's outcome in the state file."""
-    accrue_cost(job, state)
-    elapsed_hours = (time.time() - job.started_at) / 3600 if job.started_at else 0.0
+    cost log and the job's outcome in the state file. A pod that was
+    already released (the job finished, a stop event exists) is not billed
+    or recorded a second time, and a finished job keeps its outcome."""
+    already_stopped = job.finished_at is not None or pod_stop_recorded(cost_log_path, job.pod_id)
+    if not already_stopped:
+        job.finished_at = time.time()
+        accrue_cost(job, state)
     try:
         update_pod(job.pod_id, status="terminated" if verified else "running", cost_usd=job.cost_usd)
     except Exception as e:
         print(f"  warning: could not update pod registry: {e}", file=sys.stderr)
-    append_cost_event(cost_log_path, {
-        "event": "pod_stopped", "job": job.name, "pod_id": job.pod_id,
-        "gpu_type": job.gpu_type, "reason": "manual_teardown", "verified": verified,
-        "total_hours": elapsed_hours, "total_cost_usd": job.cost_usd,
-    })
+    if not already_stopped:
+        elapsed_hours = (job.finished_at - job.started_at) / 3600 if job.started_at else 0.0
+        record_pod_stopped(cost_log_path, {
+            "job": job.name, "pod_id": job.pod_id,
+            "gpu_type": job.gpu_type, "reason": "manual_teardown", "verified": verified,
+            "total_hours": elapsed_hours, "total_cost_usd": job.cost_usd,
+        })
+    note = f"pod {job.pod_id} teardown unverified, it may still be running"
     if job.status in LIVE_STATUSES or job.status == "pending":
         job.status = "failed"
-    error = "torn down manually"
-    if not verified:
-        error += f"; pod {job.pod_id} teardown unverified, it may still be running"
-    job.error = error
+        job.error = "torn down manually" + (f"; {note}" if not verified else "")
+    elif not verified:
+        # completed/failed/skipped: keep the outcome, note the loose pod
+        job.error = f"{job.error}; {note}" if job.error else note
 
 
 def cmd_dry_run(args):

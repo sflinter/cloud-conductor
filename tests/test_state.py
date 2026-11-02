@@ -167,3 +167,38 @@ def test_accrue_cost_from_pod_creation():
     assert accrue_cost(job, state, now=1000.0) == 0.0 and job.cost_usd == 1.0
     assert accrue_cost(PodState(name="b", started_at=1.0), state) == 0.0
     assert accrue_cost(PodState(name="c", gpu_cost_per_hour=1.0), state) == 0.0
+
+
+def test_accrue_cost_stops_at_finished_at():
+    from conductor.state import accrue_cost, elapsed_seconds
+    job = PodState(name="a", status="completed", started_at=1000.0, gpu_cost_per_hour=1.0,
+                   finished_at=1000.0 + 1800)
+    state = RunState(jobs=[job])
+    assert accrue_cost(job, state, now=1000.0 + 7200) == 0.5
+    assert job.cost_usd == 0.5 and state.total_cost_usd == 0.5
+    assert accrue_cost(job, state, now=1000.0 + 99999) == 0.0
+    assert elapsed_seconds(job, now=1000.0 + 99999) == 1800
+    live = PodState(name="b", status="running", started_at=1000.0)
+    assert elapsed_seconds(live, now=1060.0) == 60
+    assert elapsed_seconds(PodState(name="c")) is None
+
+
+def test_record_pod_stopped_once_per_pod(tmp_dir):
+    from conductor.state import pod_stop_recorded, read_cost_log, record_pod_stopped
+    path = os.path.join(tmp_dir, "cost.jsonl")
+    assert pod_stop_recorded(path, "p1") is False
+    assert record_pod_stopped(path, {"job": "a", "pod_id": "p1", "reason": "completed"}) is True
+    assert pod_stop_recorded(path, "p1") is True
+    assert record_pod_stopped(path, {"job": "a", "pod_id": "p1", "reason": "manual_teardown"}) is False
+    assert record_pod_stopped(path, {"job": "a", "pod_id": "p2", "reason": "completed"}) is True
+    events = read_cost_log(path)
+    assert [e["pod_id"] for e in events] == ["p1", "p2"]
+    assert all(e["event"] == "pod_stopped" and "ts" in e for e in events)
+    assert pod_stop_recorded(path, None) is False
+
+
+def test_reset_job_for_retry_clears_finished_at():
+    from conductor.state import reset_job_for_retry
+    job = PodState(name="a", status="failed", pod_id="p", started_at=1.0, finished_at=2.0)
+    reset_job_for_retry(job, keep_pod=True)
+    assert job.finished_at is None and job.pod_id == "p"

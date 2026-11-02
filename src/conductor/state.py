@@ -39,6 +39,7 @@ class PodState:
     pid: int | None = None
     pid_start: str | None = None   # process start time, detects pid reuse
     exit_code: int | None = None   # from the remote exit file, once the job ends
+    finished_at: float | None = None  # when the pod stopped billing for this job
     error: str | None = None
 
 
@@ -59,10 +60,13 @@ LIVE_STATUSES = ("provisioning", "deploying", "running", "sync_failed")
 def accrue_cost(job: PodState, state: RunState, now: float | None = None) -> float:
     """Bring job.cost_usd up to date (elapsed since started_at, i.e. pod
     creation, times the hourly rate) and add the increase to
-    state.total_cost_usd. Returns the increase."""
+    state.total_cost_usd. Returns the increase. Nothing accrues past
+    finished_at: a pod stops billing when it was released."""
     if not job.started_at or job.gpu_cost_per_hour <= 0:
         return 0.0
     now = time.time() if now is None else now
+    if job.finished_at is not None:
+        now = min(now, job.finished_at)
     new_cost = max(0.0, now - job.started_at) / 3600 * job.gpu_cost_per_hour
     delta = new_cost - job.cost_usd
     if delta <= 0:
@@ -190,7 +194,17 @@ def reset_job_for_retry(job: PodState, keep_pod: bool = False) -> None:
     job.pid = None
     job.pid_start = None
     job.exit_code = None
+    job.finished_at = None
     job.error = None
+
+
+def elapsed_seconds(job: PodState, now: float | None = None) -> float | None:
+    """Pod lifetime for display: from creation to release, or to now while
+    the pod is still live."""
+    if not job.started_at:
+        return None
+    end = job.finished_at if job.finished_at is not None else (time.time() if now is None else now)
+    return max(0.0, end - job.started_at)
 
 
 def append_cost_event(path: str, event: dict) -> None:
@@ -198,6 +212,24 @@ def append_cost_event(path: str, event: dict) -> None:
         event["ts"] = time.time()
     with open(path, "a") as f:
         f.write(json.dumps(event) + "\n")
+
+
+def pod_stop_recorded(path: str, pod_id: str | None) -> bool:
+    """True if the cost log already holds a pod_stopped event for this pod."""
+    if not pod_id:
+        return False
+    return any(e.get("event") == "pod_stopped" and e.get("pod_id") == pod_id
+               for e in read_cost_log(path))
+
+
+def record_pod_stopped(path: str, event: dict) -> bool:
+    """Append a pod_stopped event unless one exists for the pod already
+    (a pod stops billing once; a second release of the same ID is a no-op).
+    Returns True if the event was written."""
+    if pod_stop_recorded(path, event.get("pod_id")):
+        return False
+    append_cost_event(path, {"event": "pod_stopped", **event})
+    return True
 
 
 def read_cost_log(path: str) -> list[dict]:

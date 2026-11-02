@@ -587,6 +587,34 @@ def test_finish_job_retries_final_sync(mock_sync, mock_reg, mock_notify, paths):
 
 @patch("conductor.monitor.send_notification", return_value=False)
 @patch("conductor.monitor.registry_update")
+@patch("conductor.monitor.sync_pull", return_value=True)
+def test_finish_job_sets_finished_at_and_final_cost(mock_sync, mock_reg, mock_notify, paths):
+    from conductor.monitor import _finish_job
+    from conductor.state import accrue_cost, read_cost_log
+    state_path, cost_path = paths
+    provider = _provider()
+    provider.check_exists.return_value = False
+    job = PodState(name="a", status="running", pod_id="p", ssh_host="h", ssh_port=1,
+                   gpu_cost_per_hour=3600.0, started_at=time.time() - 1.0)
+    state = RunState(jobs=[job])
+
+    _finish_job(provider, job, _make_config(name="a"), state, cost_path, "completed")
+
+    assert job.finished_at is not None and job.finished_at >= job.started_at
+    assert job.cost_usd > 0.5 and state.total_cost_usd == job.cost_usd
+    final = job.cost_usd
+    assert accrue_cost(job, state, now=time.time() + 3600) == 0.0   # frozen at release
+    assert job.cost_usd == final
+    events = read_cost_log(cost_path)
+    assert len(events) == 1 and events[0]["total_cost_usd"] == final
+
+    # Releasing the same pod again must not write a second stop event
+    _finish_job(provider, job, _make_config(name="a"), state, cost_path, "completed")
+    assert len(read_cost_log(cost_path)) == 1
+
+
+@patch("conductor.monitor.send_notification", return_value=False)
+@patch("conductor.monitor.registry_update")
 @patch("conductor.monitor.sync_pull", return_value=False)
 def test_finish_job_force_teardown_ignores_sync_failure(mock_sync, mock_reg, mock_notify, paths):
     from conductor.monitor import _finish_job

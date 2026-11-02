@@ -7,9 +7,9 @@ import time
 import runpod
 
 from conductor import shutdown
-from conductor.errors import NoCapacityError, guarded, is_capacity_message
+from conductor.errors import NoCapacityError, guarded, is_capacity_message, is_not_found_message
 from conductor.gpu_pricing import GpuInfo
-from conductor.retry import retry
+from conductor.retry import is_retryable, retry
 from conductor.shutdown import Interrupted
 
 log = logging.getLogger(__name__)
@@ -20,6 +20,10 @@ WAIT_POLL_SECONDS = 5.0
 def _pause(instance_id: str) -> None:
     if shutdown.wait(WAIT_POLL_SECONDS):
         raise Interrupted(f"shutdown requested while waiting for SSH info of {instance_id}")
+
+
+def _retry_unless_gone(exc: BaseException) -> bool:
+    return is_retryable(exc) and not is_not_found_message(str(exc))
 
 
 class RunPodProvider:
@@ -125,11 +129,16 @@ class RunPodProvider:
         return pod.get("desiredStatus") not in ("EXITED", "TERMINATED")
 
     def terminate(self, instance_id: str) -> bool:
+        """True when the pod is terminated or was already gone ("pod not
+        found to terminate" is not retried); False on any other failure."""
         try:
             retry(guarded, "runpod.terminate_pod", runpod.terminate_pod, instance_id,
-                  what="runpod.terminate_pod")
+                  what="runpod.terminate_pod", should_retry=_retry_unless_gone)
             return True
         except Exception as e:
+            if is_not_found_message(str(e)):
+                log.info(f"Pod {instance_id} is already gone: {e}")
+                return True
             log.warning(f"Failed to terminate pod {instance_id}: {e}")
             return False
 

@@ -75,7 +75,7 @@ conductor sync                     # force immediate result sync
 conductor run [--config jobs.toml] [--jobs name1,name2] [--budget 40.00] [--retry-failed] [--retry-completed] [--force] [--teardown-on-interrupt]
 conductor status [--config jobs.toml]
 conductor sync [--config jobs.toml] [--jobs name1,name2] [--force]
-conductor teardown [--config jobs.toml] [--jobs name1,name2] [--force]
+conductor teardown [--config jobs.toml] [--jobs name1,name2] [--force]   # --jobs: only those jobs' pods
 conductor dry-run [--config jobs.toml]
 conductor validate [--config jobs.toml]
 conductor logs <job-name> [--tail] [--config jobs.toml]

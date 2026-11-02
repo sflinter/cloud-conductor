@@ -529,6 +529,72 @@ def test_teardown_jobs_only_touches_selected_jobs(tmp_dir, monkeypatch, capsys):
     assert "Tearing down eval (p2)" in out and "train" not in out
 
 
+def test_teardown_of_released_pod_keeps_outcome_and_cost(tmp_dir, monkeypatch, capsys):
+    """A completed job's pod is already gone: the terminate reports 'not
+    found', nothing is re-billed, no second stop event is written and the
+    job stays completed."""
+    import time
+    from unittest.mock import MagicMock
+    from conductor.state import PodState, load_state, read_cost_log
+    finished = time.time() - 600
+    config_path, state_path = _write_run_fixture(tmp_dir, [
+        PodState(name="train", status="completed", pod_id="p1", gpu_type="L4", gpu_cost_per_hour=0.59,
+                 started_at=finished - 120, finished_at=finished, cost_usd=0.02, exit_code=0),
+        PodState(name="eval", status="pending"),
+    ])
+    cost_path = os.path.join(tmp_dir, "cost.jsonl")
+    with open(cost_path, "w") as f:
+        f.write(json.dumps({"ts": finished - 120, "event": "pod_started", "job": "train",
+                            "pod_id": "p1", "gpu_type": "L4", "cost_per_hour": 0.59}) + "\n")
+        f.write(json.dumps({"ts": finished, "event": "pod_stopped", "job": "train", "pod_id": "p1",
+                            "gpu_type": "L4", "reason": "completed", "total_hours": 120 / 3600,
+                            "total_cost_usd": 0.02}) + "\n")
+    provider = MagicMock()
+    provider.terminate.return_value = True       # provider classified "not found" as gone
+    provider.check_exists.return_value = False
+    monkeypatch.setattr("conductor.cli._configure_provider", lambda name: provider)
+    registry = MagicMock()
+    monkeypatch.setattr("conductor.cli.update_pod", registry)
+
+    main(["teardown", "--config", config_path, "--force"])
+
+    assert registry.call_args[1]["status"] == "terminated"
+    train = load_state(state_path).jobs[0]
+    assert train.status == "completed" and train.error is None
+    assert train.cost_usd == 0.02 and train.finished_at == finished
+    stops = [e for e in read_cost_log(cost_path) if e["event"] == "pod_stopped"]
+    assert len(stops) == 1 and stops[0]["reason"] == "completed"
+    assert "All pods terminated" in capsys.readouterr().out
+
+
+def test_teardown_old_state_dedupes_by_cost_log(tmp_dir, monkeypatch, capsys):
+    """State written before finished_at existed: the cost log alone must
+    prevent the second stop event."""
+    import time
+    from unittest.mock import MagicMock
+    from conductor.state import PodState, load_state, read_cost_log
+    config_path, state_path = _write_run_fixture(tmp_dir, [
+        PodState(name="train", status="completed", pod_id="p1", gpu_cost_per_hour=0.59,
+                 started_at=time.time() - 7200, cost_usd=0.02),
+        PodState(name="eval", status="pending"),
+    ])
+    cost_path = os.path.join(tmp_dir, "cost.jsonl")
+    with open(cost_path, "w") as f:
+        f.write(json.dumps({"ts": 1, "event": "pod_stopped", "job": "train", "pod_id": "p1",
+                            "reason": "completed", "total_cost_usd": 0.02}) + "\n")
+    provider = MagicMock()
+    provider.terminate.return_value = True
+    provider.check_exists.return_value = False
+    monkeypatch.setattr("conductor.cli._configure_provider", lambda name: provider)
+    monkeypatch.setattr("conductor.cli.update_pod", MagicMock())
+
+    main(["teardown", "--config", config_path, "--force"])
+
+    train = load_state(state_path).jobs[0]
+    assert train.status == "completed" and train.cost_usd == 0.02   # not re-accrued for 2 h
+    assert len(read_cost_log(cost_path)) == 1
+
+
 def test_teardown_unverified_is_recorded_as_such(tmp_dir, monkeypatch, capsys):
     from unittest.mock import MagicMock
     from conductor.state import PodState, load_state, read_cost_log

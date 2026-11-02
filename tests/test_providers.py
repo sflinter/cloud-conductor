@@ -238,3 +238,37 @@ def test_vastai_no_offers_is_no_capacity():
         req.return_value = _vast_response({"offers": []})
         with pytest.raises(NoCapacityError):
             provider.create_instance("RTX 4090", "img")
+
+
+@patch("conductor.providers.runpod.runpod")
+def test_runpod_terminate_not_found_is_already_gone(mock_runpod):
+    from runpod import error as runpod_error
+    mock_runpod.terminate_pod.side_effect = runpod_error.QueryError("pod not found to terminate")
+    assert RunPodProvider().terminate("p") is True
+    assert mock_runpod.terminate_pod.call_count == 1   # not retried
+
+
+@patch("conductor.providers.runpod.runpod")
+def test_runpod_terminate_other_error_is_failure(mock_runpod):
+    from runpod import error as runpod_error
+    mock_runpod.terminate_pod.side_effect = runpod_error.QueryError("internal error")
+    assert RunPodProvider().terminate("p") is False
+    assert mock_runpod.terminate_pod.call_count == 4
+
+
+def test_vastai_terminate_missing_instance_is_already_gone():
+    from conductor.providers.vastai import VastaiProvider
+    provider = VastaiProvider()
+    with patch.object(provider, "_req") as req:
+        req.return_value = _vast_response(status=404)
+        assert provider.terminate("1") is True
+        assert req.call_count == 1
+
+        req.reset_mock()
+        req.return_value = _vast_response({"success": False, "msg": "Instance not found"})
+        assert provider.terminate("1") is True
+        assert req.call_count == 1
+
+        req.reset_mock()
+        req.return_value = _vast_response({"success": False, "msg": "rate limited"})
+        assert provider.terminate("1") is False
