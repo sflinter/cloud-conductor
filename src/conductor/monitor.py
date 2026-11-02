@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 import signal
 import sys
 import threading
@@ -35,6 +36,7 @@ def run_lifecycle(
     cost_log_path: str,
     budget_override: float = 0.0,
     provider: CloudProvider | None = None,
+    teardown_on_interrupt: bool = False,
 ) -> RunState:
     if budget_override > 0:
         state.budget_usd = budget_override
@@ -45,27 +47,26 @@ def run_lifecycle(
 
     config_map = {c.name: c for c in configs}
     provider_map = {c.name: get_provider(c.provider) for c in configs}
-    shutdown = {"requested": False}
+    shutdown = {"requested": False, "teardown": teardown_on_interrupt}
 
-    def _sigint_handler(sig, frame):
-        if shutdown["requested"]:
-            log.warning("Force quit")
-            sys.exit(1)
-        log.info("Graceful shutdown requested (Ctrl+C)")
-        shutdown["requested"] = True
+    prev_handler = signal.signal(signal.SIGINT, make_sigint_handler(shutdown, state))
 
-    prev_handler = signal.signal(signal.SIGINT, _sigint_handler)
-
+    state.orchestrator_pid = os.getpid()
+    state.heartbeat_at = time.time()
     try:
+        save_state(state, state_path)
+
         # Match the provider's pods to this run before touching anything
         reconcile_run_pods(config_map, provider_map, state, state_path, cost_log_path)
 
         # Start jobs that have no dependencies (or deps already met)
         _start_unblocked_jobs(configs, config_map, provider_map, state, state_path, cost_log_path)
+        state.heartbeat_at = time.time()
         save_state(state, state_path)
 
         while not _all_done(state) and not shutdown["requested"]:
             _monitor_tick(configs, config_map, provider_map, state, state_path, cost_log_path)
+            state.heartbeat_at = time.time()
             save_state(state, state_path)
 
             if shutdown["requested"]:
@@ -78,18 +79,61 @@ def run_lifecycle(
                 break
 
             _print_status(state)
-            time.sleep(POLL_INTERVAL)
+            _sleep_unless(shutdown, POLL_INTERVAL)
 
         if shutdown["requested"]:
-            _graceful_shutdown(configs, config_map, provider_map, state, state_path, cost_log_path)
+            if shutdown["teardown"]:
+                _graceful_shutdown(configs, config_map, provider_map, state, state_path, cost_log_path)
+            else:
+                _detach(state)
     except BaseException as e:
         _handle_crash(e, configs, config_map, provider_map, state, state_path, cost_log_path)
         raise
     finally:
         signal.signal(signal.SIGINT, prev_handler)
+        # This process no longer owns the run, whatever the exit path
+        state.orchestrator_pid = None
+        state.heartbeat_at = None
         save_state(state, state_path)
 
     return state
+
+
+def make_sigint_handler(shutdown: dict, state: RunState, hard_exit=os._exit):
+    """First Ctrl-C: stop after the current step (detach, or tear down when
+    shutdown["teardown"] is set). Second Ctrl-C: print the live pod IDs and
+    hard-exit; the pods and their IDs are already persisted."""
+    def _handler(sig, frame):
+        if shutdown["requested"]:
+            print_live_pods(live_pods(state),
+                            header="Force quit. These pods are STILL RUNNING and billing:")
+            print("Resume with 'conductor run --force' or terminate with "
+                  "'conductor teardown --force'.", file=sys.stderr)
+            hard_exit(130)
+            return
+        shutdown["requested"] = True
+        if shutdown["teardown"]:
+            log.warning("Ctrl-C: will sync and tear down all pods after the current step "
+                        "(press again to force quit)")
+        else:
+            log.warning("Ctrl-C: detaching after the current step; pods keep running "
+                        "(press again to force quit)")
+    return _handler
+
+
+def _sleep_unless(shutdown: dict, seconds: float) -> None:
+    deadline = time.time() + seconds
+    while time.time() < deadline and not shutdown["requested"]:
+        time.sleep(min(1.0, max(0.0, deadline - time.time())))
+
+
+def _detach(state: RunState) -> None:
+    live = live_pods(state)
+    log.info("Detached. Nothing was marked failed and no pod was touched.")
+    print_live_pods(live, header="Detached from run. Pods still running (and billing):")
+    if live:
+        print("Resume monitoring with 'conductor run', or terminate with 'conductor teardown'.",
+              file=sys.stderr)
 
 
 def _handle_crash(
@@ -867,14 +911,19 @@ def _graceful_shutdown(
 ) -> None:
     log.info("Performing graceful shutdown...")
     for job in state.jobs:
-        if job.status != "running":
+        if job.status not in ("running", "provisioning", "deploying"):
             continue
         config = config_map.get(job.name)
         if not config:
             continue
         prov = provider_map.get(job.name)
-        # Final sync
-        sync_pull(config, job)
+        if not job.pod_id:
+            job.status = "failed"
+            job.error = "interrupted"
+            continue
+        # Final sync (only a running job has results worth pulling)
+        if job.status == "running" and job.ssh_host:
+            sync_pull(config, job)
         # Teardown unless keep_pod_alive
         if job.pod_id and not config.keep_pod_alive:
             teardown_pod(prov, job.pod_id)

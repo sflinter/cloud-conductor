@@ -12,7 +12,7 @@ from pathlib import Path
 from conductor import __version__
 from conductor.config import load_config
 from conductor.gpu_pricing import get_gpu_price, select_cheapest_gpus
-from conductor.monitor import run_lifecycle
+from conductor.monitor import POLL_INTERVAL, run_lifecycle
 from conductor.providers import CloudProvider
 from conductor.provisioner import provision_pod_direct, teardown_pod
 from conductor.registry import PodRecord, add_pod, get_pod, list_pods, reconcile_with_provider, update_pod
@@ -20,8 +20,8 @@ from conductor.runner import exec_foreground, get_log_path, get_utilization, lau
 from conductor.deployer import deploy_direct
 from conductor.ssh import ssh_exec, ssh_interactive, tail_remote_log, tail_remote_log_subprocess
 from conductor.state import (
-    PodState, RunState, append_cost_event, get_job, init_state, load_state,
-    new_run_id, read_cost_log, reset_job_for_retry, save_state,
+    PodState, RunState, append_cost_event, describe_owner, get_job, init_state, load_state,
+    new_run_id, read_cost_log, reset_job_for_retry, run_is_live, save_state,
 )
 from conductor.syncer import sync_pull
 from conductor.validator import validate
@@ -45,6 +45,10 @@ def _build_parser() -> argparse.ArgumentParser:
                        help="Re-run jobs recorded as failed (and un-skip their dependents)")
     p_run.add_argument("--retry-completed", action="store_true",
                        help="Re-run jobs recorded as completed")
+    p_run.add_argument("--force", action="store_true",
+                       help="Start even if another 'conductor run' appears to be live on this state file")
+    p_run.add_argument("--teardown-on-interrupt", action="store_true",
+                       help="Ctrl-C syncs and terminates all pods (default: detach, pods keep running)")
 
     # status
     p_status = sub.add_parser("status", parents=[parent], help="Show current job status")
@@ -53,11 +57,13 @@ def _build_parser() -> argparse.ArgumentParser:
     # sync
     p_sync = sub.add_parser("sync", parents=[parent], help="Force sync results from all running pods")
     p_sync.add_argument("--jobs", help="Comma-separated job names to sync")
+    p_sync.add_argument("--force", action="store_true", help="Sync even while a 'conductor run' is live")
 
     # teardown
     p_td = sub.add_parser("teardown", parents=[parent], help="Terminate all tracked pods")
     p_td.add_argument("--jobs", help="Comma-separated job names to teardown")
-    p_td.add_argument("--force", action="store_true", help="Skip confirmation prompt")
+    p_td.add_argument("--force", action="store_true",
+                      help="Skip confirmation prompt and proceed even while a 'conductor run' is live")
 
     # dry-run
     sub.add_parser("dry-run", parents=[parent], help="Show what would be provisioned")
@@ -335,6 +341,11 @@ def cmd_run(args):
     # Load or init state
     if os.path.exists(state_path):
         state = load_state(state_path)
+        if run_is_live(state, POLL_INTERVAL) and not args.force:
+            print(f"Another 'conductor run' is {describe_owner(state, POLL_INTERVAL)} on {state_path}.\n"
+                  f"Stop it first (Ctrl-C detaches), or pass --force if it is really dead.",
+                  file=sys.stderr)
+            sys.exit(1)
         if not state.run_id:
             state.run_id = new_run_id()
         # Merge in any new jobs not in existing state
@@ -353,8 +364,14 @@ def cmd_run(args):
         state = init_state(configs, budget_usd=args.budget or configs[0].budget_usd)
 
     print(f"Run {state.run_id}: pods are named conductor-{state.run_id}-<job>")
-    run_lifecycle(configs, state, state_path, cost_log_path, budget_override=args.budget)
-    print("\nAll jobs finished.")
+    if args.teardown_on_interrupt:
+        print("Ctrl-C will sync and tear down all pods.")
+    else:
+        print("Ctrl-C detaches (pods keep running; resume with 'conductor run').")
+    run_lifecycle(configs, state, state_path, cost_log_path, budget_override=args.budget,
+                  teardown_on_interrupt=args.teardown_on_interrupt)
+    if all(j.status in ("completed", "failed", "skipped") for j in state.jobs):
+        print("\nAll jobs finished.")
 
 
 def _apply_retry_flags(state: RunState, config_map: dict, args) -> list[str]:
@@ -396,6 +413,7 @@ def cmd_status(args):
         return
 
     state = load_state(state_path)
+    print(f"Run {state.run_id or '(no id)'}: orchestrator {describe_owner(state, POLL_INTERVAL)}")
 
     # Reconcile running jobs against provider to detect terminated pods
     provider_cache: dict[str, CloudProvider] = {}
@@ -479,6 +497,7 @@ def cmd_sync(args):
         return
 
     state = load_state(state_path)
+    _refuse_if_live(state, "sync", args)
     for job in state.jobs:
         if job.status != "running" or not job.ssh_host:
             continue
@@ -489,8 +508,19 @@ def cmd_sync(args):
         sync_pull(config, job)
         job.last_sync_at = time.time()
 
-    save_state(state, state_path)
+    # Only the timestamps changed; never clobber a live run's state
+    if not run_is_live(state, POLL_INTERVAL):
+        save_state(state, state_path)
     print("Sync complete.")
+
+
+def _refuse_if_live(state: RunState, what: str, args) -> None:
+    if run_is_live(state, POLL_INTERVAL) and not getattr(args, "force", False):
+        print(f"Refusing to {what}: a 'conductor run' is {describe_owner(state, POLL_INTERVAL)} "
+              f"and would fight over the same pods.\n"
+              f"Stop it first (Ctrl-C detaches), or pass --force to proceed anyway.",
+              file=sys.stderr)
+        sys.exit(1)
 
 
 def cmd_teardown(args):
@@ -509,6 +539,7 @@ def cmd_teardown(args):
         return
 
     state = load_state(state_path)
+    _refuse_if_live(state, "teardown", args)
     pods = [(j.name, j.pod_id) for j in state.jobs if j.pod_id]
     if not pods:
         print("No active pods to teardown.")

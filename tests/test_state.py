@@ -133,3 +133,23 @@ def test_concurrent_save_state_is_safe(tmp_dir):
     for t in threads:
         t.join()
     assert load_state(path).run_id == "abc123"
+
+
+def test_run_is_live_and_owner_description(tmp_dir):
+    import time
+    from conductor.state import run_is_live, describe_owner
+    state = RunState(jobs=[], run_id="abc123")
+    assert run_is_live(state) is False
+    assert "not running" in describe_owner(state)
+    state.orchestrator_pid = 4242
+    state.heartbeat_at = time.time() - 10
+    assert run_is_live(state, poll_interval=30) is True
+    assert "live (pid 4242" in describe_owner(state)
+    state.heartbeat_at = time.time() - 61
+    assert run_is_live(state, poll_interval=30) is False
+    assert "crashed or hard-killed" in describe_owner(state)
+    # Round trip
+    path = os.path.join(tmp_dir, "state.json")
+    save_state(state, path)
+    loaded = load_state(path)
+    assert loaded.orchestrator_pid == 4242 and loaded.heartbeat_at == state.heartbeat_at

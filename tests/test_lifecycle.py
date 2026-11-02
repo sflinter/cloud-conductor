@@ -380,3 +380,112 @@ def test_lifecycle_reconciles_on_start(mock_reconcile, mock_start, mock_tick, mo
         run_lifecycle([config], state, state_path, cost_path)
     mock_reconcile.assert_called_once()
     assert mock_reconcile.call_args[0][2] is state
+
+
+# --- ownership, detach, interrupt ------------------------------------------
+
+def test_sigint_handler_detaches_then_hard_exits(capsys):
+    from conductor.monitor import make_sigint_handler
+    state = RunState(jobs=[PodState(name="a", status="running", pod_id="pod-live")])
+    shutdown = {"requested": False, "teardown": False}
+    exits = []
+    handler = make_sigint_handler(shutdown, state, hard_exit=exits.append)
+
+    handler(2, None)
+    assert shutdown["requested"] is True
+    assert exits == []
+    assert state.jobs[0].status == "running"
+
+    handler(2, None)
+    assert exits == [130]
+    err = capsys.readouterr().err
+    assert "pod-live" in err and "STILL RUNNING" in err
+
+
+@patch("conductor.monitor.send_notification", return_value=False)
+@patch("conductor.monitor._graceful_shutdown")
+@patch("conductor.monitor._start_unblocked_jobs")
+@patch("conductor.monitor.reconcile_run_pods")
+def test_lifecycle_detach_leaves_pods_and_clears_heartbeat(mock_rec, mock_start, mock_graceful, mock_notify, paths, capsys):
+    state_path, cost_path = paths
+    job = PodState(name="a", status="running", pod_id="pod-live", ssh_host="h", ssh_port=1, pid=1)
+    state = RunState(jobs=[job], run_id="abc123")
+    config = _make_config(name="a")
+    provider = _provider()
+    seen = {}
+
+    def tick(configs, config_map, provider_map, st, sp, cp):
+        seen["heartbeat"] = load_state(sp).heartbeat_at  # written before the first tick
+        seen["pid"] = load_state(sp).orchestrator_pid
+        # simulate Ctrl-C during the tick
+        import signal
+        signal.getsignal(signal.SIGINT)(signal.SIGINT, None)
+
+    with patch("conductor.monitor._monitor_tick", side_effect=tick), \
+         patch("conductor.monitor.get_provider", return_value=provider):
+        run_lifecycle([config], state, state_path, cost_path)
+
+    assert seen["heartbeat"] is not None and seen["pid"] == os.getpid()
+    assert job.status == "running"
+    provider.terminate.assert_not_called()
+    mock_graceful.assert_not_called()
+    saved = load_state(state_path)
+    assert saved.heartbeat_at is None and saved.orchestrator_pid is None
+    assert saved.jobs[0].pod_id == "pod-live"
+    err = capsys.readouterr().err
+    assert "Detached" in err and "pod-live" in err
+
+
+@patch("conductor.monitor.send_notification", return_value=False)
+@patch("conductor.monitor.sync_pull", return_value=True)
+@patch("conductor.monitor.registry_update")
+@patch("conductor.monitor._start_unblocked_jobs")
+@patch("conductor.monitor.reconcile_run_pods")
+def test_lifecycle_teardown_on_interrupt(mock_rec, mock_start, mock_reg, mock_sync, mock_notify, paths):
+    state_path, cost_path = paths
+    job = PodState(name="a", status="running", pod_id="pod-live", ssh_host="h", ssh_port=1, pid=1,
+                   started_at=time.time())
+    state = RunState(jobs=[job], run_id="abc123")
+    config = _make_config(name="a")
+    provider = _provider()
+
+    def tick(*a):
+        import signal
+        signal.getsignal(signal.SIGINT)(signal.SIGINT, None)
+
+    with patch("conductor.monitor._monitor_tick", side_effect=tick), \
+         patch("conductor.monitor.get_provider", return_value=provider):
+        run_lifecycle([config], state, state_path, cost_path, teardown_on_interrupt=True)
+
+    provider.terminate.assert_called_once_with("pod-live")
+    assert job.status == "failed" and job.error == "interrupted"
+
+
+@patch("conductor.monitor.send_notification", return_value=False)
+@patch("conductor.monitor.sync_pull", return_value=True)
+@patch("conductor.monitor.registry_update")
+def test_graceful_shutdown_covers_provisioning_and_deploying(mock_reg, mock_sync, mock_notify, paths):
+    from conductor.monitor import _graceful_shutdown
+    state_path, cost_path = paths
+    provider = _provider()
+    state = RunState(jobs=[
+        PodState(name="prov", status="provisioning", pod_id="p1"),
+        PodState(name="dep", status="deploying", pod_id="p2", ssh_host="h", ssh_port=1),
+        PodState(name="run", status="running", pod_id="p3", ssh_host="h", ssh_port=1, pid=1),
+        PodState(name="nopod", status="provisioning"),
+        PodState(name="done", status="completed", pod_id="p4"),
+    ])
+    configs = {j.name: _make_config(name=j.name) for j in state.jobs}
+    providers = {n: provider for n in configs}
+    _graceful_shutdown(list(configs.values()), configs, providers, state, state_path, cost_path)
+    assert sorted(c[0][0] for c in provider.terminate.call_args_list) == ["p1", "p2", "p3"]
+    assert [j.status for j in state.jobs] == ["failed", "failed", "failed", "failed", "completed"]
+    mock_sync.assert_called_once()  # only the running job had results to pull
+
+
+def test_sleep_unless_returns_early():
+    from conductor.monitor import _sleep_unless
+    shutdown = {"requested": True, "teardown": False}
+    t0 = time.time()
+    _sleep_unless(shutdown, 30)
+    assert time.time() - t0 < 1

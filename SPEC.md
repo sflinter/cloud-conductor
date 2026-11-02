@@ -43,10 +43,10 @@ The `<pod>` argument accepts a pod name or pod ID prefix (like `docker ps`). Pod
 ### Declarative commands (TOML config)
 
 ```
-conductor run [-f jobs.toml] [--jobs name1,name2] [--budget 40.00] [--retry-failed] [--retry-completed]
+conductor run [-f jobs.toml] [--jobs name1,name2] [--budget 40.00] [--retry-failed] [--retry-completed] [--force] [--teardown-on-interrupt]
 conductor status [--config jobs.toml]
-conductor sync [--config jobs.toml] [--jobs name1,name2]
-conductor teardown [--config jobs.toml] [--jobs name1,name2]
+conductor sync [--config jobs.toml] [--jobs name1,name2] [--force]
+conductor teardown [--config jobs.toml] [--jobs name1,name2] [--force]
 conductor dry-run [--config jobs.toml]
 conductor validate [--config jobs.toml]
 conductor logs <job-name> [--tail] [--config jobs.toml]
@@ -90,7 +90,8 @@ Full lifecycle: provision → deploy → launch → monitor → sync → teardow
 - Tears down each pod when its job completes or fails
 - Sends notifications on job completion, failure, or budget threshold
 - Exits when all jobs are done
-- Ctrl+C triggers graceful shutdown: final sync, then teardown all pods
+- Refuses to start if the state file's heartbeat shows another `conductor run` is live (override with `--force`)
+- Ctrl+C detaches: prints the live pod IDs, marks nothing failed, exits; `--teardown-on-interrupt` instead does a final sync and tears down all pods. A second Ctrl+C hard-exits after printing the pod IDs
 
 ### `conductor status`
 
@@ -106,11 +107,11 @@ Job     Pod          GPU              Status     GPU%  CPU%  Elapsed    Cost    
 
 ### `conductor sync`
 
-Forces an immediate rsync of results from all running pods.
+Forces an immediate rsync of results from all running pods. Refuses while a `conductor run` is live on the state file unless `--force` is passed.
 
 ### `conductor teardown`
 
-Terminates all pods tracked in the state file. Prompts for confirmation unless `--force` is passed.
+Terminates all pods tracked in the state file. Prompts for confirmation unless `--force` is passed. Refuses while a `conductor run` is live on the state file unless `--force` is passed.
 
 ### `conductor dry-run`
 
@@ -344,11 +345,13 @@ PYTHONUNBUFFERED=1 .venv/bin/python scripts/eval_with_search.py \
   ],
   "total_cost_usd": 0.27,
   "budget_usd": 40.00,
-  "run_id": "a1b2c3"
+  "run_id": "a1b2c3",
+  "orchestrator_pid": 4242,
+  "heartbeat_at": 1709149531.0
 }
 ```
 
-`run_id` names this run's pods (`conductor-<run_id>-<job>`) so they can be matched to the run from the provider's pod list. The state file and the registry are protected by a cross-process lock (`flock` on a hidden `.lock` sibling) for every read-modify-write.
+`orchestrator_pid` and `heartbeat_at` identify the live `conductor run`; the heartbeat is refreshed every poll and cleared when the run detaches or finishes. A run is considered live while the heartbeat is fresher than two poll intervals (60 s). `run_id` names this run's pods (`conductor-<run_id>-<job>`) so they can be matched to the run from the provider's pod list. The state file and the registry are protected by a cross-process lock (`flock` on a hidden `.lock` sibling) for every read-modify-write.
 
 The state file is updated after every significant event (provision, deploy, sync, status check, teardown). It is the source of truth for `conductor status`.
 
@@ -506,7 +509,8 @@ Minimal:
 | GPU stall (process alive, GPU idle) | Final sync, teardown pod, mark as `failed`, notify |
 | Global budget limit reached | Final sync all pods, teardown all pods, notify, exit |
 | Dependency failed | Mark dependent jobs as `skipped`, notify |
-| Ctrl+C | Graceful shutdown: final sync all pods, teardown all pods (unless `keep_pod_alive`), save state, exit |
+| Ctrl+C | Detach: save state, print live pod IDs and how to resume, exit. Nothing marked failed, nothing terminated. With `--teardown-on-interrupt`: final sync all pods, teardown all pods (unless `keep_pod_alive`), save state, exit |
+| Second Ctrl+C | Print live pod IDs, hard exit |
 | Conductor process dies | State saved, every live pod ID printed with its job, `orchestrator_crashed` notification sent. Pods are left running unless `teardown_on_crash = true`. `conductor status` still works; `conductor run` resumes from saved state. |
 | Transport error (SSH timeout, rsync failure, provider API/SDK error) | Returned as a failed result or `ConductorError`; the affected job is marked `failed` with `error` set. The orchestrator never dies from one. |
 

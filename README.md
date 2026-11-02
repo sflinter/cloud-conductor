@@ -69,9 +69,9 @@ conductor sync                     # force immediate result sync
 ## CLI Reference
 
 ```
-conductor run [--config jobs.toml] [--jobs name1,name2] [--budget 40.00] [--retry-failed] [--retry-completed]
+conductor run [--config jobs.toml] [--jobs name1,name2] [--budget 40.00] [--retry-failed] [--retry-completed] [--force] [--teardown-on-interrupt]
 conductor status [--config jobs.toml]
-conductor sync [--config jobs.toml] [--jobs name1,name2]
+conductor sync [--config jobs.toml] [--jobs name1,name2] [--force]
 conductor teardown [--config jobs.toml] [--jobs name1,name2] [--force]
 conductor dry-run [--config jobs.toml]
 conductor validate [--config jobs.toml]
@@ -132,6 +132,10 @@ Running `conductor run` again with an existing state file:
 - lists the provider's pods, adopts any `conductor-<run_id>-*` pod missing from state, and terminates (loudly) any such pod that no job tracks
 - resumes jobs persisted as `provisioning`/`deploying` on their existing pod (re-deploy, launch) and relaunches a `running` job that has no recorded pid
 - skips `completed`/`failed`/`skipped` jobs unless you pass `--retry-failed` (also un-skips their dependents) or `--retry-completed`
+
+**Ctrl-C detaches.** The orchestrator stops after its current step, prints the live pod IDs and exits; nothing is marked failed and no pod is terminated. Run `conductor run` again to resume monitoring, or `conductor teardown` to terminate. Use `conductor run --teardown-on-interrupt` for the old behaviour (final sync, then terminate everything). A second Ctrl-C hard-exits after printing the pod IDs.
+
+**One orchestrator per state file.** A live run writes a heartbeat to the state file every tick. `conductor run` refuses to start while another run is live, and `conductor teardown` / `conductor sync` refuse too, so two processes never fight over the same pods; pass `--force` if the other process is really dead. `conductor status` shows whether the orchestrator is live.
 
 ## Lifecycle
 

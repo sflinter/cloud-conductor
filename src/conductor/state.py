@@ -42,6 +42,27 @@ class RunState:
     total_cost_usd: float = 0.0
     budget_usd: float = 0.0
     run_id: str = ""  # short id naming this run's pods: conductor-<run_id>-<job>
+    orchestrator_pid: int | None = None  # pid of the live `conductor run`, if any
+    heartbeat_at: float | None = None    # last tick of the live `conductor run`
+
+
+def run_is_live(state: RunState, poll_interval: float = 30.0, now: float | None = None) -> bool:
+    """True if an orchestrator has heart-beaten this state within the last
+    two poll intervals. A detached or finished run clears its heartbeat."""
+    if not state.heartbeat_at:
+        return False
+    now = time.time() if now is None else now
+    return (now - state.heartbeat_at) < 2 * poll_interval
+
+
+def describe_owner(state: RunState, poll_interval: float = 30.0) -> str:
+    if run_is_live(state, poll_interval):
+        age = int(time.time() - state.heartbeat_at)
+        return f"live (pid {state.orchestrator_pid}, heartbeat {age}s ago)"
+    if state.heartbeat_at:
+        age = int(time.time() - state.heartbeat_at)
+        return f"not running (last heartbeat {age}s ago; crashed or hard-killed)"
+    return "not running (detached or finished)"
 
 
 def new_run_id() -> str:
@@ -67,6 +88,8 @@ def load_state(path: str, lock: bool = True) -> RunState:
         total_cost_usd=data.get("total_cost_usd", 0.0),
         budget_usd=data.get("budget_usd", 0.0),
         run_id=data.get("run_id", ""),
+        orchestrator_pid=data.get("orchestrator_pid"),
+        heartbeat_at=data.get("heartbeat_at"),
     )
 
 
@@ -76,6 +99,8 @@ def save_state(state: RunState, path: str, lock: bool = True) -> None:
         "total_cost_usd": state.total_cost_usd,
         "budget_usd": state.budget_usd,
         "run_id": state.run_id,
+        "orchestrator_pid": state.orchestrator_pid,
+        "heartbeat_at": state.heartbeat_at,
     }
     dir_name = os.path.dirname(path) or "."
     with locked(path) if lock else contextlib.nullcontext():
