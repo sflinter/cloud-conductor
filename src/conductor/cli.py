@@ -599,27 +599,26 @@ def cmd_teardown(args):
     state = load_state(state_path)
     cost_log_path = configs[0].cost_log_file
     _refuse_if_live(state, "teardown", args)
-    pods = [(j.name, j.pod_id) for j in state.jobs if j.pod_id]
-    if not pods:
+    # --jobs narrows the configs: only tear down the selected jobs' pods
+    selected = [j for j in state.jobs if j.pod_id and j.name in config_map]
+    if not selected:
         print("No active pods to teardown.")
         return
 
     if not args.force:
-        print(f"About to teardown {len(pods)} pod(s):")
-        for name, pid in pods:
-            print(f"  {name}: {pid}")
+        print(f"About to teardown {len(selected)} pod(s):")
+        for job in selected:
+            print(f"  {job.name}: {job.pod_id}")
         answer = input("Continue? [y/N] ").strip().lower()
         if answer != "y":
             print("Aborted.")
             return
 
     unverified = []
-    for job in state.jobs:
-        if not job.pod_id:
-            continue
-        cfg = config_map.get(job.name)
-        prov = providers.get(cfg.provider) if cfg else providers.get("runpod")
-        print(f"Tearing down {job.name} ({job.pod_id})...")
+    for job in selected:
+        cfg = config_map[job.name]
+        prov = providers[cfg.provider]
+        print(f"Tearing down {job.name} ({job.pod_id})...", flush=True)
         log.info(f"[{job.name}] Manual teardown of pod {job.pod_id}")
         ok = teardown_pod(prov, job.pod_id)
         _record_manual_teardown(job, state, cost_log_path, ok)
@@ -630,9 +629,9 @@ def cmd_teardown(args):
     if unverified:
         print("Could not confirm termination of: "
               + ", ".join(f"{j.name} ({j.pod_id})" for j in unverified)
-              + ". They may still be billing; check the provider console.")
+              + ". They may still be billing; check the provider console.", flush=True)
     else:
-        print("All pods terminated.")
+        print("All pods terminated.", flush=True)
 
 
 def _record_manual_teardown(job: PodState, state: RunState, cost_log_path: str, verified: bool) -> None:

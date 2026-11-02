@@ -502,6 +502,33 @@ def test_teardown_records_outcome_and_cost(tmp_dir, monkeypatch, capsys):
     assert "manual_teardown" in row and "running" not in row
 
 
+def test_teardown_jobs_only_touches_selected_jobs(tmp_dir, monkeypatch, capsys):
+    from unittest.mock import MagicMock
+    from conductor.state import PodState, load_state, read_cost_log
+    config_path, state_path = _write_run_fixture(tmp_dir, [
+        PodState(name="train", status="completed", pod_id="p1", exit_code=0),
+        PodState(name="eval", status="running", pod_id="p2"),
+    ])
+    provider = MagicMock()
+    provider.terminate.return_value = True
+    provider.check_exists.return_value = False
+    monkeypatch.setattr("conductor.cli._configure_provider", lambda name: provider)
+    registry = MagicMock()
+    monkeypatch.setattr("conductor.cli.update_pod", registry)
+
+    main(["teardown", "--config", config_path, "--jobs", "eval", "--force"])
+
+    provider.terminate.assert_called_once_with("p2")
+    assert [c[0][0] for c in registry.call_args_list] == ["p2"]
+    saved = load_state(state_path)
+    assert saved.jobs[0].status == "completed" and saved.jobs[0].error is None
+    assert saved.jobs[1].status == "failed" and saved.jobs[1].error == "torn down manually"
+    stops = [e for e in read_cost_log(os.path.join(tmp_dir, "cost.jsonl")) if e["event"] == "pod_stopped"]
+    assert [e["pod_id"] for e in stops] == ["p2"]
+    out = capsys.readouterr().out
+    assert "Tearing down eval (p2)" in out and "train" not in out
+
+
 def test_teardown_unverified_is_recorded_as_such(tmp_dir, monkeypatch, capsys):
     from unittest.mock import MagicMock
     from conductor.state import PodState, load_state, read_cost_log
