@@ -104,3 +104,39 @@ def test_vastai_get_ssh_info():
         assert provider.get_ssh_info("42") == ("ssh.vast.ai", 1234)
         req.return_value = _vast_response(status=500)
         assert provider.get_ssh_info("42") is None
+
+
+@patch("conductor.providers.runpod.runpod")
+def test_runpod_list_instances(mock_runpod):
+    mock_runpod.get_pods.return_value = [
+        {"id": "a", "name": "conductor-abc123-train", "desiredStatus": "RUNNING"},
+        {"id": "b", "name": "conductor-abc123-eval", "desiredStatus": "EXITED"},
+        {"id": "c", "desiredStatus": "RUNNING"},
+    ]
+    insts = RunPodProvider().list_instances()
+    assert insts == [
+        {"id": "a", "name": "conductor-abc123-train", "alive": True},
+        {"id": "b", "name": "conductor-abc123-eval", "alive": False},
+        {"id": "c", "name": "", "alive": True},
+    ]
+    from runpod import error as runpod_error
+    mock_runpod.get_pods.side_effect = runpod_error.QueryError("429")
+    with pytest.raises(ConductorError):
+        RunPodProvider().list_instances()
+
+
+def test_vastai_list_instances():
+    from conductor.providers.vastai import VastaiProvider
+    provider = VastaiProvider()
+    with patch.object(provider, "_req") as req:
+        req.return_value = _vast_response({"instances": [
+            {"id": 1, "label": "conductor-abc123-train", "actual_status": "running"},
+            {"id": 2, "label": "other", "actual_status": "exited"},
+        ]})
+        assert provider.list_instances() == [
+            {"id": "1", "name": "conductor-abc123-train", "alive": True},
+            {"id": "2", "name": "other", "alive": False},
+        ]
+        req.return_value = _vast_response(raise_json=True)
+        with pytest.raises(ConductorError):
+            provider.list_instances()

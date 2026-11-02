@@ -20,8 +20,8 @@ from conductor.runner import exec_foreground, get_log_path, get_utilization, lau
 from conductor.deployer import deploy_direct
 from conductor.ssh import ssh_exec, ssh_interactive, tail_remote_log, tail_remote_log_subprocess
 from conductor.state import (
-    RunState, append_cost_event, get_job, init_state, load_state,
-    read_cost_log, save_state,
+    PodState, RunState, append_cost_event, get_job, init_state, load_state,
+    new_run_id, read_cost_log, reset_job_for_retry, save_state,
 )
 from conductor.syncer import sync_pull
 from conductor.validator import validate
@@ -41,6 +41,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("-f", "--file", dest="config_file", default=None, help="Path to TOML config file")
     p_run.add_argument("--jobs", help="Comma-separated job names to run")
     p_run.add_argument("--budget", type=float, default=0.0, help="Override global budget")
+    p_run.add_argument("--retry-failed", action="store_true",
+                       help="Re-run jobs recorded as failed (and un-skip their dependents)")
+    p_run.add_argument("--retry-completed", action="store_true",
+                       help="Re-run jobs recorded as completed")
 
     # status
     p_status = sub.add_parser("status", parents=[parent], help="Show current job status")
@@ -308,6 +312,7 @@ def cmd_completions(args, parser=None):
 def cmd_run(args):
     job_names = args.jobs.split(",") if args.jobs else None
     configs = load_config(args.config, job_names=job_names)
+    config_map = {c.name: c for c in configs}
 
     # Configure providers for all jobs
     provider_names = {c.provider for c in configs}
@@ -330,21 +335,55 @@ def cmd_run(args):
     # Load or init state
     if os.path.exists(state_path):
         state = load_state(state_path)
+        if not state.run_id:
+            state.run_id = new_run_id()
         # Merge in any new jobs not in existing state
         existing = {j.name for j in state.jobs}
         for cfg in configs:
             if cfg.name not in existing:
-                from conductor.state import PodState
                 state.jobs.append(PodState(
                     name=cfg.name,
                     depends_on=list(cfg.depends_on),
                     job_budget_usd=cfg.job_budget_usd,
                 ))
+        retried = _apply_retry_flags(state, config_map, args)
+        for name in retried:
+            print(f"Re-running {name}")
     else:
         state = init_state(configs, budget_usd=args.budget or configs[0].budget_usd)
 
+    print(f"Run {state.run_id}: pods are named conductor-{state.run_id}-<job>")
     run_lifecycle(configs, state, state_path, cost_log_path, budget_override=args.budget)
     print("\nAll jobs finished.")
+
+
+def _apply_retry_flags(state: RunState, config_map: dict, args) -> list[str]:
+    """--retry-failed / --retry-completed: return finished jobs to pending.
+    A kept-alive pod of a completed job is reused; any other pod a retried
+    job still references is terminated by the pipeline before re-provisioning."""
+    statuses = set()
+    if getattr(args, "retry_failed", False):
+        statuses.add("failed")
+    if getattr(args, "retry_completed", False):
+        statuses.add("completed")
+    if not statuses:
+        return []
+    retried = []
+    for job in state.jobs:
+        if job.name not in config_map or job.status not in statuses:
+            continue
+        cfg = config_map[job.name]
+        keep_pod = job.status == "completed" and cfg.keep_pod_alive
+        reset_job_for_retry(job, keep_pod=keep_pod or bool(job.pod_id))
+        retried.append(job.name)
+    if "failed" in statuses:
+        # Dependents skipped because of a failure get another chance; the
+        # lifecycle re-skips them if a dependency is still failed
+        for job in state.jobs:
+            if job.status == "skipped" and job.name in config_map:
+                reset_job_for_retry(job)
+                retried.append(job.name)
+    return retried
 
 
 def cmd_status(args):

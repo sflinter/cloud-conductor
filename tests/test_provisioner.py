@@ -168,3 +168,62 @@ def test_refresh_ssh_info():
     assert refresh_ssh_info(provider, pod) is True
     assert (pod.ssh_host, pod.ssh_port) == ("new", 2)
     assert refresh_ssh_info(provider, _make_pod()) is False  # no pod_id
+
+
+@patch("conductor.provisioner.wait_ssh", return_value=True)
+def test_provision_persists_pod_id_before_ssh_wait(mock_ssh):
+    provider = _mock_provider()
+    provider.create_instance.return_value = {"id": "pod123", "cost_per_hour": 0.12}
+    seen = []
+
+    def _wait(instance_id, timeout=300):
+        seen.append(("wait_for_ssh", list(persisted)))
+        return ("1.2.3.4", 22222)
+    provider.wait_for_ssh.side_effect = _wait
+    persisted = []
+
+    def on_created(pod_state):
+        persisted.append((pod_state.pod_id, pod_state.gpu_type, pod_state.gpu_cost_per_hour, pod_state.status))
+
+    config = _make_config()
+    pod = _make_pod()
+    result = provision_pod(provider, config, pod, run_id="abc123", on_created=on_created)
+    assert result.pod_id == "pod123"
+    # on_created ran with the pod id before the provider's SSH wait started
+    assert seen[0][1] == [("pod123", "NVIDIA RTX A2000", 0.12, "provisioning")]
+    assert provider.create_instance.call_args[1]["name"] == "conductor-abc123-test"
+
+
+def test_provision_ssh_failure_releases_and_reports(mock_sleep=None):
+    provider = _mock_provider()
+    provider.create_instance.side_effect = [
+        {"id": "dead1", "cost_per_hour": 0.1},
+        {"id": "ok2", "cost_per_hour": 0.2},
+    ]
+    provider.wait_for_ssh.side_effect = [None, ("1.1.1.1", 1)]
+    provider.terminate.return_value = True
+    created, released = [], []
+    config = _make_config(gpu_type_ids_fallback=["NVIDIA RTX A4000"])
+    pod = _make_pod()
+    with patch("conductor.provisioner.wait_ssh", return_value=True):
+        result = provision_pod(provider, config, pod,
+                               on_created=lambda p: created.append(p.pod_id),
+                               on_released=lambda pid, ok: released.append((pid, ok)))
+    assert created == ["dead1", "ok2"]
+    assert released == [("dead1", True)]
+    provider.terminate.assert_called_once_with("dead1")
+    assert result.pod_id == "ok2"
+    assert result.status == "provisioning"
+
+
+def test_provision_release_failure_is_reported():
+    provider = _mock_provider()
+    provider.create_instance.return_value = {"id": "stuck", "cost_per_hour": 0.1}
+    provider.wait_for_ssh.return_value = None
+    provider.terminate.return_value = False
+    released = []
+    result = provision_pod(provider, _make_config(), _make_pod(),
+                           on_released=lambda pid, ok: released.append((pid, ok)))
+    assert released == [("stuck", False)]
+    assert result.status == "failed"
+    assert result.pod_id is None  # no longer tracked by the job (registry keeps it)

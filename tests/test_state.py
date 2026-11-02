@@ -34,9 +34,9 @@ def test_atomic_write(tmp_dir):
     state = RunState(jobs=[PodState(name="x")], budget_usd=10.0)
     save_state(state, path)
     assert os.path.exists(path)
-    # No leftover tmp files
-    files = os.listdir(tmp_dir)
-    assert len(files) == 1
+    # No leftover tmp files (the hidden .lock sibling is expected)
+    files = [f for f in os.listdir(tmp_dir) if not f.startswith(".")]
+    assert files == ["state.json"]
 
 
 def test_init_state():
@@ -71,3 +71,65 @@ def test_cost_log(tmp_dir):
 def test_read_cost_log_missing(tmp_dir):
     path = os.path.join(tmp_dir, "missing.jsonl")
     assert read_cost_log(path) == []
+
+
+def test_run_id_generated_and_persisted(tmp_dir):
+    from conductor.state import new_run_id, pod_name_for
+    configs = [JobConfig(name="a", run_command="echo a")]
+    state = init_state(configs)
+    assert len(state.run_id) == 6
+    path = os.path.join(tmp_dir, "state.json")
+    save_state(state, path)
+    assert load_state(path).run_id == state.run_id
+    assert pod_name_for(state.run_id, "a") == f"conductor-{state.run_id}-a"
+    assert pod_name_for("", "a") == "conductor-a"
+    assert new_run_id() != new_run_id()
+
+
+def test_load_old_state_without_run_id(tmp_dir):
+    path = os.path.join(tmp_dir, "state.json")
+    with open(path, "w") as f:
+        json.dump({"jobs": [{"name": "a", "status": "running", "pod_id": "p"}],
+                   "total_cost_usd": 1.0, "budget_usd": 5.0}, f)
+    state = load_state(path)
+    assert state.run_id == ""
+    assert state.jobs[0].pod_id == "p"
+
+
+def test_reset_job_for_retry():
+    from conductor.state import reset_job_for_retry
+    import time
+    job = PodState(name="a", status="failed", pod_id="p", ssh_host="h", ssh_port=1,
+                   pid=5, pid_start="x", exit_code=1, error="boom", cost_usd=2.0,
+                   started_at=time.time(), provision_attempts=3, gone_confirmations=2,
+                   gpu_type="A2000", gpu_cost_per_hour=0.5)
+    reset_job_for_retry(job)
+    assert job.status == "pending"
+    assert job.pod_id is None and job.ssh_host is None
+    assert job.pid is None and job.exit_code is None and job.error is None
+    assert job.cost_usd == 0.0 and job.started_at is None
+    assert job.provision_attempts == 0 and job.gone_confirmations == 0
+
+    job2 = PodState(name="b", status="completed", pod_id="keep", ssh_host="h", ssh_port=1, pid=5)
+    reset_job_for_retry(job2, keep_pod=True)
+    assert job2.pod_id == "keep" and job2.ssh_host == "h"
+    assert job2.pid is None and job2.status == "pending"
+
+
+def test_concurrent_save_state_is_safe(tmp_dir):
+    import threading
+    path = os.path.join(tmp_dir, "state.json")
+    state = RunState(jobs=[PodState(name=f"j{i}") for i in range(20)], run_id="abc123")
+
+    def writer():
+        for _ in range(15):
+            save_state(state, path)
+            loaded = load_state(path)
+            assert len(loaded.jobs) == 20  # never a partial read
+
+    threads = [threading.Thread(target=writer) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert load_state(path).run_id == "abc123"

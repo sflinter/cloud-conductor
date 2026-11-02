@@ -17,8 +17,9 @@ from conductor.providers import CloudProvider, get_provider
 from conductor.provisioner import check_pod_exists, provision_pod, refresh_ssh_info, teardown_pod
 from conductor.registry import PodRecord, add_pod as registry_add, update_pod as registry_update
 from conductor.runner import LOG_TAIL_LINES, fetch_log_tail, get_log_path, get_utilization, is_alive, launch
+from conductor.ssh import wait_ssh
 from conductor.state import (
-    PodState, RunState, append_cost_event, get_job, save_state,
+    PodState, RunState, append_cost_event, get_job, pod_name_for, save_state,
 )
 from conductor.syncer import sync_pull, sync_push
 
@@ -56,6 +57,9 @@ def run_lifecycle(
     prev_handler = signal.signal(signal.SIGINT, _sigint_handler)
 
     try:
+        # Match the provider's pods to this run before touching anything
+        reconcile_run_pods(config_map, provider_map, state, state_path, cost_log_path)
+
         # Start jobs that have no dependencies (or deps already met)
         _start_unblocked_jobs(configs, config_map, provider_map, state, state_path, cost_log_path)
         save_state(state, state_path)
@@ -151,7 +155,7 @@ def _monitor_tick(
     cost_log_path: str,
 ) -> None:
     for job in state.jobs:
-        if job.status != "running":
+        if job.status not in ("running", "provisioning", "deploying"):
             continue
 
         config = config_map.get(job.name)
@@ -160,6 +164,11 @@ def _monitor_tick(
 
         prov = provider_map.get(job.name)
         try:
+            if job.status != "running":
+                # Persisted mid-flight by a previous orchestrator (ticks and
+                # pipelines never overlap, so nobody else is working on it)
+                _resume_job(prov, job, config, state, state_path, cost_log_path)
+                continue
             _tick_job(job, config, prov, state, state_path, cost_log_path)
         except ConductorError as e:
             # Transient infrastructure error: keep the job, retry next tick
@@ -274,6 +283,13 @@ def _tick_job(
         exists = check_pod_exists(prov, job.pod_id) if job.pod_id else None
         if exists is True:
             job.gone_confirmations = 0
+            if not job.pid and job.ssh_host:
+                # Persisted as running with no pid and no exit file: launch
+                # (the launcher reports an already-running job instead of
+                # starting a second copy)
+                log.warning(f"[{job.name}] No pid recorded; launching")
+                _launch_job(prov, job, config, state, state_path, contextlib.nullcontext())
+                return
             # The port may have been remapped: refresh before the next tick
             if refresh_ssh_info(prov, job):
                 log.info(f"[{job.name}] Pod alive; SSH info refreshed to "
@@ -390,13 +406,14 @@ def _provision_deploy_launch(
     state_path: str,
     cost_log_path: str,
     lock: threading.Lock | None = None,
+    resume: bool = False,
 ) -> None:
     """Run provision → deploy → launch for one job. Never raises: any error
     marks the job failed with job.error set, keeping the pod ID in state so
     it can be torn down or resumed."""
     cm = lock or contextlib.nullcontext()
     try:
-        _pipeline(provider, job, config, state, state_path, cost_log_path, cm)
+        _pipeline(provider, job, config, state, state_path, cost_log_path, cm, resume=resume)
     except Exception as e:
         if isinstance(e, ConductorError):
             log.error(f"[{job.name}] {e}")
@@ -427,54 +444,71 @@ def _pipeline(
     state_path: str,
     cost_log_path: str,
     cm,
+    resume: bool = False,
 ) -> None:
     is_reuse = config.keep_pod_alive and job.pod_id is not None
+    # resume: the job was persisted mid-flight and its pod has been verified
+    # to exist; continue on it rather than terminating and starting over.
+    adopt = resume and job.pod_id is not None
 
     # Terminate any existing pod before provisioning a replacement
-    if job.pod_id and not is_reuse:
+    if job.pod_id and not is_reuse and not adopt:
         try:
-            teardown_pod(provider, job.pod_id)
-            registry_update(job.pod_id, status="terminated")
-        except Exception:
-            pass
+            if teardown_pod(provider, job.pod_id):
+                registry_update(job.pod_id, status="terminated", cost_usd=job.cost_usd)
+            else:
+                log.error(f"[{job.name}] Could not terminate old pod {job.pod_id}; "
+                          f"it stays in the registry as running")
+        except Exception as e:
+            log.error(f"[{job.name}] Error terminating old pod {job.pod_id}: {describe(e)}")
 
-    # Provision
-    provision_pod(provider, config, job)
-    if job.status == "failed":
-        _propagate_failure(job, state)
-        send_notification(config.notifications, "job_failed",
-                          job=job.name, error=job.error)
-        return
+    def _persist_created(pod: PodState) -> None:
+        # Called the instant the provider returns an ID, before any SSH wait
+        pod.status = "provisioning"
+        with cm:
+            save_state(state, state_path)
+            append_cost_event(cost_log_path, {
+                "event": "pod_started", "job": pod.name, "pod_id": pod.pod_id,
+                "gpu_type": pod.gpu_type, "cost_per_hour": pod.gpu_cost_per_hour,
+            })
+        _register_pod(pod, config, state.run_id)
+
+    def _released(pod_id: str, terminated: bool) -> None:
+        if terminated:
+            registry_update(pod_id, status="terminated")
+        else:
+            log.error(f"[{job.name}] Pod {pod_id} could not be terminated and is NOT "
+                      f"tracked by this job any more; it stays in the registry as running")
+            append_cost_event(cost_log_path, {
+                "event": "pod_orphaned", "job": job.name, "pod_id": pod_id,
+            })
+
+    if adopt:
+        log.info(f"[{job.name}] Resuming on existing pod {job.pod_id}")
+        job.status = "provisioning"
+        with cm:
+            save_state(state, state_path)
+        refresh_ssh_info(provider, job)
+        if not job.ssh_host or not wait_ssh(job.ssh_host, job.ssh_port, config.ssh_key_path):
+            raise ConductorError(f"pod {job.pod_id} is not reachable over SSH "
+                                 f"at {job.ssh_host}:{job.ssh_port}")
+    else:
+        provision_pod(provider, config, job, run_id=state.run_id,
+                      on_created=_persist_created, on_released=_released)
+        if job.status == "failed":
+            _propagate_failure(job, state)
+            send_notification(config.notifications, "job_failed",
+                              job=job.name, error=job.error)
+            return
 
     with cm:
         save_state(state, state_path)
-        append_cost_event(cost_log_path, {
-            "event": "pod_started", "job": job.name, "pod_id": job.pod_id,
-            "gpu_type": job.gpu_type, "cost_per_hour": job.gpu_cost_per_hour,
-        })
+    if not is_reuse and not adopt:
+        _register_pod(job, config, state.run_id)
+    else:
+        registry_update(job.pod_id, ssh_host=job.ssh_host, ssh_port=job.ssh_port, status="running")
 
-    # Register in global pod registry
-    try:
-        registry_add(PodRecord(
-            pod_id=job.pod_id,
-            name=job.name,
-            gpu_type=job.gpu_type or "",
-            gpu_cost_per_hour=job.gpu_cost_per_hour,
-            ssh_host=job.ssh_host,
-            ssh_port=job.ssh_port,
-            ssh_key_path=config.ssh_key_path,
-            image_name=config.image_name,
-            status="running",
-            created_at=job.started_at or time.time(),
-            source="declarative",
-            provider=config.provider,
-            remote_project_dir=config.remote_project_dir,
-            job_name=job.name,
-        ))
-    except Exception:
-        pass  # registry is best-effort
-
-    # Deploy
+    # Deploy (a resumed job re-runs setup: it may not have finished)
     job.status = "deploying"
     with cm:
         save_state(state, state_path)
@@ -488,7 +522,17 @@ def _pipeline(
                           job=job.name, error=job.error)
         return
 
-    # Launch
+    _launch_job(provider, job, config, state, state_path, cm)
+
+
+def _launch_job(
+    provider: CloudProvider,
+    job: PodState,
+    config: JobConfig,
+    state: RunState,
+    state_path: str,
+    cm,
+) -> bool:
     launched = launch(config, job)
     if launched is None:
         job.status = "failed"
@@ -498,7 +542,7 @@ def _pipeline(
         _propagate_failure(job, state)
         send_notification(config.notifications, "job_failed",
                           job=job.name, error=job.error)
-        return
+        return False
 
     job.pid = launched.pid
     job.pid_start = launched.pid_start
@@ -508,6 +552,155 @@ def _pipeline(
     job.last_sync_at = time.time()
     with cm:
         save_state(state, state_path)
+    return True
+
+
+def _register_pod(job: PodState, config: JobConfig, run_id: str) -> None:
+    try:
+        registry_add(PodRecord(
+            pod_id=job.pod_id,
+            name=pod_name_for(run_id, job.name),
+            gpu_type=job.gpu_type or "",
+            gpu_cost_per_hour=job.gpu_cost_per_hour,
+            ssh_host=job.ssh_host,
+            ssh_port=job.ssh_port,
+            ssh_key_path=config.ssh_key_path,
+            image_name=config.image_name,
+            status="running",
+            created_at=job.started_at or time.time(),
+            source="declarative",
+            provider=config.provider,
+            remote_project_dir=config.remote_project_dir,
+            job_name=job.name,
+            run_id=run_id or None,
+        ))
+    except Exception as e:
+        log.warning(f"[{job.name}] Could not update pod registry: {describe(e)}")
+
+
+def _resume_job(
+    provider: CloudProvider,
+    job: PodState,
+    config: JobConfig,
+    state: RunState,
+    state_path: str,
+    cost_log_path: str,
+) -> None:
+    """Continue a job that was persisted as provisioning/deploying by an
+    orchestrator that died. Re-checks the pod, re-deploys and launches."""
+    if job.pod_id:
+        exists = check_pod_exists(provider, job.pod_id)
+        if exists is None:
+            log.warning(f"[{job.name}] Cannot tell whether pod {job.pod_id} exists; "
+                        f"will retry next tick")
+            return
+        if exists is False:
+            log.warning(f"[{job.name}] Pod {job.pod_id} from a previous run is gone; "
+                        f"re-provisioning")
+            registry_update(job.pod_id, status="terminated")
+            job.pod_id = None
+            job.ssh_host = None
+            job.ssh_port = None
+            job.pid = None
+            job.pid_start = None
+    log.info(f"[{job.name}] Resuming job persisted as '{job.status}'")
+    _provision_deploy_launch(provider, job, config, state, state_path, cost_log_path, resume=True)
+
+
+def reconcile_run_pods(
+    config_map: dict[str, JobConfig],
+    provider_map: dict[str, CloudProvider],
+    state: RunState,
+    state_path: str,
+    cost_log_path: str,
+) -> None:
+    """List the account's pods and match them to this run by name
+    (conductor-<run_id>-<job>): adopt pods missing from state, terminate
+    pods that this run owns but has no job for, leave everything else."""
+    if not state.run_id:
+        return
+    prefix = f"conductor-{state.run_id}-"
+    seen_providers: dict[str, CloudProvider] = {}
+    for name, prov in provider_map.items():
+        seen_providers.setdefault(getattr(prov, "name", name), prov)
+
+    for prov_name, prov in seen_providers.items():
+        try:
+            instances = prov.list_instances()
+        except Exception as e:
+            log.warning(f"Could not list {prov_name} instances to reconcile run {state.run_id}: "
+                        f"{describe(e)}")
+            continue
+
+        for inst in instances:
+            inst_name = inst.get("name") or ""
+            if not inst.get("alive") or not inst_name.startswith(prefix):
+                continue
+            inst_id = str(inst["id"])
+            job_name = inst_name[len(prefix):]
+            job = get_job(state, job_name)
+            config = config_map.get(job_name)
+
+            if job is None or config is None or config.provider != prov_name:
+                _terminate_stray(prov, inst_id, inst_name, state, cost_log_path,
+                                 why="no job in state for it")
+                continue
+            if job.pod_id == inst_id:
+                continue
+            if job.pod_id is None:
+                if job.status in ("completed", "failed", "skipped"):
+                    _terminate_stray(prov, inst_id, inst_name, state, cost_log_path,
+                                     why=f"job {job_name} is already {job.status}")
+                    continue
+                log.warning(f"Adopting pod {inst_id} ({inst_name}) into job {job_name}: "
+                            f"it was created but never persisted")
+                job.pod_id = inst_id
+                job.started_at = job.started_at or time.time()
+                job.gpu_type = job.gpu_type or None
+                if job.status == "pending":
+                    job.status = "provisioning"
+                _register_pod(job, config, state.run_id)
+                continue
+            # The job tracks a different pod. Keep the tracked one unless it is
+            # confirmed gone; the extra one is never left running.
+            tracked_exists = check_pod_exists(prov, job.pod_id)
+            if tracked_exists is False:
+                log.warning(f"Job {job_name}: tracked pod {job.pod_id} is gone; adopting "
+                            f"{inst_id} ({inst_name}) in its place")
+                registry_update(job.pod_id, status="terminated")
+                job.pod_id = inst_id
+                job.ssh_host = None
+                job.ssh_port = None
+                job.pid = None
+                job.pid_start = None
+                if job.status == "running":
+                    job.status = "provisioning"
+                _register_pod(job, config, state.run_id)
+            else:
+                _terminate_stray(prov, inst_id, inst_name, state, cost_log_path,
+                                 why=f"job {job_name} already tracks pod {job.pod_id}")
+    save_state(state, state_path)
+
+
+def _terminate_stray(
+    provider: CloudProvider,
+    inst_id: str,
+    inst_name: str,
+    state: RunState,
+    cost_log_path: str,
+    why: str,
+) -> None:
+    msg = f"TERMINATING stray pod {inst_id} ({inst_name}) belonging to run {state.run_id}: {why}"
+    log.warning(msg)
+    print(msg, file=sys.stderr)
+    ok = teardown_pod(provider, inst_id)
+    registry_update(inst_id, status="terminated" if ok else "running")
+    append_cost_event(cost_log_path, {
+        "event": "pod_stopped", "job": inst_name, "pod_id": inst_id,
+        "reason": "stray_terminated" if ok else "stray_terminate_failed",
+    })
+    if not ok:
+        log.error(f"COULD NOT TERMINATE stray pod {inst_id} ({inst_name}); it may still be billing")
 
 
 def _spot_recover(

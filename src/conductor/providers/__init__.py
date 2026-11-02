@@ -38,6 +38,11 @@ class CloudProvider(Protocol):
 
     def terminate(self, instance_id: str) -> bool: ...
 
+    def list_instances(self) -> list[dict]:
+        """All of the account's instances as {"id": str, "name": str, "alive": bool}.
+        Raises ConductorError if the list could not be fetched."""
+        ...
+
     def get_gpu_catalog(self) -> list[GpuInfo]: ...
 
 

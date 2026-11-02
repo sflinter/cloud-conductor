@@ -211,3 +211,105 @@ state_file = "{state_path}"
     assert " 2 " in row
     assert "exit code 2" in row
     assert "Traceback" not in row
+
+
+def _write_run_fixture(tmp_dir, jobs_state):
+    from conductor.state import RunState, save_state
+    state_path = os.path.join(tmp_dir, "state.json")
+    config_path = os.path.join(tmp_dir, "jobs.toml")
+    key_path = os.path.join(tmp_dir, "key")
+    with open(key_path, "w") as f:
+        f.write("k")
+    os.chmod(key_path, 0o600)
+    with open(config_path, "w") as f:
+        f.write(f'''
+[global]
+ssh_key_path = "{key_path}"
+state_file = "{state_path}"
+cost_log_file = "{tmp_dir}/cost.jsonl"
+local_project_dir = "{tmp_dir}"
+
+[[jobs]]
+name = "train"
+run_command = "echo hi"
+
+[[jobs]]
+name = "eval"
+depends_on = ["train"]
+run_command = "echo eval"
+''')
+    save_state(RunState(jobs=jobs_state, run_id="abc123"), state_path)
+    return config_path, state_path
+
+
+def test_run_retry_failed_resets_jobs(tmp_dir, monkeypatch, capsys):
+    from unittest.mock import MagicMock
+    from conductor.state import PodState, load_state
+    config_path, state_path = _write_run_fixture(tmp_dir, [
+        PodState(name="train", status="failed", pod_id=None, error="exit code 1", exit_code=1),
+        PodState(name="eval", status="skipped", error="dependency 'train' failed"),
+    ])
+    monkeypatch.setattr("conductor.cli._configure_provider", lambda name: MagicMock())
+    captured = {}
+
+    def fake_lifecycle(configs, state, state_path, cost_log_path, budget_override=0.0):
+        captured["state"] = state
+        return state
+    monkeypatch.setattr("conductor.cli.run_lifecycle", fake_lifecycle)
+
+    main(["run", "--config", config_path, "--retry-failed"])
+    state = captured["state"]
+    assert state.run_id == "abc123"
+    assert [j.status for j in state.jobs] == ["pending", "pending"]
+    assert state.jobs[0].error is None and state.jobs[0].exit_code is None
+    assert "Re-running train" in capsys.readouterr().out
+
+
+def test_run_without_retry_leaves_finished_jobs(tmp_dir, monkeypatch):
+    from unittest.mock import MagicMock
+    from conductor.state import PodState
+    config_path, state_path = _write_run_fixture(tmp_dir, [
+        PodState(name="train", status="completed"),
+        PodState(name="eval", status="failed", error="boom"),
+    ])
+    monkeypatch.setattr("conductor.cli._configure_provider", lambda name: MagicMock())
+    captured = {}
+    monkeypatch.setattr("conductor.cli.run_lifecycle",
+                        lambda configs, state, *a, **k: captured.setdefault("state", state))
+    main(["run", "--config", config_path])
+    assert [j.status for j in captured["state"].jobs] == ["completed", "failed"]
+
+
+def test_run_retry_completed_keeps_alive_pod(tmp_dir, monkeypatch):
+    from unittest.mock import MagicMock
+    from conductor.state import PodState
+    config_path, state_path = _write_run_fixture(tmp_dir, [
+        PodState(name="train", status="completed", pod_id="kept", ssh_host="h", ssh_port=1, pid=3),
+        PodState(name="eval", status="completed"),
+    ])
+    monkeypatch.setattr("conductor.cli._configure_provider", lambda name: MagicMock())
+    captured = {}
+    monkeypatch.setattr("conductor.cli.run_lifecycle",
+                        lambda configs, state, *a, **k: captured.setdefault("state", state))
+    main(["run", "--config", config_path, "--retry-completed"])
+    train = captured["state"].jobs[0]
+    assert train.status == "pending"
+    assert train.pod_id == "kept"  # pipeline terminates or reuses it, never loses it
+    assert train.pid is None
+
+
+def test_run_assigns_run_id_to_old_state(tmp_dir, monkeypatch):
+    from unittest.mock import MagicMock
+    from conductor.state import PodState
+    config_path, state_path = _write_run_fixture(tmp_dir, [PodState(name="train"), PodState(name="eval")])
+    with open(state_path) as f:
+        data = json.load(f)
+    del data["run_id"]
+    with open(state_path, "w") as f:
+        json.dump(data, f)
+    monkeypatch.setattr("conductor.cli._configure_provider", lambda name: MagicMock())
+    captured = {}
+    monkeypatch.setattr("conductor.cli.run_lifecycle",
+                        lambda configs, state, *a, **k: captured.setdefault("state", state))
+    main(["run", "--config", config_path])
+    assert len(captured["state"].run_id) == 6

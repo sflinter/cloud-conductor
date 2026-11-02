@@ -7,6 +7,7 @@ from pathlib import Path
 
 import httpx
 
+from conductor.errors import guarded
 from conductor.gpu_pricing import GpuInfo
 
 log = logging.getLogger(__name__)
@@ -173,6 +174,18 @@ class VastaiProvider:
         except Exception as e:
             log.warning(f"Failed to terminate vast.ai instance {instance_id}: {e}")
             return False
+
+    def list_instances(self) -> list[dict]:
+        def _fetch():
+            resp = self._req("GET", "/instances", params={"owner": "me"})
+            resp.raise_for_status()
+            return resp.json().get("instances", [])
+        raw = guarded("vast.ai GET /instances", _fetch)
+        return [{
+            "id": str(inst.get("id", "")),
+            "name": inst.get("label") or "",
+            "alive": inst.get("actual_status") not in ("exited", "error"),
+        } for inst in raw if inst.get("id") is not None]
 
     def get_gpu_catalog(self) -> list[GpuInfo]:
         body = {

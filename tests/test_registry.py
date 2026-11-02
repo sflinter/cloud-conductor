@@ -152,3 +152,29 @@ def test_reconcile_ignores_unknown_existence(tmp_dir, monkeypatch):
     assert pods["a"].status == "running"      # None: left alone
     assert pods["b"].status == "terminated"
     assert pods["c"].status == "running"
+
+
+def test_concurrent_registry_updates_are_not_lost(tmp_dir, monkeypatch):
+    import threading
+    reg_file = os.path.join(tmp_dir, "pods.json")
+    monkeypatch.setattr("conductor.registry.REGISTRY_DIR", tmp_dir)
+    monkeypatch.setattr("conductor.registry.REGISTRY_FILE", reg_file)
+
+    def adder(i):
+        for k in range(10):
+            add_pod(PodRecord(pod_id=f"pod-{i}-{k}", name=f"p{i}{k}"))
+
+    threads = [threading.Thread(target=adder, args=(i,)) for i in range(5)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(load_registry()) == 50  # last-writer-wins would lose entries
+
+
+def test_pod_record_run_id_round_trip(tmp_dir, monkeypatch):
+    reg_file = os.path.join(tmp_dir, "pods.json")
+    monkeypatch.setattr("conductor.registry.REGISTRY_DIR", tmp_dir)
+    monkeypatch.setattr("conductor.registry.REGISTRY_FILE", reg_file)
+    add_pod(PodRecord(pod_id="x", name="conductor-abc123-train", run_id="abc123", job_name="train"))
+    assert get_pod("x").run_id == "abc123"

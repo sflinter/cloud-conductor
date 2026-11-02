@@ -3,13 +3,14 @@ from __future__ import annotations
 
 import logging
 import time
+from typing import Callable
 
 from conductor.errors import ConductorError
 from conductor.gpu_pricing import select_cheapest_gpus
 from conductor.providers import CloudProvider
 from conductor.registry import PodRecord
 from conductor.ssh import wait_ssh
-from conductor.state import PodState
+from conductor.state import PodState, pod_name_for
 
 log = logging.getLogger(__name__)
 
@@ -21,9 +22,19 @@ def provision_pod_direct(
     ssh_key_path: str,
     name: str = "",
     disk_gb: int = 40,
+    pod_name: str = "",
+    on_created: Callable[[str, str, float], None] | None = None,
+    on_released: Callable[[str, bool], None] | None = None,
     **provider_kwargs,
 ) -> PodRecord | None:
-    pod_name = f"conductor-{name}" if name else "conductor-pod"
+    """Create an instance and wait for SSH.
+
+    on_created(instance_id, gpu_type_id, cost_per_hour) is called the moment
+    the provider returns an ID, before any SSH wait, so the caller can persist
+    it: a pod must never exist that is recorded nowhere. If SSH never comes
+    up the instance is terminated and on_released(instance_id, terminated)
+    reports whether that termination succeeded."""
+    pod_name = pod_name or (f"conductor-{name}" if name else "conductor-pod")
     log.info(f"[{pod_name}] Attempting to provision with {gpu_type_id} on {provider.name}")
 
     result = provider.create_instance(
@@ -36,13 +47,16 @@ def provision_pod_direct(
     if not result:
         return None
 
-    instance_id = result["id"]
+    instance_id = str(result["id"])
     cost = result["cost_per_hour"]
+    log.info(f"[{pod_name}] Created instance {instance_id} ({gpu_type_id}, ${cost:.3f}/hr)")
+    if on_created:
+        on_created(instance_id, gpu_type_id, cost)
 
     ssh_info = provider.wait_for_ssh(instance_id)
     if not ssh_info:
         log.warning(f"[{pod_name}] Could not get SSH info for instance {instance_id}")
-        provider.terminate(instance_id)
+        _release(provider, instance_id, pod_name, on_released)
         return None
 
     ssh_host, ssh_port = ssh_info
@@ -50,7 +64,7 @@ def provision_pod_direct(
 
     if not wait_ssh(ssh_host, ssh_port, ssh_key_path):
         log.warning(f"[{pod_name}] SSH timeout for instance {instance_id}")
-        provider.terminate(instance_id)
+        _release(provider, instance_id, pod_name, on_released)
         return None
 
     log.info(f"[{pod_name}] Instance {instance_id} ready with {gpu_type_id}")
@@ -69,7 +83,29 @@ def provision_pod_direct(
     )
 
 
-def provision_pod(provider: CloudProvider, config, pod_state: PodState) -> PodState:
+def _release(provider: CloudProvider, instance_id: str, pod_name: str,
+             on_released: Callable[[str, bool], None] | None = None) -> bool:
+    ok = teardown_pod(provider, instance_id)
+    if not ok:
+        log.error(f"[{pod_name}] COULD NOT TERMINATE instance {instance_id}; "
+                  f"it may still be billing. Check 'conductor pod list' / the provider console.")
+    if on_released:
+        on_released(instance_id, ok)
+    return ok
+
+
+def provision_pod(
+    provider: CloudProvider,
+    config,
+    pod_state: PodState,
+    run_id: str = "",
+    on_created: Callable[[PodState], None] | None = None,
+    on_released: Callable[[str, bool], None] | None = None,
+) -> PodState:
+    """Provision a pod for a declarative job. on_created(pod_state) is called
+    as soon as the pod ID is known so the caller can persist it;
+    on_released(pod_id, terminated) when a pod that never became reachable
+    has been (or could not be) terminated."""
     from conductor.config import JobConfig
     cfg: JobConfig = config
 
@@ -93,6 +129,16 @@ def provision_pod(provider: CloudProvider, config, pod_state: PodState) -> PodSt
         pod_state.error = "No GPU candidates available"
         return pod_state
 
+    def _created(instance_id: str, gpu_id: str, cost: float) -> None:
+        pod_state.pod_id = instance_id
+        pod_state.gpu_type = gpu_id
+        pod_state.started_at = time.time()
+        pod_state.ssh_host = None
+        pod_state.ssh_port = None
+        pod_state.gpu_cost_per_hour = cfg.cost_per_hour_override if cfg.cost_per_hour_override > 0 else cost
+        if on_created:
+            on_created(pod_state)
+
     pod_state.status = "provisioning"
     for gpu_id in gpu_candidates:
         pod_state.provision_attempts += 1
@@ -103,6 +149,9 @@ def provision_pod(provider: CloudProvider, config, pod_state: PodState) -> PodSt
             ssh_key_path=cfg.ssh_key_path,
             name=cfg.name,
             disk_gb=cfg.container_disk_in_gb,
+            pod_name=pod_name_for(run_id, cfg.name),
+            on_created=_created,
+            on_released=on_released,
             cloud_type=cfg.cloud_type,
             volume_in_gb=cfg.volume_in_gb,
             volume_mount_path=cfg.volume_mount_path,
@@ -116,12 +165,18 @@ def provision_pod(provider: CloudProvider, config, pod_state: PodState) -> PodSt
             pod_state.gpu_type = record.gpu_type
             pod_state.ssh_host = record.ssh_host
             pod_state.ssh_port = record.ssh_port
-            pod_state.started_at = record.created_at
+            pod_state.started_at = pod_state.started_at or record.created_at
             if cfg.cost_per_hour_override > 0:
                 pod_state.gpu_cost_per_hour = cfg.cost_per_hour_override
             else:
                 pod_state.gpu_cost_per_hour = record.gpu_cost_per_hour
             return pod_state
+        if pod_state.pod_id:
+            # Created but never reachable: provision_pod_direct released it
+            # and on_released has recorded the outcome; forget it here
+            pod_state.pod_id = None
+            pod_state.ssh_host = None
+            pod_state.ssh_port = None
 
     pod_state.status = "failed"
     pod_state.error = "All GPU types exhausted"

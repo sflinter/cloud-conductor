@@ -116,6 +116,14 @@ class RunPodProvider:
             log.warning(f"Failed to terminate pod {instance_id}: {e}")
             return False
 
+    def list_instances(self) -> list[dict]:
+        raw = guarded("runpod.get_pods", runpod.get_pods) or []
+        return [{
+            "id": str(pod.get("id", "")),
+            "name": pod.get("name") or "",
+            "alive": pod.get("desiredStatus") not in ("EXITED", "TERMINATED"),
+        } for pod in raw if pod.get("id")]
+
     def get_gpu_catalog(self) -> list[GpuInfo]:
         raw = guarded("runpod.get_gpus", runpod.get_gpus)
         results = []

@@ -69,7 +69,7 @@ conductor sync                     # force immediate result sync
 ## CLI Reference
 
 ```
-conductor run [--config jobs.toml] [--jobs name1,name2] [--budget 40.00]
+conductor run [--config jobs.toml] [--jobs name1,name2] [--budget 40.00] [--retry-failed] [--retry-completed]
 conductor status [--config jobs.toml]
 conductor sync [--config jobs.toml] [--jobs name1,name2]
 conductor teardown [--config jobs.toml] [--jobs name1,name2] [--force]
@@ -122,6 +122,16 @@ on_spot_recovery = true
 ```
 
 See [SPEC.md](SPEC.md) for the complete configuration reference.
+
+## Resuming a run
+
+Every `conductor run` gets a short run ID (printed at start, stored in `.conductor_state.json`) and names its pods `conductor-<run_id>-<job>`. Pod IDs are written to the state file and to `~/.conductor/pods.json` the moment the provider returns them, so a crash can never leave a pod recorded nowhere.
+
+Running `conductor run` again with an existing state file:
+
+- lists the provider's pods, adopts any `conductor-<run_id>-*` pod missing from state, and terminates (loudly) any such pod that no job tracks
+- resumes jobs persisted as `provisioning`/`deploying` on their existing pod (re-deploy, launch) and relaunches a `running` job that has no recorded pid
+- skips `completed`/`failed`/`skipped` jobs unless you pass `--retry-failed` (also un-skips their dependents) or `--retry-completed`
 
 ## Lifecycle
 

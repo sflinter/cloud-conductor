@@ -43,7 +43,7 @@ The `<pod>` argument accepts a pod name or pod ID prefix (like `docker ps`). Pod
 ### Declarative commands (TOML config)
 
 ```
-conductor run [-f jobs.toml] [--jobs name1,name2] [--budget 40.00]
+conductor run [-f jobs.toml] [--jobs name1,name2] [--budget 40.00] [--retry-failed] [--retry-completed]
 conductor status [--config jobs.toml]
 conductor sync [--config jobs.toml] [--jobs name1,name2]
 conductor teardown [--config jobs.toml] [--jobs name1,name2]
@@ -81,7 +81,9 @@ Kills the tracked process on a pod but keeps the pod running. Useful for stoppin
 Full lifecycle: provision → deploy → launch → monitor → sync → teardown.
 
 - Runs `validate` checks before provisioning (fail fast on bad config)
-- Provisions pods in parallel (one per job), respecting `depends_on` ordering
+- Assigns a short `run_id` to a new run; pods are named `conductor-<run_id>-<job>`
+- With an existing state file, reconciles the provider's pods against the run before doing anything (see Resume Behavior)
+- Provisions pods in parallel (one per job), respecting `depends_on` ordering; each pod ID is persisted to the state file and the registry the moment it is created
 - Deploys code via rsync or Docker image
 - Launches the job command via `setsid nohup` with an exit file for the exit code
 - Monitors pods in a loop, syncing results at a configurable interval
@@ -341,9 +343,12 @@ PYTHONUNBUFFERED=1 .venv/bin/python scripts/eval_with_search.py \
     }
   ],
   "total_cost_usd": 0.27,
-  "budget_usd": 40.00
+  "budget_usd": 40.00,
+  "run_id": "a1b2c3"
 }
 ```
+
+`run_id` names this run's pods (`conductor-<run_id>-<job>`) so they can be matched to the run from the provider's pod list. The state file and the registry are protected by a cross-process lock (`flock` on a hidden `.lock` sibling) for every read-modify-write.
 
 The state file is updated after every significant event (provision, deploy, sync, status check, teardown). It is the source of truth for `conductor status`.
 
@@ -402,7 +407,7 @@ cloud-conductor/
 - Manual: tries the primary `gpu_type_id`, then falls through `gpu_type_ids_fallback`
 - Auto: delegates to `gpu_pricing.py` to find the cheapest available GPU meeting minimum VRAM requirements
 
-Waits for SSH to become available (polls RunPod API for port mapping, then tests SSH connectivity). Returns `PodInfo` with host/port/pod_id/gpu_type/cost_per_hour. Supports pod reuse: if `keep_pod_alive` is set and a pod from a previous run still exists, skips provisioning and reuses it.
+Calls `on_created(instance_id, gpu, cost)` the instant the provider returns an ID so the caller can persist it, then waits for SSH to become available (polls the provider API for port mapping, then tests SSH connectivity). A pod that never becomes reachable is terminated and reported through `on_released(instance_id, terminated)`. Returns a `PodRecord` with host/port/pod_id/gpu_type/cost_per_hour. Supports pod reuse: if `keep_pod_alive` is set and a pod from a previous run still exists, skips provisioning, refreshes its SSH info and reuses it.
 
 **`deployer.py`** — `deploy_direct()` takes explicit SSH/path parameters (used by `conductor pod deploy`). `deploy()` wraps it for declarative mode. Two deploy methods:
 - `rsync`: Installs rsync on the pod (if needed), rsyncs `local_project_dir` to `remote_project_dir` with configured excludes, then runs `setup_command` via SSH.
@@ -535,10 +540,15 @@ Safety: if `get_utilization()` returns `None` (SSH failure, nvidia-smi missing),
 
 When `conductor run` is invoked and a state file exists:
 
-- Jobs with status `completed` or `failed` are skipped
-- Jobs with status `running` are validated: check if pod still exists and process is alive. If yes, resume monitoring. If no, treat as interrupted and attempt recovery.
-- Jobs with status `pending` are started from scratch
-- Jobs with status `skipped` (dependency failed) are skipped
+1. **Reconcile by run ID.** The provider's pod list is fetched (`list_instances()`). Every live pod named `conductor-<run_id>-<job>`:
+   - that the job already tracks: nothing to do
+   - that the job has no pod for: adopted into state (it was created but the orchestrator died before persisting it)
+   - that belongs to no job in state, or to a job that is already finished: **terminated**, logged loudly
+   - that duplicates a job's tracked pod: the extra is terminated unless the tracked pod is confirmed gone, in which case the extra is adopted
+2. Jobs with status `completed`, `failed` or `skipped` are skipped, unless `--retry-failed` / `--retry-completed` is passed, which returns them (and, for `--retry-failed`, their skipped dependents) to `pending`
+3. Jobs with status `provisioning` or `deploying` are resumed: the pod is re-checked; if it exists, SSH info is refreshed, code is re-deployed (setup re-run) and the job launched; if it is gone, a fresh pod is provisioned
+4. Jobs with status `running` are monitored as usual; one with no recorded pid is launched (the launcher reports an already-running job rather than starting a second copy)
+5. Jobs with status `pending` are started from scratch
 
 This means you can safely kill and restart the conductor without losing track of pods.
 
