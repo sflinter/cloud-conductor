@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.6.2
+
+Fixes from the second live RunPod trial of 0.6.1 and a benchmark run.
+
+- A job that exits non-zero before creating its `sync_paths` source no longer ends as `sync_failed` with the pod kept alive and billing. The syncer treats rsync exit 23 with `change_dir`/`link_stat "<source>" failed: No such file or directory` as "nothing to sync" (INFO). A transfer failure of an existing source still fails the sync unless the entry is marked `optional = true` (new per-entry `sync_paths` flag). A job whose outcome is `failed` is torn down even when its final sync fails: the sync failure is recorded on the first line of `job.error`, a `sync_failed` notification is sent and the pod is released; `keep_pod_on_failure = true` (new config, default false) keeps it instead. A successful job with a failed final sync is still kept as `sync_failed`
+- `conductor teardown --jobs X` tore down every pod in the state file, not just the selected jobs'. The confirmation list and the loop now respect the selection
+- A provider's "not found" answer to a terminate (RunPod `QueryError: pod not found to terminate`, Vast.ai 404 / "not found") means the pod is already gone: it is no longer retried three times (~33 s), counts as a verified teardown, and `--retry-failed` no longer waits 35 s on a released pod. `PodState.finished_at` records when a pod stopped billing for its job; cost never accrues past it and the status tables' `Elapsed` stops there. At most one `pod_stopped` cost event is written per pod ID (checked against the cost log, so older state files are covered), `conductor teardown` neither bills nor re-records a pod that was already released, and a finished job keeps its status and error (an unverified teardown is only appended)
+- stdout is line-buffered from CLI start, so the run banner, "Re-running" lines, status tables and teardown progress reach a redirected stdout as they happen instead of in one block at exit
+- The runpod SDK's `raw_response: {...}` print on `create_pod` (which includes the account's public keys) is suppressed; the redirect is reference-counted across the parallel provisioning threads and the text goes to the log at DEBUG
+- Relative `state_file`, `cost_log_file`, `local_project_dir`, `ssh_key_path` and the `local` side of `sync_paths`/`upload_paths` are resolved against the directory containing the config file, not the current working directory (state files landed wherever the CLI was run from). Absolute paths and `~` are unchanged; the default state files now live next to the config
+- `stall_timeout_minutes` defaults to 0 (off), as the README said; the code and SPEC said 30, which would have failed every CPU-only job after 30 minutes of 0% GPU. When enabled, the timer start is logged with the deadline and how to disable it
+- `conductor dry-run` prints the price estimate it promised: RunPod's catalog list carries no prices, so `get_gpu_price` falls back to a cached per-GPU lookup (`runpod.get_gpu`), and the dry run shows the primary GPU's price, the fallback price range, `cost_per_hour_override`, or says the price is unavailable
+- New config fields: `keep_pod_on_failure` (default false), `optional` on `sync_paths` entries (default false). Changed default: `stall_timeout_minutes` 30 → 0
+
 ## 0.6.1
 
 Fixes from the first live RunPod trial of 0.6.0.

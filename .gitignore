@@ -6,3 +6,5 @@ dist/
 .conductor_*state*.json
 .conductor_*cost_log*.jsonl
 models/
+conductor.log
+conductor.log.*
