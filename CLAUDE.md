@@ -31,7 +31,7 @@ Python 3.12+. Uses `uv` for package management (never pip/conda).
 
 Key modules:
 - `cli.py` — argparse entry point with `pod` subcommand group (imperative) and traditional subcommands (declarative); `configure_logging()` owns the root logger (`force=True`, after importing the runpod SDK which calls `basicConfig` itself) and `run`/`teardown`/`sync` add a rotating `conductor.log` next to the state file
-- `config.py` — TOML loading, merges `[global]` defaults with per-`[[jobs]]` overrides into `JobConfig` dataclasses
+- `config.py` — TOML loading, merges `[global]` defaults with per-`[[jobs]]` overrides into `JobConfig` dataclasses; relative local paths (`state_file`, `cost_log_file`, `local_project_dir`, `ssh_key_path`, sync/upload `local`) are resolved against the config file's directory
 - `providers/__init__.py` — `CloudProvider` protocol + `get_provider()` registry + `get_configured_provider()` (with API key setup)
 - `providers/runpod.py` — `RunPodProvider`: wraps `runpod` SDK for pod CRUD, SSH discovery, GPU catalog
 - `providers/vastai.py` — `VastaiProvider`: REST calls via `httpx` to `console.vast.ai/api/v0/` for instance CRUD
@@ -52,7 +52,7 @@ Key modules:
 
 **State files** (created at runtime, not committed):
 - `~/.conductor/pods.json` — global pod registry (imperative + declarative pods)
-- `.conductor_state.json` — per-project batch run state (source of truth for declarative `conductor status`); carries `run_id`, `orchestrator_pid`, `heartbeat_at`
+- `.conductor_state.json` — per-project batch run state (source of truth for declarative `conductor status`), next to the config file by default; carries `run_id`, `orchestrator_pid`, `heartbeat_at`
 - `.conductor_cost_log.jsonl` — append-only cost events for `conductor report`
 - `conductor.log` — rotating log (5 MB x 3) next to the state file, written by `run`/`teardown`/`sync`
 - `.<name>.lock` siblings of the state file and registry — `flock` lock files, safe to leave in place

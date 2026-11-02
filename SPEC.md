@@ -238,6 +238,9 @@ teardown_on_crash = false             # true = if the orchestrator process dies,
 # State / cost persistence
 state_file = ".conductor_state.json"
 cost_log_file = ".conductor_cost_log.jsonl"  # append-only cost log for `conductor report`
+# Relative paths (state_file, cost_log_file, local_project_dir, ssh_key_path and the `local`
+# side of sync_paths/upload_paths) are resolved against the directory containing this file,
+# not the current working directory. Absolute paths and `~` are used as given.
 
 # Notifications (optional — omit entire section to disable)
 [global.notifications]

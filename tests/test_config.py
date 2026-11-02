@@ -90,7 +90,7 @@ sync_paths = [
     configs = load_config(path)
     assert len(configs[0].sync_paths) == 1
     assert configs[0].sync_paths[0].remote == "output/"
-    assert configs[0].sync_paths[0].local == "./results/"
+    assert configs[0].sync_paths[0].local == os.path.join(tmp_dir, "results") + "/"
     # Per-job override replaces global
     assert len(configs[1].sync_paths) == 1
     assert configs[1].sync_paths[0].remote == "custom/"
@@ -253,3 +253,61 @@ keep_pod_on_failure = true
     assert [sp.optional for sp in configs[0].sync_paths] == [False, True]
     assert configs[0].keep_pod_on_failure is False
     assert configs[1].keep_pod_on_failure is True
+
+
+def test_relative_paths_resolve_against_config_dir(tmp_dir, monkeypatch):
+    from conductor.config import resolve_path
+    project = os.path.join(os.path.realpath(tmp_dir), "project")   # macOS: /var -> /private/var
+    os.makedirs(os.path.join(project, "sub"))
+    path = os.path.join(project, "jobs.toml")
+    with open(path, "w") as f:
+        f.write('''
+[global]
+state_file = "state/run.json"
+cost_log_file = "/var/tmp/cost.jsonl"
+local_project_dir = "."
+ssh_key_path = "keys/id_ed25519"
+sync_paths = [{ remote = "output/", local = "./results/" }]
+upload_paths = [{ remote = "data/", local = "data" }]
+
+[[jobs]]
+name = "a"
+run_command = "echo hi"
+
+[[jobs]]
+name = "b"
+run_command = "echo hi"
+state_file = "sub/other.json"
+sync_paths = [{ remote = "out/", local = "/abs/results/" }]
+''')
+    # Running from somewhere else must not change where the files land
+    elsewhere = os.path.join(tmp_dir, "elsewhere")
+    os.makedirs(elsewhere)
+    monkeypatch.chdir(elsewhere)
+    configs = load_config("../project/jobs.toml")
+    a, b = configs
+    assert a.state_file == os.path.join(project, "state", "run.json")
+    assert a.cost_log_file == "/var/tmp/cost.jsonl"
+    assert a.local_project_dir == project
+    assert a.ssh_key_path == os.path.join(project, "keys", "id_ed25519")
+    assert a.sync_paths[0].local == os.path.join(project, "results") + "/"
+    assert a.upload_paths[0].local == os.path.join(project, "data")
+    assert b.state_file == os.path.join(project, "sub", "other.json")
+    assert b.sync_paths[0].local == "/abs/results/"
+    assert resolve_path("/base", "~/x") == os.path.expanduser("~/x")
+    assert resolve_path("/base", "") == ""
+
+
+def test_default_state_files_live_next_to_config(tmp_dir, monkeypatch):
+    path = os.path.join(tmp_dir, "jobs.toml")
+    with open(path, "w") as f:
+        f.write('''
+[[jobs]]
+name = "a"
+run_command = "echo hi"
+''')
+    monkeypatch.chdir("/")
+    cfg = load_config(path)[0]
+    assert cfg.state_file == os.path.join(tmp_dir, ".conductor_state.json")
+    assert cfg.cost_log_file == os.path.join(tmp_dir, ".conductor_cost_log.jsonl")
+    assert cfg.local_project_dir == tmp_dir

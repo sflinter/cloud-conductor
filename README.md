@@ -85,7 +85,7 @@ conductor report [--config jobs.toml]
 
 ## Configuration
 
-The TOML config has a `[global]` section for defaults and `[[jobs]]` entries for each job. Any global field can be overridden per-job.
+The TOML config has a `[global]` section for defaults and `[[jobs]]` entries for each job. Any global field can be overridden per-job. Relative local paths (`state_file`, `cost_log_file`, `local_project_dir`, `ssh_key_path`, the `local` side of `sync_paths`/`upload_paths`) are resolved against the directory containing the config file, so running `conductor` from another directory keeps the state files and results with the project. Absolute paths and `~` are used as given.
 
 ### Key settings
 

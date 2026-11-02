@@ -119,6 +119,31 @@ def _parse_sync_paths(raw: list[dict]) -> list[SyncPath]:
             for sp in raw]
 
 
+# Local paths in the config that are resolved against the config file's directory
+_LOCAL_PATH_FIELDS = ("state_file", "cost_log_file", "local_project_dir", "ssh_key_path")
+
+
+def resolve_path(base_dir: str, path: str) -> str:
+    """A relative path in the config means relative to the config file,
+    not to wherever the CLI happens to be run from. Absolute paths (and
+    `~`, expanded first) are returned as they are."""
+    path = os.path.expanduser(path)
+    if not path or os.path.isabs(path):
+        return path
+    resolved = os.path.normpath(os.path.join(base_dir, path))
+    return resolved + "/" if path.endswith("/") else resolved
+
+
+def _resolve_local_paths(merged: dict, base_dir: str) -> None:
+    for key in _LOCAL_PATH_FIELDS:
+        if key in merged:
+            merged[key] = resolve_path(base_dir, merged[key])
+    for key in ("sync_paths", "upload_paths"):
+        if key in merged:
+            merged[key] = [SyncPath(remote=sp.remote, local=resolve_path(base_dir, sp.local),
+                                    optional=sp.optional) for sp in merged[key]]
+
+
 def _parse_notifications(raw: dict) -> NotificationConfig:
     return NotificationConfig(**{k: v for k, v in raw.items() if k in NotificationConfig.__dataclass_fields__})
 
@@ -126,6 +151,7 @@ def _parse_notifications(raw: dict) -> NotificationConfig:
 def load_config(path: str, job_names: list[str] | None = None) -> list[JobConfig]:
     with open(path, "rb") as f:
         data = tomllib.load(f)
+    base_dir = os.path.dirname(os.path.abspath(path))
 
     global_cfg = dict(data.get("global", {}))
     jobs_raw = data.get("jobs", [])
@@ -172,6 +198,12 @@ def load_config(path: str, job_names: list[str] | None = None) -> list[JobConfig
         # Expand ssh_key_path
         if "ssh_key_path" in merged:
             merged["ssh_key_path"] = os.path.expanduser(merged["ssh_key_path"])
+
+        # Default state files live next to the config, not in the cwd
+        merged.setdefault("state_file", JobConfig.state_file)
+        merged.setdefault("cost_log_file", JobConfig.cost_log_file)
+        merged.setdefault("local_project_dir", JobConfig.local_project_dir)
+        _resolve_local_paths(merged, base_dir)
 
         configs.append(JobConfig(**merged))
 
