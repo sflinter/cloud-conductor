@@ -17,6 +17,7 @@ from conductor.notify import send_notification
 from conductor.providers import CloudProvider, get_provider
 from conductor.provisioner import check_pod_exists, provision_pod, refresh_ssh_info, teardown_pod
 from conductor.registry import PodRecord, add_pod as registry_add, update_pod as registry_update
+from conductor.retry import retry
 from conductor.runner import LOG_TAIL_LINES, fetch_log_tail, get_log_path, get_utilization, is_alive, launch
 from conductor.ssh import wait_ssh
 from conductor.state import (
@@ -177,7 +178,7 @@ def _handle_crash(
 def live_pods(state: RunState) -> list[PodState]:
     """Jobs whose pod may still exist on the provider."""
     return [j for j in state.jobs
-            if j.pod_id and j.status in ("provisioning", "deploying", "running")]
+            if j.pod_id and j.status in ("provisioning", "deploying", "running", "sync_failed")]
 
 
 def print_live_pods(jobs: list[PodState], header: str = "Live pods:") -> None:
@@ -259,7 +260,8 @@ def _tick_job(
     # Check per-job budget
     if config.job_budget_usd > 0 and job.cost_usd >= config.job_budget_usd:
         log.warning(f"[{job.name}] Per-job budget exceeded (${job.cost_usd:.2f} >= ${config.job_budget_usd:.2f})")
-        _finish_job(prov, job, config, state, cost_log_path, "failed", error="job budget exceeded")
+        _finish_job(prov, job, config, state, cost_log_path, "failed", error="job budget exceeded",
+                    force_teardown=True)
         send_notification(config.notifications, "job_budget_exceeded",
                           job=job.name, cost_usd=job.cost_usd)
         return
@@ -533,7 +535,8 @@ def _pipeline(
         with cm:
             save_state(state, state_path)
         refresh_ssh_info(provider, job)
-        if not job.ssh_host or not wait_ssh(job.ssh_host, job.ssh_port, config.ssh_key_path):
+        if not job.ssh_host or not wait_ssh(job.ssh_host, job.ssh_port, config.ssh_key_path,
+                                            timeout=config.provision_timeout_seconds):
             raise ConductorError(f"pod {job.pod_id} is not reachable over SSH "
                                  f"at {job.ssh_host}:{job.ssh_port}")
     else:
@@ -793,6 +796,9 @@ def _spot_recover(
         sync_push(config, job)
 
 
+FINAL_SYNC_ATTEMPTS = 3
+
+
 def _finish_job(
     provider: CloudProvider,
     job: PodState,
@@ -801,14 +807,38 @@ def _finish_job(
     cost_log_path: str,
     status: str,
     error: str | None = None,
+    force_teardown: bool = False,
 ) -> None:
-    # Final sync
-    sync_pull(config, job)
+    """Final sync, then release the pod and record the outcome.
+
+    The final sync is retried; if it still fails the pod is kept alive and
+    the job marked sync_failed so no results are lost, unless
+    force_teardown is set (budget stop, crash teardown)."""
+    synced = _final_sync(config, job)
+    if not synced and not force_teardown and job.pod_id:
+        job.status = "sync_failed"
+        intended = f"{status}: {error}" if error else status
+        job.error = (f"final sync failed after {FINAL_SYNC_ATTEMPTS} attempts; pod kept alive "
+                     f"(intended outcome: {intended}). Run 'conductor sync --jobs {job.name}' "
+                     f"then 'conductor teardown --jobs {job.name}'")
+        log.error(f"[{job.name}] {job.error}")
+        registry_update(job.pod_id, status="running", cost_usd=job.cost_usd)
+        send_notification(config.notifications, "sync_failed", job=job.name,
+                          error=f"final sync failed; pod {job.pod_id} kept alive",
+                          cost_usd=job.cost_usd)
+        if status == "failed":
+            _propagate_failure(job, state)
+        return
 
     # Teardown (unless keep_pod_alive)
     pod_kept_alive = status == "completed" and config.keep_pod_alive
+    torn_down = False
     if job.pod_id and not pod_kept_alive:
-        teardown_pod(provider, job.pod_id)
+        torn_down = teardown_pod(provider, job.pod_id)
+        if not torn_down:
+            msg = f"pod {job.pod_id} teardown unverified; it may still be running"
+            log.error(f"[{job.name}] {msg}")
+            error = f"{error}; {msg}" if error else msg
 
     elapsed_hours = 0.0
     if job.started_at:
@@ -822,16 +852,37 @@ def _finish_job(
     job.status = status
     job.error = error
 
-    # Update global registry
+    # Update global registry: only a verified teardown is recorded as such
     if job.pod_id:
         try:
-            reg_status = "running" if pod_kept_alive else "terminated"
+            reg_status = "terminated" if torn_down else "running"
             registry_update(job.pod_id, status=reg_status, cost_usd=job.cost_usd)
         except Exception:
             pass
 
     if status == "failed":
         _propagate_failure(job, state)
+
+
+def _final_sync(config: JobConfig, job: PodState) -> bool:
+    if not config.sync_paths:
+        return True
+    if not job.ssh_host:
+        log.warning(f"[{job.name}] No SSH info; skipping final sync")
+        return False
+
+    def _pull():
+        if not sync_pull(config, job):
+            raise ConductorError(f"[{job.name}] final sync incomplete")
+        return True
+
+    try:
+        retry(_pull, attempts=FINAL_SYNC_ATTEMPTS, base=5.0, max_delay=30.0,
+              what=f"[{job.name}] final sync")
+        return True
+    except ConductorError as e:
+        log.error(str(e))
+        return False
 
 
 def _update_cost(job: PodState, state: RunState, config: JobConfig, cost_log_path: str) -> None:
@@ -878,8 +929,11 @@ def _propagate_failure(job: PodState, state: RunState) -> None:
             _propagate_failure(j, state)
 
 
+TERMINAL_STATUSES = ("completed", "failed", "skipped", "sync_failed")
+
+
 def _all_done(state: RunState) -> bool:
-    return all(j.status in ("completed", "failed", "skipped") for j in state.jobs)
+    return all(j.status in TERMINAL_STATUSES for j in state.jobs)
 
 
 def _teardown_all(
@@ -892,12 +946,13 @@ def _teardown_all(
     reason: str = "shutdown",
 ) -> None:
     for job in state.jobs:
-        if job.status not in ("running", "deploying", "provisioning"):
+        if job.status not in ("running", "deploying", "provisioning", "sync_failed"):
             continue
         config = config_map.get(job.name)
         if config:
             prov = provider_map.get(job.name)
-            _finish_job(prov, job, config, state, cost_log_path, "failed", error=reason)
+            _finish_job(prov, job, config, state, cost_log_path, "failed", error=reason,
+                        force_teardown=True)
     save_state(state, state_path)
 
 

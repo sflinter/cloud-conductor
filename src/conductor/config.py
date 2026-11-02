@@ -43,6 +43,7 @@ class JobConfig:
     volume_in_gb: int = 0
     volume_mount_path: str = "/workspace"
     ssh_key_path: str = "~/.ssh/id_rsa"
+    provision_timeout_seconds: int = 900  # max wait for a new pod's SSH to come up
 
     # Deployment
     deploy_method: str = "rsync"

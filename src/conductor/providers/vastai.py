@@ -9,6 +9,7 @@ import httpx
 
 from conductor.errors import guarded
 from conductor.gpu_pricing import GpuInfo
+from conductor.retry import retry
 
 log = logging.getLogger(__name__)
 
@@ -135,12 +136,19 @@ class VastaiProvider:
             time.sleep(5)
         return None
 
+    def _list_raw(self) -> list[dict]:
+        """GET /instances with retries on transport errors, 429 and 5xx.
+        Raises ConductorError if it keeps failing."""
+        def _fetch():
+            resp = self._req("GET", "/instances", params={"owner": "me"})
+            resp.raise_for_status()
+            return resp.json().get("instances", [])
+        return retry(guarded, "vast.ai GET /instances", _fetch, what="vast.ai GET /instances")
+
     def _find_instance(self, instance_id: str) -> dict | None:
         """The raw instance record, or None if the API does not list it.
         Raises on any transport/JSON error."""
-        resp = self._req("GET", "/instances", params={"owner": "me"})
-        resp.raise_for_status()
-        for inst in resp.json().get("instances", []):
+        for inst in self._list_raw():
             if str(inst.get("id")) == str(instance_id):
                 return inst
         return None
@@ -167,20 +175,18 @@ class VastaiProvider:
         return inst.get("actual_status") not in ("exited", "error")
 
     def terminate(self, instance_id: str) -> bool:
-        try:
+        def _delete():
             resp = self._req("DELETE", f"/instances/{instance_id}/", json={})
             resp.raise_for_status()
+        try:
+            retry(guarded, "vast.ai DELETE /instances", _delete, what="vast.ai DELETE /instances")
             return True
         except Exception as e:
             log.warning(f"Failed to terminate vast.ai instance {instance_id}: {e}")
             return False
 
     def list_instances(self) -> list[dict]:
-        def _fetch():
-            resp = self._req("GET", "/instances", params={"owner": "me"})
-            resp.raise_for_status()
-            return resp.json().get("instances", [])
-        raw = guarded("vast.ai GET /instances", _fetch)
+        raw = self._list_raw()
         return [{
             "id": str(inst.get("id", "")),
             "name": inst.get("label") or "",
@@ -193,10 +199,12 @@ class VastaiProvider:
             "order": [["dph_total", "asc"]],
             "type": "on-demand",
         }
-        try:
+        def _fetch():
             resp = self._req("POST", "/bundles/", json=body)
             resp.raise_for_status()
-            offers = resp.json().get("offers", [])
+            return resp.json().get("offers", [])
+        try:
+            offers = retry(guarded, "vast.ai POST /bundles", _fetch, what="vast.ai POST /bundles")
         except Exception as e:
             log.error(f"Failed to fetch vast.ai GPU catalog: {e}")
             return []

@@ -140,3 +140,51 @@ def test_vastai_list_instances():
         req.return_value = _vast_response(raise_json=True)
         with pytest.raises(ConductorError):
             provider.list_instances()
+
+
+@patch("conductor.providers.runpod.runpod")
+def test_runpod_check_exists_retries_transient_errors(mock_runpod):
+    from runpod import error as runpod_error
+    mock_runpod.get_pod.side_effect = [
+        runpod_error.QueryError("502 Bad Gateway"),
+        {"id": "p", "desiredStatus": "RUNNING"},
+    ]
+    assert RunPodProvider().check_exists("p") is True
+    assert mock_runpod.get_pod.call_count == 2
+
+    mock_runpod.get_pod.side_effect = runpod_error.AuthenticationError("bad key")
+    mock_runpod.get_pod.reset_mock()
+    assert RunPodProvider().check_exists("p") is None
+    assert mock_runpod.get_pod.call_count == 1  # not retried
+
+
+@patch("conductor.providers.runpod.runpod")
+def test_runpod_terminate_retries(mock_runpod):
+    from runpod import error as runpod_error
+    mock_runpod.terminate_pod.side_effect = [runpod_error.QueryError("429"), None]
+    assert RunPodProvider().terminate("p") is True
+    assert mock_runpod.terminate_pod.call_count == 2
+
+
+def test_vastai_list_retries_5xx_not_4xx():
+    from conductor.providers.vastai import VastaiProvider
+    provider = VastaiProvider()
+    with patch.object(provider, "_req") as req:
+        req.side_effect = [_vast_response(status=503),
+                           _vast_response({"instances": [{"id": 1, "label": "x", "actual_status": "running"}]})]
+        assert provider.check_exists("1") is True
+        assert req.call_count == 2
+
+        req.reset_mock()
+        req.side_effect = [_vast_response(status=403)]
+        assert provider.check_exists("1") is None
+        assert req.call_count == 1
+
+
+def test_vastai_terminate_retries():
+    from conductor.providers.vastai import VastaiProvider
+    provider = VastaiProvider()
+    with patch.object(provider, "_req") as req:
+        req.side_effect = [_vast_response(status=502), _vast_response({})]
+        assert provider.terminate("1") is True
+        assert req.call_count == 2

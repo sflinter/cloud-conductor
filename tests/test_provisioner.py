@@ -101,11 +101,37 @@ def test_check_pod_exists():
     assert check_pod_exists(provider, "pod123") is False
 
 
-def test_teardown_pod():
+def test_teardown_pod_verifies_with_provider():
     provider = _mock_provider()
     provider.terminate.return_value = True
+    provider.check_exists.return_value = False
     assert teardown_pod(provider, "pod123") is True
     provider.terminate.assert_called_once_with("pod123")
+    provider.check_exists.assert_called_with("pod123")
+
+
+def test_teardown_pod_unverified_when_still_alive():
+    provider = _mock_provider()
+    provider.terminate.return_value = True
+    provider.check_exists.return_value = True
+    assert teardown_pod(provider, "pod123") is False
+    provider.check_exists.return_value = None
+    assert teardown_pod(provider, "pod123") is False
+    assert teardown_pod(provider, "pod123", verify=False) is True
+
+
+def test_teardown_pod_retries_terminate():
+    provider = _mock_provider()
+    provider.terminate.side_effect = [False, RuntimeError("502"), True]
+    provider.check_exists.return_value = False
+    assert teardown_pod(provider, "pod123") is True
+    assert provider.terminate.call_count == 3
+
+    provider.terminate.side_effect = None
+    provider.terminate.return_value = False
+    provider.terminate.reset_mock()
+    assert teardown_pod(provider, "pod123") is False
+    assert provider.terminate.call_count == 3
 
 
 @patch("conductor.provisioner.select_cheapest_gpus")
@@ -202,6 +228,7 @@ def test_provision_ssh_failure_releases_and_reports(mock_sleep=None):
     ]
     provider.wait_for_ssh.side_effect = [None, ("1.1.1.1", 1)]
     provider.terminate.return_value = True
+    provider.check_exists.return_value = False
     created, released = [], []
     config = _make_config(gpu_type_ids_fallback=["NVIDIA RTX A4000"])
     pod = _make_pod()
@@ -227,3 +254,24 @@ def test_provision_release_failure_is_reported():
     assert released == [("stuck", False)]
     assert result.status == "failed"
     assert result.pod_id is None  # no longer tracked by the job (registry keeps it)
+
+
+@patch("conductor.provisioner.wait_ssh", return_value=True)
+def test_provision_timeout_is_configurable(mock_ssh):
+    provider = _mock_provider()
+    provider.create_instance.return_value = {"id": "pod123", "cost_per_hour": 0.12}
+    provider.wait_for_ssh.return_value = ("1.2.3.4", 22222)
+    config = _make_config(provision_timeout_seconds=1234)
+    provision_pod(provider, config, _make_pod())
+    assert provider.wait_for_ssh.call_args[1]["timeout"] == 1234
+    assert mock_ssh.call_args[1]["timeout"] == 1234
+
+
+@patch("conductor.provisioner.wait_ssh", return_value=True)
+def test_provision_timeout_default(mock_ssh):
+    provider = _mock_provider()
+    provider.create_instance.return_value = {"id": "pod123", "cost_per_hour": 0.12}
+    provider.wait_for_ssh.return_value = ("1.2.3.4", 22222)
+    provision_pod(provider, _make_config(), _make_pod())
+    assert provider.wait_for_ssh.call_args[1]["timeout"] == 900
+    assert mock_ssh.call_args[1]["timeout"] == 900

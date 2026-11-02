@@ -182,6 +182,7 @@ container_disk_in_gb = 40
 volume_in_gb = 0
 volume_mount_path = "/workspace"
 ssh_key_path = "~/.ssh/id_rsa"
+provision_timeout_seconds = 900       # wait this long for a new pod's SSH before terminating it and trying the next GPU
 
 # Deployment
 deploy_method = "rsync"               # "rsync" or "image" (prebuilt Docker)
@@ -440,7 +441,11 @@ When reusing a pod (`keep_pod_alive`), rsync mode re-syncs code (fast incrementa
 
 **`state.py`** — Serializes/deserializes the per-run state file (`.conductor_state.json`). Provides `PodState` dataclass for declarative batch runs. Also manages the append-only cost log (JSONL) for historical reporting. Note: the global pod registry (`registry.py`) is separate from per-run state.
 
-**`ssh.py`** — Low-level SSH and rsync wrappers. All SSH commands use `-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null` for ephemeral pod connections. Provides `ssh_exec()` for commands and `ssh_interactive()` for `conductor ssh`. Provides `tail_remote_log()` for `conductor logs --tail` (opens persistent SSH + `tail -f`).
+**`ssh.py`** — Low-level SSH and rsync wrappers. All SSH commands use `-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o BatchMode=yes` for ephemeral pod connections; rsync adds `--partial --timeout=120`. Every invocation goes through `_run()`, which never raises (a local timeout or OS error comes back as a failed `CompletedProcess`) and retries transient failures (ssh rc 255; rsync socket/protocol/timeout codes) with exponential backoff and jitter. Provides `ssh_exec()` for commands and `ssh_interactive()` for `conductor ssh`. Provides `tail_remote_log()` for `conductor logs --tail` (opens persistent SSH + `tail -f`).
+
+**`errors.py` / `retry.py`** — `ConductorError` and `guarded()` convert SDK/HTTP/JSON/OS errors into one well-defined exception; `retry()` adds exponential backoff with jitter (4 attempts, 30 s cap), retrying transport errors, 429 and 5xx but not other 4xx or authentication failures. Both providers wrap their idempotent calls (get, list, terminate, catalog) in it; instance creation is never retried.
+
+**`filelock.py`** — `locked(path)`: `flock` on a hidden `.lock` sibling, used for every read-modify-write of the state file and the registry.
 
 **`gpu_pricing.py`** — Queries `runpod.get_gpu_types()` to get current GPU availability and pricing. Filters by minimum VRAM, sorts by price ascending, returns ordered list of candidates. Caches results for 5 minutes to avoid hammering the API during parallel provisioning.
 
@@ -488,7 +493,7 @@ Minimal:
 2. **Deploy**: Rsync code + run setup (or skip for prebuilt images). Parallel across jobs.
 3. **Launch**: Start `run_command` via nohup. Sequential (fast, just SSH commands).
 4. **Monitor**: Loop until all jobs done. Sync results, track costs, handle interruptions.
-5. **Teardown**: Terminate pod via RunPod API. Final sync first.
+5. **Teardown**: Final sync (retried; a persistent failure keeps the pod and marks the job `sync_failed`), then terminate via the provider API and poll until the provider confirms the pod is gone.
 
 ## Error Handling
 
@@ -496,7 +501,9 @@ Minimal:
 |---|---|
 | Config validation fails | Abort before provisioning, print errors |
 | All GPU types unavailable | Mark job as `failed`, notify, continue other jobs |
-| SSH never becomes ready (5 min timeout) | Mark job as `failed`, terminate pod, notify |
+| SSH never becomes ready (`provision_timeout_seconds`, default 15 min) | Terminate the pod (verified), try the next GPU candidate; when all are exhausted mark job as `failed`, notify |
+| Final sync fails after 3 attempts | Keep the pod alive, mark the job `sync_failed`, notify. `conductor sync --jobs X` then `conductor teardown --jobs X` releases it. A budget stop still tears the pod down |
+| Terminate not confirmed by the provider | Registry keeps the pod as `running`, `job.error` records it, status shows it; never assumed gone |
 | Deploy/setup command fails | Mark job as `failed`, terminate pod, notify |
 | Process exits with code 0 | Immediately: final sync, mark as `completed`, terminate pod, notify |
 | Process exits with non-zero code | Immediately: final sync, mark as `failed` with the exit code and last 50 log lines in `error`, terminate pod, notify |

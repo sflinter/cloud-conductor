@@ -12,7 +12,7 @@ from pathlib import Path
 from conductor import __version__
 from conductor.config import load_config
 from conductor.gpu_pricing import get_gpu_price, select_cheapest_gpus
-from conductor.monitor import POLL_INTERVAL, run_lifecycle
+from conductor.monitor import POLL_INTERVAL, TERMINAL_STATUSES, run_lifecycle
 from conductor.providers import CloudProvider
 from conductor.provisioner import provision_pod_direct, teardown_pod
 from conductor.registry import PodRecord, add_pod, get_pod, list_pods, reconcile_with_provider, update_pod
@@ -370,8 +370,12 @@ def cmd_run(args):
         print("Ctrl-C detaches (pods keep running; resume with 'conductor run').")
     run_lifecycle(configs, state, state_path, cost_log_path, budget_override=args.budget,
                   teardown_on_interrupt=args.teardown_on_interrupt)
-    if all(j.status in ("completed", "failed", "skipped") for j in state.jobs):
+    if all(j.status in TERMINAL_STATUSES for j in state.jobs):
         print("\nAll jobs finished.")
+        stuck = [j for j in state.jobs if j.status == "sync_failed"]
+        for j in stuck:
+            print(f"  {j.name}: final sync failed, pod {j.pod_id} kept alive (still billing). "
+                  f"Run 'conductor sync --jobs {j.name}' then 'conductor teardown --jobs {j.name}'.")
 
 
 def _apply_retry_flags(state: RunState, config_map: dict, args) -> list[str]:
@@ -499,14 +503,19 @@ def cmd_sync(args):
     state = load_state(state_path)
     _refuse_if_live(state, "sync", args)
     for job in state.jobs:
-        if job.status != "running" or not job.ssh_host:
+        if job.status not in ("running", "sync_failed") or not job.ssh_host:
             continue
         config = config_map.get(job.name)
         if not config:
             continue
         print(f"Syncing {job.name}...")
-        sync_pull(config, job)
-        job.last_sync_at = time.time()
+        if sync_pull(config, job):
+            job.last_sync_at = time.time()
+            if job.status == "sync_failed":
+                print(f"  {job.name}: synced; the pod is still running. "
+                      f"Run 'conductor teardown --jobs {job.name}' to release it.")
+        else:
+            print(f"  {job.name}: sync FAILED")
 
     # Only the timestamps changed; never clobber a live run's state
     if not run_is_live(state, POLL_INTERVAL):
@@ -791,7 +800,7 @@ def cmd_attach(args):
             print(f"Unknown job: {args.job_name}")
             sys.exit(1)
 
-        if job.status in ("completed", "failed", "skipped"):
+        if job.status in TERMINAL_STATUSES:
             print(f"Job '{args.job_name}' is {job.status}.")
             break
 
@@ -806,7 +815,7 @@ def cmd_attach(args):
         # Reload state to check if job is still running (SSH info may have changed after spot recovery)
         state = load_state(state_path)
         job = get_job(state, args.job_name)
-        if not job or job.status in ("completed", "failed", "skipped"):
+        if not job or job.status in TERMINAL_STATUSES:
             print(f"\nJob '{args.job_name}' is {job.status if job else 'gone'}.")
             break
 

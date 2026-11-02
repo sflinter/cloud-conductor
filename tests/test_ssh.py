@@ -104,3 +104,72 @@ def test_wait_ssh_survives_timeout_results():
             subprocess.CompletedProcess([], 0),
         ]
         assert wait_ssh("1.2.3.4", 22222, "/key", timeout=10) is True
+
+
+def test_ssh_opts_are_hardened():
+    opts = " ".join(SSH_OPTS)
+    for o in ("ConnectTimeout=15", "ServerAliveInterval=15", "ServerAliveCountMax=3", "BatchMode=yes"):
+        assert o in opts
+    with patch("conductor.ssh.subprocess.run") as mock_run:
+        mock_run.return_value = subprocess.CompletedProcess([], 0)
+        rsync("/src/", "/dst/", "1.2.3.4", 22222, "/key")
+        cmd = mock_run.call_args[0][0]
+        assert "--partial" in cmd and "--timeout=120" in cmd
+        assert "BatchMode=yes" in cmd[cmd.index("-e") + 1]
+        rsync_pull("/r", "/l", "1.2.3.4", 22222, "/key")
+        cmd = mock_run.call_args[0][0]
+        assert "--partial" in cmd and "--timeout=120" in cmd
+
+
+def test_ssh_exec_retries_connection_failures_only():
+    with patch("conductor.ssh.subprocess.run") as mock_run:
+        mock_run.side_effect = [
+            subprocess.CompletedProcess([], 255, stdout="", stderr="Connection refused"),
+            subprocess.CompletedProcess([], 255, stdout="", stderr="Connection refused"),
+            subprocess.CompletedProcess([], 0, stdout="ok\n", stderr=""),
+        ]
+        result = ssh_exec("1.2.3.4", 22222, "/key", "echo ok")
+        assert result.returncode == 0
+        assert mock_run.call_count == 3
+
+    with patch("conductor.ssh.subprocess.run") as mock_run:
+        mock_run.return_value = subprocess.CompletedProcess([], 1, stdout="", stderr="command failed")
+        assert ssh_exec("1.2.3.4", 22222, "/key", "false").returncode == 1
+        assert mock_run.call_count == 1  # a real command failure is not retried
+
+    with patch("conductor.ssh.subprocess.run") as mock_run:
+        mock_run.side_effect = subprocess.TimeoutExpired(cmd=["ssh"], timeout=5)
+        assert ssh_exec("1.2.3.4", 22222, "/key", "sleep", timeout=5).returncode == 124
+        assert mock_run.call_count == 1  # a command timeout is not retried
+
+
+def test_ssh_exec_retries_can_be_disabled():
+    with patch("conductor.ssh.subprocess.run") as mock_run:
+        mock_run.return_value = subprocess.CompletedProcess([], 255, stdout="", stderr="refused")
+        assert ssh_exec("1.2.3.4", 22222, "/key", "echo", retries=1).returncode == 255
+        assert mock_run.call_count == 1
+
+
+def test_rsync_retries_transient_codes():
+    with patch("conductor.ssh.subprocess.run") as mock_run:
+        mock_run.side_effect = [
+            subprocess.CompletedProcess([], 30, stderr="timeout in data send"),
+            subprocess.TimeoutExpired(cmd=["rsync"], timeout=600),
+            subprocess.CompletedProcess([], 0),
+        ]
+        assert rsync_pull("/r", "/l", "1.2.3.4", 22222, "/key").returncode == 0
+        assert mock_run.call_count == 3
+
+    with patch("conductor.ssh.subprocess.run") as mock_run:
+        mock_run.return_value = subprocess.CompletedProcess([], 23, stderr="partial transfer")
+        assert rsync("/s/", "/d/", "1.2.3.4", 22222, "/key").returncode == 23
+        assert mock_run.call_count == 1
+
+
+def test_wait_ssh_uses_single_attempt_probe():
+    with patch("conductor.ssh.ssh_exec") as mock_exec, patch("conductor.ssh.time") as mock_time:
+        mock_time.time.side_effect = [0, 1]
+        mock_time.sleep = MagicMock()
+        mock_exec.return_value = subprocess.CompletedProcess([], 0)
+        assert wait_ssh("h", 1, "/key", timeout=900) is True
+        assert mock_exec.call_args[1]["retries"] == 1

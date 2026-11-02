@@ -51,6 +51,7 @@ def _should_notify(config: NotificationConfig, event: str) -> bool:
         "budget_exceeded": config.on_job_failure,
         "job_budget_exceeded": config.on_job_failure,
         "orchestrator_crashed": config.on_job_failure,
+        "sync_failed": config.on_job_failure,
     }
     return mapping.get(event, True)
 
@@ -95,7 +96,8 @@ def _notify_pushover(config: NotificationConfig, title: str, message: str, event
         log.warning("Pushover credentials not configured")
         return False
 
-    priority = 1 if event in ("job_failed", "budget_exceeded", "job_budget_exceeded") else 0
+    priority = 1 if event in ("job_failed", "budget_exceeded", "job_budget_exceeded",
+                              "orchestrator_crashed", "sync_failed") else 0
     data = {
         "token": app_token,
         "user": user_key,

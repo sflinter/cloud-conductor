@@ -10,6 +10,16 @@ def tmp_dir():
         yield d
 
 
+@pytest.fixture(autouse=True)
+def no_retry_sleeps(monkeypatch):
+    """Retries and terminate verification must never make a test wait."""
+    monkeypatch.setattr("conductor.retry._sleep", lambda s: None)
+    monkeypatch.setattr("conductor.ssh.RETRY_BASE_SECONDS", 0.0)
+    monkeypatch.setattr("conductor.ssh.RETRY_MAX_SECONDS", 0.0)
+    monkeypatch.setattr("conductor.provisioner.TERMINATE_POLL_SECONDS", 0.0)
+    monkeypatch.setattr("conductor.provisioner.TERMINATE_VERIFY_SECONDS", 0.0)
+
+
 @pytest.fixture
 def sample_toml(tmp_dir):
     path = os.path.join(tmp_dir, "jobs.toml")

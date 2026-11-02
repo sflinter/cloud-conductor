@@ -489,3 +489,124 @@ def test_sleep_unless_returns_early():
     t0 = time.time()
     _sleep_unless(shutdown, 30)
     assert time.time() - t0 < 1
+
+
+# --- final sync and verified teardown ----------------------------------------
+
+def _sync_config(**kw):
+    from conductor.config import SyncPath
+    return _make_config(sync_paths=[SyncPath(remote="out/", local="./r/")], **kw)
+
+
+@patch("conductor.monitor.send_notification", return_value=False)
+@patch("conductor.monitor.registry_update")
+@patch("conductor.monitor.sync_pull", return_value=False)
+def test_finish_job_keeps_pod_when_final_sync_fails(mock_sync, mock_reg, mock_notify, paths):
+    from conductor.monitor import _finish_job, _all_done
+    state_path, cost_path = paths
+    provider = _provider()
+    job = PodState(name="a", status="running", pod_id="p", ssh_host="h", ssh_port=1, exit_code=0)
+    state = RunState(jobs=[job, PodState(name="b", status="pending", depends_on=["a"])])
+    config = _sync_config(name="a")
+
+    _finish_job(provider, job, config, state, cost_path, "completed")
+
+    assert mock_sync.call_count == 3
+    provider.terminate.assert_not_called()
+    assert job.status == "sync_failed"
+    assert "conductor sync --jobs a" in job.error and "completed" in job.error
+    assert mock_reg.call_args[1]["status"] == "running"
+    assert mock_notify.call_args[0][1] == "sync_failed"
+    assert state.jobs[1].status == "pending"  # not propagated as a failure
+    assert _all_done(RunState(jobs=[job])) is True
+    assert job in __import__("conductor.monitor", fromlist=["live_pods"]).live_pods(state)
+
+
+@patch("conductor.monitor.send_notification", return_value=False)
+@patch("conductor.monitor.registry_update")
+@patch("conductor.monitor.sync_pull", side_effect=[False, True])
+def test_finish_job_retries_final_sync(mock_sync, mock_reg, mock_notify, paths):
+    from conductor.monitor import _finish_job
+    state_path, cost_path = paths
+    provider = _provider()
+    provider.check_exists.return_value = False
+    job = PodState(name="a", status="running", pod_id="p", ssh_host="h", ssh_port=1)
+    state = RunState(jobs=[job])
+
+    _finish_job(provider, job, _sync_config(name="a"), state, cost_path, "completed")
+
+    assert mock_sync.call_count == 2
+    provider.terminate.assert_called_once_with("p")
+    assert job.status == "completed" and job.error is None
+    assert mock_reg.call_args[1]["status"] == "terminated"
+
+
+@patch("conductor.monitor.send_notification", return_value=False)
+@patch("conductor.monitor.registry_update")
+@patch("conductor.monitor.sync_pull", return_value=False)
+def test_finish_job_force_teardown_ignores_sync_failure(mock_sync, mock_reg, mock_notify, paths):
+    from conductor.monitor import _finish_job
+    state_path, cost_path = paths
+    provider = _provider()
+    provider.check_exists.return_value = False
+    job = PodState(name="a", status="running", pod_id="p", ssh_host="h", ssh_port=1)
+    state = RunState(jobs=[job])
+
+    _finish_job(provider, job, _sync_config(name="a"), state, cost_path, "failed",
+                error="budget_exceeded", force_teardown=True)
+
+    provider.terminate.assert_called_once_with("p")
+    assert job.status == "failed"
+
+
+@patch("conductor.monitor.send_notification", return_value=False)
+@patch("conductor.monitor.registry_update")
+@patch("conductor.monitor.sync_pull", return_value=True)
+def test_finish_job_records_unverified_teardown(mock_sync, mock_reg, mock_notify, paths):
+    from conductor.monitor import _finish_job
+    state_path, cost_path = paths
+    provider = _provider()
+    provider.terminate.return_value = True
+    provider.check_exists.return_value = True  # still alive after terminate
+    job = PodState(name="a", status="running", pod_id="p", ssh_host="h", ssh_port=1)
+    state = RunState(jobs=[job])
+
+    _finish_job(provider, job, _make_config(name="a"), state, cost_path, "completed")
+
+    assert job.status == "completed"
+    assert "teardown unverified" in job.error
+    assert mock_reg.call_args[1]["status"] == "running"  # never claim a pod is gone
+
+
+@patch("conductor.monitor.send_notification", return_value=False)
+@patch("conductor.monitor.registry_update")
+@patch("conductor.monitor.sync_pull", return_value=False)
+def test_budget_stop_tears_down_sync_failed_pods(mock_sync, mock_reg, mock_notify, paths):
+    from conductor.monitor import _teardown_all
+    state_path, cost_path = paths
+    provider = _provider()
+    provider.check_exists.return_value = False
+    state = RunState(jobs=[PodState(name="a", status="sync_failed", pod_id="p", ssh_host="h", ssh_port=1)])
+    cfg = {"a": _sync_config(name="a")}
+    _teardown_all(list(cfg.values()), cfg, {"a": provider}, state, state_path, cost_path, reason="budget_exceeded")
+    provider.terminate.assert_called_once_with("p")
+    assert state.jobs[0].status == "failed"
+
+
+@patch("conductor.monitor.send_notification", return_value=False)
+@patch("conductor.monitor._start_unblocked_jobs")
+@patch("conductor.monitor.registry_update")
+@patch("conductor.monitor.registry_add")
+@patch("conductor.monitor.launch")
+@patch("conductor.monitor.deploy", return_value=True)
+@patch("conductor.monitor.wait_ssh", return_value=True)
+def test_resume_uses_provision_timeout(mock_wait, mock_deploy, mock_launch, mock_add, mock_upd, mock_start, mock_notify, paths):
+    from conductor.runner import LaunchResult
+    mock_launch.return_value = LaunchResult(pid=1)
+    provider = _provider()
+    provider.get_ssh_info.return_value = ("h", 1)
+    job = PodState(name="a", status="deploying", pod_id="p")
+    state = RunState(jobs=[job], run_id="abc123")
+    config = _make_config(name="a", provision_timeout_seconds=333)
+    _monitor_tick([config], {"a": config}, {"a": provider}, state, *paths)
+    assert mock_wait.call_args[1]["timeout"] == 333

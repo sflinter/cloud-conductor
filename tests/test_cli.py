@@ -398,3 +398,18 @@ def test_status_shows_orchestrator_liveness(tmp_dir, monkeypatch, capsys):
     main(["status", "--config", config_path])
     out = capsys.readouterr().out
     assert "Run abc123: orchestrator live (pid 4242" in out
+
+
+def test_sync_covers_sync_failed_jobs(tmp_dir, monkeypatch, capsys):
+    from unittest.mock import MagicMock
+    from conductor.state import PodState
+    config_path, state_path = _write_run_fixture(tmp_dir, [
+        PodState(name="train", status="sync_failed", pod_id="p1", ssh_host="h", ssh_port=1),
+        PodState(name="eval", status="completed"),
+    ])
+    pull = MagicMock(return_value=True)
+    monkeypatch.setattr("conductor.cli.sync_pull", pull)
+    main(["sync", "--config", config_path])
+    assert pull.call_count == 1
+    out = capsys.readouterr().out
+    assert "conductor teardown --jobs train" in out

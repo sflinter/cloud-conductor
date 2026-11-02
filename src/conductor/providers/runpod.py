@@ -8,6 +8,7 @@ import runpod
 
 from conductor.errors import guarded
 from conductor.gpu_pricing import GpuInfo
+from conductor.retry import retry
 
 log = logging.getLogger(__name__)
 
@@ -78,9 +79,13 @@ class RunPodProvider:
             time.sleep(5)
         return None
 
+    def _get_pod(self, instance_id: str) -> dict | None:
+        """get_pod with retries on transport errors, 429 and 5xx."""
+        return retry(guarded, "runpod.get_pod", runpod.get_pod, instance_id, what="runpod.get_pod")
+
     def get_ssh_info(self, instance_id: str) -> tuple[str, int] | None:
         try:
-            pod = runpod.get_pod(instance_id)
+            pod = self._get_pod(instance_id)
         except Exception as e:
             log.warning(f"Could not query pod {instance_id} for SSH info: {e}")
             return None
@@ -99,7 +104,7 @@ class RunPodProvider:
 
     def check_exists(self, instance_id: str) -> bool | None:
         try:
-            pod = runpod.get_pod(instance_id)
+            pod = self._get_pod(instance_id)
         except Exception as e:
             log.warning(f"Could not check pod {instance_id}: {e}")
             return None
@@ -110,14 +115,15 @@ class RunPodProvider:
 
     def terminate(self, instance_id: str) -> bool:
         try:
-            runpod.terminate_pod(instance_id)
+            retry(guarded, "runpod.terminate_pod", runpod.terminate_pod, instance_id,
+                  what="runpod.terminate_pod")
             return True
         except Exception as e:
             log.warning(f"Failed to terminate pod {instance_id}: {e}")
             return False
 
     def list_instances(self) -> list[dict]:
-        raw = guarded("runpod.get_pods", runpod.get_pods) or []
+        raw = retry(guarded, "runpod.get_pods", runpod.get_pods, what="runpod.get_pods") or []
         return [{
             "id": str(pod.get("id", "")),
             "name": pod.get("name") or "",
@@ -125,7 +131,7 @@ class RunPodProvider:
         } for pod in raw if pod.get("id")]
 
     def get_gpu_catalog(self) -> list[GpuInfo]:
-        raw = guarded("runpod.get_gpus", runpod.get_gpus)
+        raw = retry(guarded, "runpod.get_gpus", runpod.get_gpus, what="runpod.get_gpus")
         results = []
         for gpu in raw:
             results.append(GpuInfo(
@@ -141,7 +147,7 @@ class RunPodProvider:
 
     def _get_cost(self, pod_id: str, gpu_id: str, cloud_type: str) -> float:
         try:
-            pod = runpod.get_pod(pod_id)
+            pod = self._get_pod(pod_id)
             cost = pod.get("costPerHr", 0) if pod else 0
             if cost and cost > 0:
                 return float(cost)

@@ -189,3 +189,21 @@ def test_defaults_without_new_fields(sample_toml):
     cfg = load_config(sample_toml)[0]
     assert cfg.setup_timeout_seconds == 1800
     assert cfg.teardown_on_crash is False
+
+
+def test_provision_timeout_field(tmp_dir):
+    path = os.path.join(tmp_dir, "jobs.toml")
+    with open(path, "w") as f:
+        f.write('''
+[global]
+provision_timeout_seconds = 1200
+recovery_confirmations = 5
+
+[[jobs]]
+name = "a"
+run_command = "echo hi"
+''')
+    cfg = load_config(path)[0]
+    assert cfg.provision_timeout_seconds == 1200
+    assert cfg.recovery_confirmations == 5
+    assert JobConfig(name="x", run_command="y").provision_timeout_seconds == 900

@@ -15,6 +15,7 @@ Cloud Conductor is **project-agnostic**: it runs arbitrary shell commands on GPU
 - **Auto GPU selection** — query RunPod API for cheapest available GPU at provision time
 - **Notifications** — macOS native, Pushover push, or pipe to any custom command
 - **Observable** — `conductor status` works even when the main process isn't running
+- **Resilient** — every SSH, rsync and provider call is retried with backoff; a transient error never kills the orchestrator or triggers a false spot recovery; Ctrl-C detaches and `conductor run` resumes
 
 ## Installation
 
@@ -93,6 +94,7 @@ The TOML config has a `[global]` section for defaults and `[[jobs]]` entries for
 | `auto_select_cheapest_gpu` | `false` | Ignore manual list, pick cheapest available |
 | `gpu_min_vram_gb` | `0` | Minimum VRAM filter for auto-select |
 | `image_name` | | Docker image for the pod |
+| `provision_timeout_seconds` | `900` | Max wait for a new pod's SSH to come up before it is terminated and the next GPU tried |
 | `deploy_method` | `"rsync"` | `"rsync"` or `"image"` (prebuilt Docker) |
 | `setup_command` | `""` | Shell command run after rsync (install deps, etc.) |
 | `setup_timeout_seconds` | `1800` | Max time for `setup_command` before the job is marked failed |
@@ -149,7 +151,7 @@ Provision → Deploy → Launch → Monitor → Teardown
 2. **Deploy** — rsync code + run setup command (or skip for prebuilt images)
 3. **Launch** — start `run_command` under `setsid nohup`; the exit code is written to `.conductor_exit` when it ends
 4. **Monitor** — poll the exit file and process, sync results, track costs, handle interruptions. Exit 0 completes the job at once; a non-zero exit fails it with the last 50 log lines in the error
-5. **Teardown** — terminate pod (final sync first)
+5. **Teardown** — final sync (retried; if it keeps failing the pod is kept alive and the job marked `sync_failed`), then terminate and verify with the provider that the pod is gone
 
 ## Job Dependencies
 

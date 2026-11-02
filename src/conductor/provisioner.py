@@ -14,6 +14,10 @@ from conductor.state import PodState, pod_name_for
 
 log = logging.getLogger(__name__)
 
+TERMINATE_ATTEMPTS = 3
+TERMINATE_VERIFY_SECONDS = 60.0   # how long to poll the provider after terminate
+TERMINATE_POLL_SECONDS = 5.0
+
 
 def provision_pod_direct(
     provider: CloudProvider,
@@ -25,6 +29,7 @@ def provision_pod_direct(
     pod_name: str = "",
     on_created: Callable[[str, str, float], None] | None = None,
     on_released: Callable[[str, bool], None] | None = None,
+    provision_timeout: int = 900,
     **provider_kwargs,
 ) -> PodRecord | None:
     """Create an instance and wait for SSH.
@@ -53,7 +58,7 @@ def provision_pod_direct(
     if on_created:
         on_created(instance_id, gpu_type_id, cost)
 
-    ssh_info = provider.wait_for_ssh(instance_id)
+    ssh_info = provider.wait_for_ssh(instance_id, timeout=provision_timeout)
     if not ssh_info:
         log.warning(f"[{pod_name}] Could not get SSH info for instance {instance_id}")
         _release(provider, instance_id, pod_name, on_released)
@@ -62,7 +67,7 @@ def provision_pod_direct(
     ssh_host, ssh_port = ssh_info
     log.info(f"[{pod_name}] Waiting for SSH at {ssh_host}:{ssh_port}")
 
-    if not wait_ssh(ssh_host, ssh_port, ssh_key_path):
+    if not wait_ssh(ssh_host, ssh_port, ssh_key_path, timeout=provision_timeout):
         log.warning(f"[{pod_name}] SSH timeout for instance {instance_id}")
         _release(provider, instance_id, pod_name, on_released)
         return None
@@ -152,6 +157,7 @@ def provision_pod(
             pod_name=pod_name_for(run_id, cfg.name),
             on_created=_created,
             on_released=on_released,
+            provision_timeout=cfg.provision_timeout_seconds,
             cloud_type=cfg.cloud_type,
             volume_in_gb=cfg.volume_in_gb,
             volume_mount_path=cfg.volume_mount_path,
@@ -227,5 +233,40 @@ def refresh_ssh_info(provider: CloudProvider, pod_state: PodState) -> bool:
     return True
 
 
-def teardown_pod(provider: CloudProvider, pod_id: str) -> bool:
-    return provider.terminate(pod_id)
+def teardown_pod(provider: CloudProvider, pod_id: str, verify: bool = True) -> bool:
+    """Terminate a pod and, by default, verify with the provider that it is
+    gone. Returns False if the terminate call kept failing or the pod was
+    still reported alive at the end of the verification window; callers
+    must then treat the pod as possibly still billing."""
+    ok = False
+    for attempt in range(1, TERMINATE_ATTEMPTS + 1):
+        try:
+            ok = bool(provider.terminate(pod_id))
+        except Exception as e:
+            log.warning(f"terminate({pod_id}) raised: {e}")
+            ok = False
+        if ok:
+            break
+        if attempt < TERMINATE_ATTEMPTS:
+            time.sleep(TERMINATE_POLL_SECONDS)
+    if not ok:
+        log.error(f"Terminate of pod {pod_id} failed {TERMINATE_ATTEMPTS} times")
+        return False
+    if not verify:
+        return True
+
+    deadline = time.time() + TERMINATE_VERIFY_SECONDS
+    last = None
+    while True:
+        last = check_pod_exists(provider, pod_id)
+        if last is False:
+            log.info(f"Pod {pod_id} confirmed gone")
+            return True
+        if time.time() >= deadline:
+            break
+        time.sleep(TERMINATE_POLL_SECONDS)
+    if last is True:
+        log.error(f"Pod {pod_id} is STILL REPORTED ALIVE {TERMINATE_VERIFY_SECONDS:.0f}s after terminate")
+    else:
+        log.warning(f"Could not confirm that pod {pod_id} is gone (provider not answering)")
+    return False
