@@ -107,7 +107,7 @@ The TOML config has a `[global]` section for defaults and `[[jobs]]` entries for
 | `budget_usd` | `0` | Global budget limit (0 = unlimited) |
 | `job_budget_usd` | `0` | Per-job budget limit |
 | `idle_timeout_minutes` | `5` | Fallback only: teardown if the process vanished without writing an exit file and stayed gone this long |
-| `stall_timeout_minutes` | `0` | Teardown if GPU util stays below threshold (0 = disabled) |
+| `stall_timeout_minutes` | `0` | Fail the job and teardown if GPU util stays below threshold this long (0 = disabled, the default: CPU-only jobs show 0% GPU) |
 | `stall_gpu_threshold` | `5` | GPU util % below which the job is considered stalled |
 | `recovery_confirmations` | `3` | Consecutive ticks the provider must report a pod gone before spot recovery starts |
 | `provision_retries` | `3` | Passes over the GPU candidate list when none has capacity right now, with jittered backoff between passes |

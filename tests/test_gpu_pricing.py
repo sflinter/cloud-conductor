@@ -87,3 +87,35 @@ def test_get_gpu_price():
     assert get_gpu_price(provider, "NVIDIA RTX A2000", "COMMUNITY") == 0.12
     assert get_gpu_price(provider, "NVIDIA RTX A2000", "SECURE") == 0.15
     assert get_gpu_price(provider, "FAKE", "ALL") == 0.0
+
+
+def test_get_gpu_price_falls_back_to_gpu_detail():
+    clear_cache()
+    provider = _mock_provider()
+    # Catalog lists the GPU without a price (RunPod's list query), detail has it
+    provider.get_gpu_catalog.return_value = [GpuInfo(
+        id="NVIDIA L4", display_name="NVIDIA L4", memory_mb=24 * 1024,
+        community_price=0.0, secure_price=0.0, community_available=False, secure_available=False)]
+    provider.get_gpu_detail.return_value = GpuInfo(
+        id="NVIDIA L4", display_name="NVIDIA L4", memory_mb=24 * 1024,
+        community_price=0.43, secure_price=0.59, community_available=True, secure_available=True)
+    assert get_gpu_price(provider, "NVIDIA L4", "ALL") == 0.43
+    assert get_gpu_price(provider, "NVIDIA L4", "SECURE") == 0.59
+    assert provider.get_gpu_detail.call_count == 1   # cached
+
+    # Detail lookup that fails or returns junk means "unknown", never raises
+    clear_cache()
+    provider.get_gpu_detail.side_effect = RuntimeError("down")
+    assert get_gpu_price(provider, "NVIDIA L4", "ALL") == 0.0
+    clear_cache()
+    provider.get_gpu_detail.side_effect = None
+    provider.get_gpu_detail.return_value = {"not": "a GpuInfo"}
+    assert get_gpu_price(provider, "NVIDIA L4", "ALL") == 0.0
+
+    # A provider without get_gpu_detail just reports no price
+    class Bare:
+        name = "bare"
+        def get_gpu_catalog(self):
+            return []
+    clear_cache()
+    assert get_gpu_price(Bare(), "NVIDIA L4", "ALL") == 0.0

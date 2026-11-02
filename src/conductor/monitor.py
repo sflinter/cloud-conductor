@@ -23,7 +23,7 @@ from conductor.runner import LOG_TAIL_LINES, fetch_log_tail, get_log_path, get_u
 from conductor.shutdown import Interrupted
 from conductor.ssh import wait_ssh
 from conductor.state import (
-    PodState, RunState, accrue_cost, append_cost_event, get_job, pod_name_for,
+    PodState, RunState, accrue_cost, append_cost_event, elapsed_seconds, get_job, pod_name_for,
     record_pod_stopped, save_state,
 )
 from conductor.syncer import sync_pull, sync_push
@@ -293,6 +293,7 @@ def _fail_job_safely(
         log.error(f"[{job.name}] Could not tear down pod {job.pod_id}: {describe(e)}")
         job.status = "failed"
         job.error = f"{error} (pod {job.pod_id} may still be running)"
+        _mark_finished(job)
         _propagate_failure(job, state)
     send_notification(config.notifications, "job_failed", job=job.name, error=job.error)
 
@@ -335,7 +336,10 @@ def _tick_job(
             if gpu_util is not None and gpu_util < config.stall_gpu_threshold:
                 if job.stalled_since is None:
                     job.stalled_since = time.time()
-                    log.info(f"[{job.name}] GPU util {gpu_util}% < {config.stall_gpu_threshold}%, starting stall timer")
+                    log.info(f"[{job.name}] GPU util {gpu_util}% < {config.stall_gpu_threshold}%: stall timer "
+                             f"started, the job FAILS and its pod is torn down in "
+                             f"{config.stall_timeout_minutes} min unless GPU activity resumes "
+                             f"(stall_timeout_minutes = 0 disables this)")
                 elif (time.time() - job.stalled_since) / 60 >= config.stall_timeout_minutes:
                     log.warning(f"[{job.name}] GPU stall timeout reached ({config.stall_timeout_minutes}m)")
                     _finish_job(prov, job, config, state, cost_log_path, "failed", error="gpu stall detected")
@@ -525,6 +529,7 @@ def _provision_deploy_launch(
             log.exception(f"[{job.name}] Unexpected error during {job.status}")
         job.error = f"{job.status} failed: {describe(e)}"
         job.status = "failed"
+        _mark_finished(job)
         if job.pod_id:
             log.warning(f"[{job.name}] Pod {job.pod_id} may still be running; tearing down")
             try:
@@ -601,6 +606,7 @@ def _pipeline(
         provision_pod(provider, config, job, run_id=state.run_id,
                       on_created=_persist_created, on_released=_released)
         if job.status == "failed":
+            _mark_finished(job)
             _propagate_failure(job, state)
             send_notification(config.notifications, "job_failed",
                               job=job.name, error=job.error)
@@ -621,6 +627,7 @@ def _pipeline(
     if not deploy(config, job, is_reuse=is_reuse):
         job.status = "failed"
         job.error = "deploy failed"
+        _mark_finished(job)
         if job.pod_id:
             teardown_pod(provider, job.pod_id)
         _propagate_failure(job, state)
@@ -644,6 +651,7 @@ def _launch_job(
     if launched is None:
         job.status = "failed"
         job.error = "launch failed"
+        _mark_finished(job)
         if job.pod_id:
             teardown_pod(provider, job.pod_id)
         _propagate_failure(job, state)
@@ -821,6 +829,7 @@ def _spot_recover(
     if job.provision_attempts >= config.max_provision_attempts:
         job.status = "failed"
         job.error = f"max provision attempts ({config.max_provision_attempts}) exceeded"
+        _mark_finished(job)
         _propagate_failure(job, state)
         send_notification(config.notifications, "job_failed",
                           job=job.name, error=job.error)
@@ -939,6 +948,13 @@ def _finish_job(
 
     if status == "failed":
         _propagate_failure(job, state)
+
+
+def _mark_finished(job: PodState) -> None:
+    """The job is over: Elapsed stops here. Cost keeps accruing only for a
+    pod that is still live (the registry/teardown paths handle that)."""
+    if job.started_at and job.finished_at is None:
+        job.finished_at = time.time()
 
 
 def _with_note(error: str | None, note: str) -> str:
@@ -1080,6 +1096,15 @@ def _graceful_shutdown(
     save_state(state, state_path)
 
 
+def format_elapsed(job: PodState) -> str:
+    """Pod lifetime as "Xh YYm"; frozen at finished_at once the job is over."""
+    secs = elapsed_seconds(job)
+    if secs is None:
+        return "---"
+    h, m = int(secs // 3600), int((secs % 3600) // 60)
+    return f"{h}h {m:02d}m"
+
+
 def _print_status(state: RunState) -> None:
     header = f"{'Job':<16} {'Pod':<14} {'GPU':<24} {'Status':<12} {'Exit':<5} {'$/hr':<8} {'Elapsed':<10} {'Cost':<8}"
     sep = "─" * len(header)
@@ -1087,11 +1112,7 @@ def _print_status(state: RunState) -> None:
     for job in state.jobs:
         pod_id = (job.pod_id or "---")[:12]
         gpu = (job.gpu_type or "---")[:22]
-        elapsed = "---"
-        if job.started_at:
-            secs = time.time() - job.started_at
-            h, m = int(secs // 3600), int((secs % 3600) // 60)
-            elapsed = f"{h}h {m:02d}m"
+        elapsed = format_elapsed(job)
         cost = f"${job.cost_usd:.2f}" if job.cost_usd > 0 else "---"
         rate = f"${job.gpu_cost_per_hour:.2f}" if job.gpu_cost_per_hour > 0 else "---"
         exit_code = "---" if job.exit_code is None else str(job.exit_code)

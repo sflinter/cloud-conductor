@@ -84,7 +84,7 @@ Intentionally minimal:
 - `depends_on` supports job ordering with cycle detection; failed dependencies cascade as `skipped`
 - `keep_pod_alive` enables pod reuse across runs (re-syncs code, skips setup)
 - `auto_select_cheapest_gpu` queries provider API at provision time instead of using manual fallback lists
-- Aggressive cost defaults: GPU stall detection enabled (30 min), idle timeout 5 min
+- Cost defaults: idle timeout 5 min; GPU stall detection off by default (`stall_timeout_minutes = 0`, a CPU-only job shows 0% GPU) and loud about starting its timer when enabled. `Elapsed` in the status tables stops at `finished_at`
 
 ## RunPod Operational Notes
 

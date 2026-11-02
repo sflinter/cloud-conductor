@@ -311,3 +311,15 @@ run_command = "echo hi"
     assert cfg.state_file == os.path.join(tmp_dir, ".conductor_state.json")
     assert cfg.cost_log_file == os.path.join(tmp_dir, ".conductor_cost_log.jsonl")
     assert cfg.local_project_dir == tmp_dir
+
+
+def test_stall_detection_off_by_default(tmp_dir):
+    path = os.path.join(tmp_dir, "jobs.toml")
+    with open(path, "w") as f:
+        f.write('''
+[[jobs]]
+name = "a"
+run_command = "echo hi"
+''')
+    assert JobConfig(name="x", run_command="y").stall_timeout_minutes == 0
+    assert load_config(path)[0].stall_timeout_minutes == 0

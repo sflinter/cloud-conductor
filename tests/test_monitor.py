@@ -503,3 +503,71 @@ def test_monitor_tick_accrues_cost_while_deploying(mock_resume, mock_start, mock
         _monitor_tick([config], {"a": config}, _mock_provider_map([config]), state, sf.name, cf.name)
     assert job.cost_usd > 0.45 and state.total_cost_usd > 0.45
     mock_resume.assert_called_once()
+
+
+@patch("conductor.monitor.send_notification", return_value=False)
+@patch("conductor.monitor._start_unblocked_jobs")
+@patch("conductor.monitor.check_pod_exists", return_value=True)
+@patch("conductor.monitor.is_alive", return_value=ProcessStatus("running"))
+@patch("conductor.monitor.get_utilization", return_value={"gpu_util": 0})
+def test_stall_timer_start_is_loud(mock_util, mock_alive, mock_pod_exists, mock_start, mock_notify, caplog):
+    import logging
+    import time as _time
+    job = PodState(name="a", status="running", started_at=_time.time() - 100,
+                   ssh_host="1.2.3.4", ssh_port=22222, pid=123, pod_id="pod123", last_sync_at=_time.time())
+    state = RunState(jobs=[job])
+    config = _make_config(name="a", stall_timeout_minutes=30)
+    with tempfile.NamedTemporaryFile(suffix=".json") as sf, tempfile.NamedTemporaryFile(suffix=".jsonl") as cf, \
+            caplog.at_level(logging.INFO, logger="conductor.monitor"):
+        _monitor_tick([config], {"a": config}, _mock_provider_map([config]), state, sf.name, cf.name)
+    msgs = [r.message for r in caplog.records if "stall timer" in r.message]
+    assert msgs and "30 min" in msgs[0] and "stall_timeout_minutes = 0" in msgs[0]
+
+
+@patch("conductor.monitor.send_notification", return_value=False)
+@patch("conductor.monitor._start_unblocked_jobs")
+@patch("conductor.monitor.check_pod_exists", return_value=True)
+@patch("conductor.monitor.is_alive", return_value=ProcessStatus("running"))
+@patch("conductor.monitor.get_utilization", return_value={"gpu_util": 0})
+def test_stall_detection_not_consulted_when_off(mock_util, mock_alive, mock_pod_exists, mock_start, mock_notify):
+    import time as _time
+    job = PodState(name="a", status="running", started_at=_time.time() - 100,
+                   ssh_host="1.2.3.4", ssh_port=22222, pid=123, pod_id="pod123", last_sync_at=_time.time())
+    state = RunState(jobs=[job])
+    config = _make_config(name="a")   # default: off
+    with tempfile.NamedTemporaryFile(suffix=".json") as sf, tempfile.NamedTemporaryFile(suffix=".jsonl") as cf:
+        _monitor_tick([config], {"a": config}, _mock_provider_map([config]), state, sf.name, cf.name)
+    mock_util.assert_not_called()
+    assert job.stalled_since is None
+
+
+def test_print_status_elapsed_freezes_at_finish(capsys):
+    import time as _time
+    from conductor.monitor import _print_status, format_elapsed
+    now = _time.time()
+    done = PodState(name="done", status="completed", started_at=now - 5 * 3600, finished_at=now - 5 * 3600 + 90 * 60)
+    live = PodState(name="live", status="running", started_at=now - 2 * 3600 - 60)
+    assert format_elapsed(done) == "1h 30m"
+    assert format_elapsed(live) == "2h 01m"
+    assert format_elapsed(PodState(name="x")) == "---"
+    _print_status(RunState(jobs=[done, live]))
+    out = capsys.readouterr().out
+    assert "1h 30m" in [l for l in out.splitlines() if l.startswith("done")][0]
+
+
+@patch("conductor.monitor.send_notification", return_value=False)
+@patch("conductor.monitor.registry_update")
+@patch("conductor.monitor.provision_pod")
+def test_pipeline_failure_sets_finished_at(mock_prov, mock_reg, mock_notify, tmp_dir):
+    from conductor.errors import ConductorError
+    from conductor.monitor import _provision_deploy_launch
+    import time as _time
+    mock_prov.side_effect = ConductorError("boom")
+    job = PodState(name="a", status="pending", started_at=_time.time() - 10)
+    state = RunState(jobs=[job])
+    provider = MagicMock()
+    provider.terminate.return_value = True
+    provider.check_exists.return_value = False
+    _provision_deploy_launch(provider, job, _make_config(name="a"), state,
+                             os.path.join(tmp_dir, "s.json"), os.path.join(tmp_dir, "c.jsonl"))
+    assert job.status == "failed" and job.finished_at is not None

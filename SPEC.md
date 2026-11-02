@@ -20,7 +20,7 @@ Cloud Conductor extracts the orchestration concerns into a standalone, project-a
 - **Dual-mode CLI**: Imperative commands (`conductor pod`) for direct pod management without config files; declarative mode (`conductor run -f`) for batch orchestration via TOML.
 - **Stateful**: A global pod registry (`~/.conductor/pods.json`) tracks all pods. Per-project batch state is persisted to `.conductor_state.json`.
 - **Observable**: `conductor status` and `conductor pod list` always work — with or without a config file.
-- **Cost-aware**: GPU stall detection and idle timeout enabled by default. Built-in budget limits, per-pod cost tracking, and automatic teardown of idle or over-budget pods.
+- **Cost-aware**: Idle timeout enabled by default; GPU stall detection available (`stall_timeout_minutes`, off by default so CPU-bound jobs are not killed). Built-in budget limits, per-pod cost tracking, and automatic teardown of idle or over-budget pods.
 - **Composable**: Each phase (provision, deploy, run, sync, teardown) can be invoked independently via imperative commands.
 
 ## CLI Interface
@@ -96,7 +96,7 @@ Full lifecycle: provision → deploy → launch → monitor → sync → teardow
 
 ### `conductor status`
 
-Reads the state file and queries RunPod API to show a table. Cost is accrued from pod creation for every job whose pod is live (`provisioning`, `deploying`, `running`, `sync_failed`), not only from the last monitor tick:
+Reads the state file and queries RunPod API to show a table. Cost is accrued from pod creation for every job whose pod is live (`provisioning`, `deploying`, `running`, `sync_failed`), not only from the last monitor tick. `Elapsed` is the pod's lifetime: it stops at `finished_at` for a job that is over instead of growing forever:
 
 ```
 Job     Pod          GPU              Status     GPU%  CPU%  Elapsed    Cost     Info
@@ -116,7 +116,7 @@ Terminates the pods tracked in the state file (only those of the jobs named with
 
 ### `conductor dry-run`
 
-Prints what would be provisioned (GPU type, image, disk, estimated cost) without creating anything. Includes automatic GPU price lookup.
+Prints what would be provisioned (GPU type, image, disk, estimated cost) without creating anything. The estimate is best effort from the provider's catalog: the primary GPU's hourly price (`Est. cost`), the price range over the priced fallbacks (`Fallback range`), the cheapest match for `auto_select_cheapest_gpu`, or `cost_per_hour_override` when set. RunPod's catalog list carries no prices, so each candidate is looked up individually (`runpod.get_gpu`, cached 5 min); a GPU without a price is reported as unavailable rather than silently omitted.
 
 ### `conductor validate`
 
@@ -216,7 +216,7 @@ sync_paths = [
 # Cost controls
 budget_usd = 40.00                    # global hard budget limit, teardown all when reached
 idle_timeout_minutes = 5              # teardown pod if job process not running for this long
-stall_timeout_minutes = 30            # teardown if GPU util stays below threshold for this long (0 = disabled)
+stall_timeout_minutes = 0             # 0 = off (default). N = fail the job and teardown if GPU util stays below threshold for N min
 stall_gpu_threshold = 5               # GPU util % below which the job is considered stalled
 cost_per_hour_override = 0.0          # 0 = auto-detect from RunPod API
 
@@ -562,7 +562,7 @@ Each tick the monitor reads the exit file first. Completion is immediate on exit
 
 ## GPU Stall Detection
 
-Detects jobs where the process is alive but the GPU is idle (e.g. hung training loop, deadlock). Enabled by default (`stall_timeout_minutes = 30`). The monitor calls `get_utilization()` each tick while the process is alive. If GPU utilization stays below `stall_gpu_threshold` (default 5%) for longer than `stall_timeout_minutes`, the job is marked as `failed` with error "gpu stall detected" and the pod is torn down. Set `stall_timeout_minutes = 0` to disable.
+Detects jobs where the process is alive but the GPU is idle (e.g. hung training loop, deadlock). **Off by default** (`stall_timeout_minutes = 0`): a CPU-bound job legitimately shows 0% GPU and would otherwise be killed after the timeout. Set `stall_timeout_minutes = N` to enable; the monitor then calls `get_utilization()` each tick while the process is alive. When utilization first drops below `stall_gpu_threshold` (default 5%) an INFO line says that the stall timer has started and when the job will fail; if it stays below for longer than `stall_timeout_minutes`, the job is marked as `failed` with error "gpu stall detected" and the pod is torn down.
 
 Safety: if `get_utilization()` returns `None` (SSH failure, nvidia-smi missing), the stall timer is reset — no false positives from transient connectivity issues.
 

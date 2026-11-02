@@ -207,6 +207,22 @@ class RunPodProvider:
             ))
         return results
 
+    def get_gpu_detail(self, gpu_id: str) -> GpuInfo | None:
+        """One GPU type with its prices (runpod.get_gpu; the list query
+        used for the catalog carries no prices). None if unknown."""
+        gpu = retry(guarded, "runpod.get_gpu", runpod.get_gpu, gpu_id, what="runpod.get_gpu")
+        if not isinstance(gpu, dict) or not gpu.get("id"):
+            return None
+        return GpuInfo(
+            id=gpu.get("id", gpu_id),
+            display_name=gpu.get("displayName", gpu_id),
+            memory_mb=(gpu.get("memoryInGb") or 0) * 1024,
+            community_price=gpu.get("communityPrice") or 0.0,
+            secure_price=gpu.get("securePrice") or 0.0,
+            community_available=bool(gpu.get("communityCloud", gpu.get("communityAvailable"))),
+            secure_available=bool(gpu.get("secureCloud", gpu.get("secureAvailable"))),
+        )
+
     def _get_cost(self, pod_id: str, gpu_id: str, cloud_type: str) -> float:
         try:
             pod = self._get_pod(pod_id)

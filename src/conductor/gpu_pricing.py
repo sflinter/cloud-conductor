@@ -10,6 +10,7 @@ if TYPE_CHECKING:
 
 _cache: dict[str, list[GpuInfo]] = {}
 _cache_time: dict[str, float] = {}
+_detail_cache: dict[tuple[str, str], tuple[float, GpuInfo | None]] = {}
 _CACHE_TTL = 300  # 5 minutes
 
 
@@ -83,13 +84,43 @@ def validate_gpu_id(provider: CloudProvider, gpu_id: str) -> bool:
 
 
 def get_gpu_price(provider: CloudProvider, gpu_id: str, cloud_type: str = "ALL") -> float:
+    """Hourly price from the catalog; when the catalog carries no price for
+    the GPU (RunPod's list query omits prices) and the provider can describe
+    a single GPU type (`get_gpu_detail`), that is used instead. 0.0 if
+    unknown."""
     gpus = get_gpu_types(provider)
     for g in gpus:
         if g.id == gpu_id:
-            return _get_best_price(g, cloud_type)
-    return 0.0
+            price = _get_best_price(g, cloud_type)
+            if price > 0:
+                return price
+            break
+    detail = get_gpu_detail(provider, gpu_id)
+    return _get_best_price(detail, cloud_type) if detail else 0.0
+
+
+def get_gpu_detail(provider: CloudProvider, gpu_id: str) -> GpuInfo | None:
+    """One GPU type with prices, via the provider's optional
+    get_gpu_detail(gpu_id); cached for _CACHE_TTL. None if unsupported or
+    the lookup failed."""
+    fetch = getattr(provider, "get_gpu_detail", None)
+    if fetch is None:
+        return None
+    key = (provider.name, gpu_id)
+    cached = _detail_cache.get(key)
+    if cached and (time.time() - cached[0]) < _CACHE_TTL:
+        return cached[1]
+    try:
+        info = fetch(gpu_id)
+    except Exception:
+        info = None
+    if not isinstance(info, GpuInfo):
+        info = None
+    _detail_cache[key] = (time.time(), info)
+    return info
 
 
 def clear_cache() -> None:
     _cache.clear()
     _cache_time.clear()
+    _detail_cache.clear()

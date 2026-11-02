@@ -337,3 +337,19 @@ def test_mute_stdout_is_shared_across_threads(capsys):
     print("visible")
     out = capsys.readouterr().out
     assert "raw_response" not in out and "visible" in out
+
+
+@patch("conductor.providers.runpod.runpod")
+def test_runpod_get_gpu_detail(mock_runpod):
+    mock_runpod.get_gpu.return_value = {
+        "id": "NVIDIA L4", "displayName": "L4", "memoryInGb": 24,
+        "communityPrice": 0.43, "securePrice": 0.59, "communityCloud": True, "secureCloud": False,
+    }
+    info = RunPodProvider().get_gpu_detail("NVIDIA L4")
+    assert info.id == "NVIDIA L4" and info.memory_mb == 24 * 1024
+    assert info.community_price == 0.43 and info.secure_price == 0.59
+    assert info.community_available is True and info.secure_available is False
+    mock_runpod.get_gpu.assert_called_once_with("NVIDIA L4")
+
+    mock_runpod.get_gpu.return_value = None
+    assert RunPodProvider().get_gpu_detail("nope") is None

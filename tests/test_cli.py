@@ -113,12 +113,28 @@ cost_log_file = "{tmp_dir}/cost.jsonl"
     assert "No cost data" in captured.out
 
 
-def test_dry_run(capsys, tmp_dir):
+def _fake_catalog_provider(prices: dict[str, float]):
+    from conductor.gpu_pricing import GpuInfo
+    from unittest.mock import MagicMock
+    provider = MagicMock()
+    provider.name = "fake"
+    provider.get_gpu_catalog.return_value = [
+        GpuInfo(id=g, display_name=g, memory_mb=16 * 1024, community_price=p, secure_price=p,
+                community_available=p > 0, secure_available=p > 0)
+        for g, p in prices.items()]
+    provider.get_gpu_detail.return_value = None
+    return provider
+
+
+def test_dry_run(capsys, tmp_dir, monkeypatch):
+    from conductor.gpu_pricing import clear_cache
+    clear_cache()
     config_path = os.path.join(tmp_dir, "jobs.toml")
     with open(config_path, "w") as f:
         f.write('''
 [global]
 gpu_type_id = "NVIDIA RTX A2000"
+gpu_type_ids_fallback = ["NVIDIA RTX A4000", "NVIDIA L4", "NVIDIA A100"]
 budget_usd = 40.0
 
 [[jobs]]
@@ -129,7 +145,11 @@ run_command = "echo train"
 name = "eval"
 depends_on = ["train"]
 run_command = "echo eval"
+cost_per_hour_override = 0.5
 ''')
+    provider = _fake_catalog_provider({"NVIDIA RTX A2000": 0.12, "NVIDIA RTX A4000": 0.25,
+                                       "NVIDIA L4": 0.43, "NVIDIA A100": 0.0})
+    monkeypatch.setattr("conductor.cli._configure_provider", lambda name: provider)
 
     main(["dry-run", "--config", config_path])
     captured = capsys.readouterr()
@@ -137,6 +157,28 @@ run_command = "echo eval"
     assert "train" in captured.out
     assert "eval" in captured.out
     assert "Depends on: train" in captured.out
+    assert "Est. cost: $0.12/hr (NVIDIA RTX A2000)" in captured.out
+    assert "Fallback range: $0.25-$0.43/hr (2 of 3 priced)" in captured.out
+    assert "Est. cost: $0.50/hr (cost_per_hour_override)" in captured.out
+    assert "Budget: $40.00" in captured.out
+
+
+def test_dry_run_without_prices_says_so(capsys, tmp_dir, monkeypatch):
+    from conductor.gpu_pricing import clear_cache
+    clear_cache()
+    config_path = os.path.join(tmp_dir, "jobs.toml")
+    with open(config_path, "w") as f:
+        f.write('''
+[[jobs]]
+name = "train"
+gpu_type_id = "NVIDIA RTX A2000"
+run_command = "echo train"
+''')
+    provider = _fake_catalog_provider({})
+    provider.get_gpu_catalog.side_effect = RuntimeError("api down")
+    monkeypatch.setattr("conductor.cli._configure_provider", lambda name: provider)
+    main(["dry-run", "--config", config_path])
+    assert "Est. cost: unavailable (no price for NVIDIA RTX A2000)" in capsys.readouterr().out
 
 
 def test_version_flag(capsys):
@@ -635,6 +677,23 @@ def test_teardown_unverified_is_recorded_as_such(tmp_dir, monkeypatch, capsys):
     assert train.status == "failed" and "unverified" in train.error
     assert read_cost_log(os.path.join(tmp_dir, "cost.jsonl"))[0]["verified"] is False
     assert "may still be billing" in capsys.readouterr().out
+
+
+def test_status_elapsed_frozen_for_finished_job(tmp_dir, monkeypatch, capsys):
+    import time
+    from unittest.mock import MagicMock
+    from conductor.state import PodState
+    now = time.time()
+    config_path, state_path = _write_run_fixture(tmp_dir, [
+        PodState(name="train", status="completed", pod_id="p1", exit_code=0,
+                 started_at=now - 10 * 3600, finished_at=now - 10 * 3600 + 45 * 60),
+        PodState(name="eval", status="pending"),
+    ])
+    monkeypatch.setattr("conductor.cli.reconcile_with_provider", lambda: [])
+    monkeypatch.setattr("conductor.cli._configure_provider", lambda name: MagicMock())
+    main(["status", "--config", config_path])
+    row = [l for l in capsys.readouterr().out.splitlines() if l.startswith("train")][0]
+    assert "0h 45m" in row
 
 
 def test_status_accrues_cost_for_provisioning_pod(tmp_dir, monkeypatch, capsys):
