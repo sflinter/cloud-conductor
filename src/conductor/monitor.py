@@ -16,7 +16,7 @@ from conductor.notify import send_notification
 from conductor.providers import CloudProvider, get_provider
 from conductor.provisioner import check_pod_exists, provision_pod, teardown_pod
 from conductor.registry import PodRecord, add_pod as registry_add, update_pod as registry_update
-from conductor.runner import get_log_path, get_utilization, is_alive, launch
+from conductor.runner import LOG_TAIL_LINES, fetch_log_tail, get_log_path, get_utilization, is_alive, launch
 from conductor.state import (
     PodState, RunState, append_cost_event, get_job, save_state,
 )
@@ -211,10 +211,14 @@ def _tick_job(
                           job=job.name, cost_usd=job.cost_usd)
         return
 
-    # Check if process is alive
-    alive = is_alive(job, config.ssh_key_path)
+    # Check the process: exit file first (immediate, real exit code), then pid
+    status = is_alive(job, config.ssh_key_path, config.remote_project_dir)
 
-    if alive is True:
+    if status.exited and status.exit_code is not None:
+        _handle_exit(prov, job, config, state, cost_log_path, status.exit_code)
+        return
+
+    if status.running:
         job.idle_since = None
 
         # GPU stall detection
@@ -242,13 +246,13 @@ def _tick_job(
             if elapsed_min >= config.sync_interval_minutes:
                 sync_pull(config, job)
                 job.last_sync_at = time.time()
-    elif alive is False:
-        # Process not running — check if pod is still alive
+    elif status.exited:
+        # Process gone without an exit file (killed, container restarted, pid
+        # reused). Fall back to the idle timer if the pod is still there.
         if job.pod_id and check_pod_exists(prov, job.pod_id):
-            # Pod alive but process gone — idle detection
             if job.idle_since is None:
                 job.idle_since = time.time()
-                log.info(f"[{job.name}] Process not running, starting idle timer")
+                log.warning(f"[{job.name}] Process not running ({status.detail}), starting idle timer")
             elif (time.time() - job.idle_since) / 60 >= config.idle_timeout_minutes:
                 log.info(f"[{job.name}] Idle timeout reached, marking completed")
                 _finish_job(prov, job, config, state, cost_log_path, "completed")
@@ -260,12 +264,39 @@ def _tick_job(
             log.warning(f"[{job.name}] Spot interruption detected")
             send_notification(config.notifications, "spot_recovery", job=job.name)
             _spot_recover(prov, job, config, state, state_path, cost_log_path)
-    elif alive is None:
+    elif status.unknown:
         # SSH unreachable — likely spot interruption
+        log.info(f"[{job.name}] Process state unknown ({status.detail})")
         if job.pod_id and not check_pod_exists(prov, job.pod_id):
             log.warning(f"[{job.name}] Pod gone (spot interruption)")
             send_notification(config.notifications, "spot_recovery", job=job.name)
             _spot_recover(prov, job, config, state, state_path, cost_log_path)
+
+
+def _handle_exit(
+    provider: CloudProvider,
+    job: PodState,
+    config: JobConfig,
+    state: RunState,
+    cost_log_path: str,
+    exit_code: int,
+) -> None:
+    job.exit_code = exit_code
+    if exit_code == 0:
+        log.info(f"[{job.name}] Job exited with code 0, marking completed")
+        _finish_job(provider, job, config, state, cost_log_path, "completed")
+        send_notification(config.notifications, "job_complete",
+                          job=job.name, cost_usd=job.cost_usd, gpu_type=job.gpu_type)
+        return
+
+    log.warning(f"[{job.name}] Job exited with code {exit_code}")
+    tail = fetch_log_tail(job, config.ssh_key_path, config.remote_project_dir)
+    error = f"exit code {exit_code}"
+    if tail:
+        error += f"\n--- last {LOG_TAIL_LINES} log lines ---\n{tail}"
+    _finish_job(provider, job, config, state, cost_log_path, "failed", error=error)
+    send_notification(config.notifications, "job_failed",
+                      job=job.name, error=f"exit code {exit_code}", cost_usd=job.cost_usd)
 
 
 def _start_unblocked_jobs(
@@ -428,8 +459,8 @@ def _pipeline(
         return
 
     # Launch
-    pid = launch(config, job)
-    if pid is None:
+    launched = launch(config, job)
+    if launched is None:
         job.status = "failed"
         job.error = "launch failed"
         if job.pod_id:
@@ -439,7 +470,9 @@ def _pipeline(
                           job=job.name, error=job.error)
         return
 
-    job.pid = pid
+    job.pid = launched.pid
+    job.pid_start = launched.pid_start
+    job.exit_code = None
     job.status = "running"
     job.started_at = job.started_at or time.time()
     job.last_sync_at = time.time()
@@ -637,7 +670,7 @@ def _graceful_shutdown(
 
 
 def _print_status(state: RunState) -> None:
-    header = f"{'Job':<16} {'Pod':<14} {'GPU':<24} {'Status':<12} {'$/hr':<8} {'Elapsed':<10} {'Cost':<8}"
+    header = f"{'Job':<16} {'Pod':<14} {'GPU':<24} {'Status':<12} {'Exit':<5} {'$/hr':<8} {'Elapsed':<10} {'Cost':<8}"
     sep = "─" * len(header)
     print(f"\n{header}\n{sep}")
     for job in state.jobs:
@@ -650,7 +683,8 @@ def _print_status(state: RunState) -> None:
             elapsed = f"{h}h {m:02d}m"
         cost = f"${job.cost_usd:.2f}" if job.cost_usd > 0 else "---"
         rate = f"${job.gpu_cost_per_hour:.2f}" if job.gpu_cost_per_hour > 0 else "---"
-        print(f"{job.name:<16} {pod_id:<14} {gpu:<24} {job.status:<12} {rate:<8} {elapsed:<10} {cost:<8}")
+        exit_code = "---" if job.exit_code is None else str(job.exit_code)
+        print(f"{job.name:<16} {pod_id:<14} {gpu:<24} {job.status:<12} {exit_code:<5} {rate:<8} {elapsed:<10} {cost:<8}")
 
     if state.budget_usd > 0:
         print(f"\nBudget: ${state.budget_usd:.2f} | Spent: ${state.total_cost_usd:.2f} | "

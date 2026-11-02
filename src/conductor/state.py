@@ -26,6 +26,8 @@ class PodState:
     job_budget_usd: float = 0.0
     depends_on: list[str] = field(default_factory=list)
     pid: int | None = None
+    pid_start: str | None = None   # process start time, detects pid reuse
+    exit_code: int | None = None   # from the remote exit file, once the job ends
     error: str | None = None
 
 

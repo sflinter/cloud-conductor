@@ -390,9 +390,9 @@ def cmd_status(args):
                         util_map[job.name] = metrics
 
     if show_util:
-        header = f"{'Job':<16} {'Pod':<14} {'GPU':<24} {'Status':<12} {'GPU%':<6}{'CPU%':<6}{'$/hr':<8} {'Elapsed':<10} {'Cost':<8}"
+        header = f"{'Job':<16} {'Pod':<14} {'GPU':<24} {'Status':<12} {'Exit':<5} {'GPU%':<6}{'CPU%':<6}{'$/hr':<8} {'Elapsed':<10} {'Cost':<8}"
     else:
-        header = f"{'Job':<16} {'Pod':<14} {'GPU':<24} {'Status':<12} {'$/hr':<8} {'Elapsed':<10} {'Cost':<8}"
+        header = f"{'Job':<16} {'Pod':<14} {'GPU':<24} {'Status':<12} {'Exit':<5} {'$/hr':<8} {'Elapsed':<10} {'Cost':<8}"
     sep = "─" * len(header)
     print(f"{header}\n{sep}")
     for job in state.jobs:
@@ -405,11 +405,12 @@ def cmd_status(args):
             elapsed = f"{h}h {m:02d}m"
         cost = f"${job.cost_usd:.2f}" if job.cost_usd > 0 else "---"
 
-        info = job.error or ""
+        info = (job.error or "").splitlines()[0] if job.error else ""
         if job.depends_on and job.status == "pending":
             info = f"waiting on {', '.join(job.depends_on)}"
 
         rate = f"${job.gpu_cost_per_hour:.2f}" if job.gpu_cost_per_hour > 0 else "---"
+        exit_code = "---" if job.exit_code is None else str(job.exit_code)
 
         if show_util:
             metrics = util_map.get(job.name)
@@ -419,9 +420,9 @@ def cmd_status(args):
             else:
                 gpu_pct = "---"
                 cpu_pct = "---"
-            print(f"{job.name:<16} {pod_id:<14} {gpu:<24} {job.status:<12} {gpu_pct:<6}{cpu_pct:<6}{rate:<8} {elapsed:<10} {cost:<8} {info}")
+            print(f"{job.name:<16} {pod_id:<14} {gpu:<24} {job.status:<12} {exit_code:<5} {gpu_pct:<6}{cpu_pct:<6}{rate:<8} {elapsed:<10} {cost:<8} {info}")
         else:
-            print(f"{job.name:<16} {pod_id:<14} {gpu:<24} {job.status:<12} {rate:<8} {elapsed:<10} {cost:<8} {info}")
+            print(f"{job.name:<16} {pod_id:<14} {gpu:<24} {job.status:<12} {exit_code:<5} {rate:<8} {elapsed:<10} {cost:<8} {info}")
 
     if state.budget_usd > 0:
         print(f"\nBudget: ${state.budget_usd:.2f} | Spent: ${state.total_cost_usd:.2f} | "
@@ -925,7 +926,7 @@ def cmd_pod_exec(args):
     remote_dir = args.remote_dir
 
     if args.detach:
-        pid = launch_direct(
+        launched = launch_direct(
             ssh_host=record.ssh_host,
             ssh_port=record.ssh_port,
             ssh_key_path=record.ssh_key_path,
@@ -933,9 +934,9 @@ def cmd_pod_exec(args):
             remote_dir=remote_dir,
             name=record.name,
         )
-        if pid:
-            update_pod(record.pod_id, pid=pid)
-            print(f"Launched (PID {pid}). Logs: conductor pod logs {record.name}")
+        if launched:
+            update_pod(record.pod_id, pid=launched.pid)
+            print(f"Launched (PID {launched.pid}). Logs: conductor pod logs {record.name}")
         else:
             print("Launch failed.")
             sys.exit(1)
@@ -959,8 +960,9 @@ def cmd_pod_stop(args):
         sys.exit(1)
 
     print(f"Killing PID {record.pid} on {record.name}...")
+    # The job runs in its own session (setsid), so kill the whole process group
     result = ssh_exec(record.ssh_host, record.ssh_port, record.ssh_key_path,
-                      f"kill {record.pid} 2>/dev/null; echo ok")
+                      f"kill -- -{record.pid} 2>/dev/null || kill {record.pid} 2>/dev/null; echo ok")
     if result.returncode == 0:
         update_pod(record.pod_id, pid=None)
         print("Process stopped. Pod is still running.")

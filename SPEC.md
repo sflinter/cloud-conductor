@@ -83,7 +83,7 @@ Full lifecycle: provision → deploy → launch → monitor → sync → teardow
 - Runs `validate` checks before provisioning (fail fast on bad config)
 - Provisions pods in parallel (one per job), respecting `depends_on` ordering
 - Deploys code via rsync or Docker image
-- Launches the job command via `nohup`
+- Launches the job command via `setsid nohup` with an exit file for the exit code
 - Monitors pods in a loop, syncing results at a configurable interval
 - Tears down each pod when its job completes or fails
 - Sends notifications on job completion, failure, or budget threshold
@@ -325,7 +325,10 @@ PYTHONUNBUFFERED=1 .venv/bin/python scripts/eval_with_search.py \
       "idle_since": null,
       "provision_attempts": 1,
       "cost_usd": 0.27,
-      "job_budget_usd": 5.00
+      "job_budget_usd": 5.00,
+      "pid": 4242,
+      "pid_start": "1234567",
+      "exit_code": null
     },
     {
       "name": "eval_4p",
@@ -405,26 +408,25 @@ Waits for SSH to become available (polls RunPod API for port mapping, then tests
 
 When reusing a pod (`keep_pod_alive`), rsync mode re-syncs code (fast incremental) but skips `setup_command` (deps already installed).
 
-**`runner.py`** — `launch_direct()` launches a detached command and returns PID (used by `conductor pod exec --detach`). `exec_foreground()` replaces the process with SSH (used by `conductor pod exec`). `launch()` wraps `launch_direct()` for declarative mode. Also provides `is_alive()` for process checking and `get_utilization()` for GPU/CPU metrics.
+**`runner.py`** — `launch_direct()` writes `.conductor_run.sh` (which runs the command and writes `$?` to `.conductor_exit`) and `.conductor_launch.sh` (which starts it under `setsid nohup ... > conductor_job.log 2>&1 < /dev/null &` and records the pid and its start time from `/proc/<pid>/stat`), returning a `LaunchResult(pid, pid_start)`. Launching is idempotent: if the previous launch is still running its pid is returned instead of starting a second copy. `exec_foreground()` replaces the process with SSH (used by `conductor pod exec`). `launch()` wraps `launch_direct()` for declarative mode. `is_alive()` returns a `ProcessStatus`: `running`, `exited` (with the exit code from the exit file, or none if the process simply vanished or its pid was reused) or `unknown` (SSH failed). `fetch_log_tail()` returns the last lines of the job log; `get_utilization()` returns GPU/CPU metrics.
 
 **`syncer.py`** — Rsyncs configured `sync_paths` from pod to local machine. Each sync path specifies a remote path (relative to `remote_project_dir`) and a local destination. Also supports push direction (local → remote) for spot recovery checkpoint restoration.
 
 **`monitor.py`** — Main monitoring loop:
-1. For each active job, check if the process is still running (`runner.is_alive()`)
+1. For each active job, check the process (`runner.is_alive()`): exit file first, then pid
 2. If running and sync interval elapsed, trigger sync
-3. If process not running, determine if completed or failed:
-   - Check RunPod pod status (EXITED/STOPPED → spot interruption)
-   - SSH unreachable → spot interruption
-   - Process exited but pod alive → completed or crashed (check exit code if available)
-4. On spot interruption: teardown dead pod, backoff, re-provision, re-deploy, push synced results back, re-launch with same command (should resume via `--resume` or equivalent in the user's command)
-5. On completion: final sync, teardown pod (unless `keep_pod_alive`), send notification
-6. On failure: sync logs, teardown pod, send notification
-7. Update cost tracking based on elapsed time and GPU hourly rate
-8. If per-job budget exceeded, teardown that job's pod, send notification
-9. If global budget exceeded, teardown all pods, send notification, exit
-10. Check `depends_on`: if a completed job unblocks pending jobs, start provisioning them
-11. Print status table
-12. Append cost event to cost log
+3. If the exit file exists: exit 0 → `completed` immediately; non-zero → `failed` immediately with the exit code and the last 50 log lines in `error`
+4. If the process vanished without an exit file (pod restarted, pid reused, killed): if the pod still exists, start the idle timer and mark `completed` after `idle_timeout_minutes`; if the pod is gone → spot interruption
+5. SSH unreachable → check the pod with the provider; pod gone → spot interruption
+6. On spot interruption: teardown dead pod, backoff, re-provision, re-deploy, push synced results back, re-launch with same command (should resume via `--resume` or equivalent in the user's command)
+7. On completion: final sync, teardown pod (unless `keep_pod_alive`), send notification
+8. On failure: sync logs, teardown pod, send notification
+9. Update cost tracking based on elapsed time and GPU hourly rate
+10. If per-job budget exceeded, teardown that job's pod, send notification
+11. If global budget exceeded, teardown all pods, send notification, exit
+12. Check `depends_on`: if a completed job unblocks pending jobs, start provisioning them
+13. Print status table (including each job's exit code)
+14. Append cost event to cost log
 
 **`state.py`** — Serializes/deserializes the per-run state file (`.conductor_state.json`). Provides `PodState` dataclass for declarative batch runs. Also manages the append-only cost log (JSONL) for historical reporting. Note: the global pod registry (`registry.py`) is separate from per-run state.
 
@@ -486,7 +488,9 @@ Minimal:
 | All GPU types unavailable | Mark job as `failed`, notify, continue other jobs |
 | SSH never becomes ready (5 min timeout) | Mark job as `failed`, terminate pod, notify |
 | Deploy/setup command fails | Mark job as `failed`, terminate pod, notify |
-| Process exits unexpectedly | Final sync of logs, mark as `failed`, terminate pod, notify |
+| Process exits with code 0 | Immediately: final sync, mark as `completed`, terminate pod, notify |
+| Process exits with non-zero code | Immediately: final sync, mark as `failed` with the exit code and last 50 log lines in `error`, terminate pod, notify |
+| Process vanishes without an exit file | Idle timer; `completed` after `idle_timeout_minutes` if the pod still exists |
 | Spot interruption (pod evicted) | Automatic recovery: re-provision → re-deploy → push synced results → re-launch. Notify. |
 | Max provision attempts exceeded | Mark job as `failed`, stop retrying, notify |
 | Per-job budget exceeded | Final sync, teardown that pod, mark as `failed`, notify |
@@ -505,15 +509,17 @@ The conductor tracks cost per pod based on:
 - Total cost across all jobs is summed and compared against `budget_usd`
 - When total cost exceeds budget, all pods are torn down immediately
 
-## Idle Detection
+## Job Supervision and Idle Detection
 
-After launching a job, the monitor periodically checks if the process is still running. If the process is not found for `idle_timeout_minutes` consecutive checks:
+The job is launched as `setsid nohup bash .conductor_run.sh > conductor_job.log 2>&1 < /dev/null &`, where the run script is `cd <dir> && ( <run_command> ); echo $? > .conductor_exit`. The pid and its start time (field 22 of `/proc/<pid>/stat`, or `ps -o lstart=`) are stored in state, so a pid that has been reused by an unrelated process is not mistaken for the job.
+
+Each tick the monitor reads the exit file first. Completion is immediate on exit 0 and failure immediate on any other code (the last 50 log lines are captured into `error`), so no time is spent waiting out an idle timeout after a job ends.
+
+`idle_timeout_minutes` is only a fallback for the case where the process is gone but no exit file was written (container restart, `kill -9` of the whole session, pid reuse). In that case, if the pod still exists:
 
 1. Do a final sync
 2. Terminate the pod
-3. Mark the job as `completed` (assumption: process exited cleanly)
-
-This prevents paying for idle pods after training completes — the single most common source of wasted spend in the current system.
+3. Mark the job as `completed`
 
 ## GPU Stall Detection
 

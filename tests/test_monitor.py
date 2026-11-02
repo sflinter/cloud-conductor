@@ -8,6 +8,7 @@ from conductor.monitor import (
     _all_done, _deps_met, _deps_failed, _propagate_failure,
     _start_unblocked_jobs, _update_cost, _monitor_tick,
 )
+from conductor.runner import ProcessStatus
 from conductor.state import PodState, RunState, get_job
 
 
@@ -120,7 +121,7 @@ def test_start_unblocked_skips_on_failed_dep(mock_pdl):
 @patch("conductor.monitor.send_notification", return_value=False)
 @patch("conductor.monitor._start_unblocked_jobs")
 @patch("conductor.monitor.check_pod_exists", return_value=True)
-@patch("conductor.monitor.is_alive", return_value=True)
+@patch("conductor.monitor.is_alive", return_value=ProcessStatus("running"))
 def test_monitor_tick_running_job(mock_alive, mock_pod_exists, mock_start, mock_notify):
     import time as _time
     job = PodState(name="a", status="running", started_at=_time.time() - 100,
@@ -142,7 +143,7 @@ def test_monitor_tick_running_job(mock_alive, mock_pod_exists, mock_start, mock_
 @patch("conductor.monitor.send_notification", return_value=False)
 @patch("conductor.monitor._start_unblocked_jobs")
 @patch("conductor.monitor.check_pod_exists", return_value=True)
-@patch("conductor.monitor.is_alive", return_value=False)
+@patch("conductor.monitor.is_alive", return_value=ProcessStatus("exited"))
 def test_monitor_tick_idle_detection(mock_alive, mock_pod_exists, mock_start, mock_notify, mock_finish):
     import time as _time
     # Process dead, pod alive — should start idle timer
@@ -169,7 +170,7 @@ def test_monitor_tick_idle_detection(mock_alive, mock_pod_exists, mock_start, mo
 @patch("conductor.monitor.send_notification", return_value=False)
 @patch("conductor.monitor._start_unblocked_jobs")
 @patch("conductor.monitor.check_pod_exists", return_value=True)
-@patch("conductor.monitor.is_alive", return_value=True)
+@patch("conductor.monitor.is_alive", return_value=ProcessStatus("running"))
 @patch("conductor.monitor.get_utilization", return_value={"gpu_util": 2, "gpu_mem_used": 100, "gpu_mem_total": 8000})
 def test_monitor_tick_stall_detection(mock_util, mock_alive, mock_pod_exists, mock_start, mock_notify):
     import time as _time
@@ -201,7 +202,7 @@ def test_monitor_tick_stall_detection(mock_util, mock_alive, mock_pod_exists, mo
 @patch("conductor.monitor.send_notification", return_value=False)
 @patch("conductor.monitor._start_unblocked_jobs")
 @patch("conductor.monitor.check_pod_exists", return_value=True)
-@patch("conductor.monitor.is_alive", return_value=True)
+@patch("conductor.monitor.is_alive", return_value=ProcessStatus("running"))
 @patch("conductor.monitor.get_utilization", return_value={"gpu_util": 80, "gpu_mem_used": 4000, "gpu_mem_total": 8000})
 def test_monitor_tick_stall_resets_on_active_gpu(mock_util, mock_alive, mock_pod_exists, mock_start, mock_notify):
     import time as _time
@@ -224,7 +225,7 @@ def test_monitor_tick_stall_resets_on_active_gpu(mock_util, mock_alive, mock_pod
 @patch("conductor.monitor.send_notification", return_value=False)
 @patch("conductor.monitor._start_unblocked_jobs")
 @patch("conductor.monitor.check_pod_exists", return_value=True)
-@patch("conductor.monitor.is_alive", return_value=True)
+@patch("conductor.monitor.is_alive", return_value=ProcessStatus("running"))
 def test_monitor_tick_stall_noop_when_disabled(mock_alive, mock_pod_exists, mock_start, mock_notify):
     import time as _time
     job = PodState(name="a", status="running", started_at=_time.time() - 100,
@@ -245,7 +246,7 @@ def test_monitor_tick_stall_noop_when_disabled(mock_alive, mock_pod_exists, mock
 @patch("conductor.monitor.send_notification", return_value=False)
 @patch("conductor.monitor._start_unblocked_jobs")
 @patch("conductor.monitor.check_pod_exists", return_value=True)
-@patch("conductor.monitor.is_alive", return_value=True)
+@patch("conductor.monitor.is_alive", return_value=ProcessStatus("running"))
 @patch("conductor.monitor.get_utilization", return_value=None)
 def test_monitor_tick_stall_resets_on_util_none(mock_util, mock_alive, mock_pod_exists, mock_start, mock_notify):
     import time as _time
@@ -292,3 +293,88 @@ def test_parallel_launch(mock_pdl):
     # Verify lock was passed (parallel path)
     for call in mock_pdl.call_args_list:
         assert call.kwargs.get("lock") is not None or (len(call.args) > 6 and call.args[6] is not None)
+
+
+@patch("conductor.monitor.send_notification", return_value=False)
+@patch("conductor.monitor._start_unblocked_jobs")
+@patch("conductor.monitor._finish_job")
+@patch("conductor.monitor.is_alive", return_value=ProcessStatus("exited", exit_code=0))
+def test_monitor_tick_exit_zero_completes_immediately(mock_alive, mock_finish, mock_start, mock_notify):
+    import time as _time
+    job = PodState(name="a", status="running", started_at=_time.time() - 100,
+                   ssh_host="1.2.3.4", ssh_port=22222, pid=123, pod_id="pod123")
+    state = RunState(jobs=[job], budget_usd=40.0)
+    config = _make_config(name="a", idle_timeout_minutes=180)
+    provider_map = _mock_provider_map([config])
+
+    with tempfile.NamedTemporaryFile(suffix=".json") as sf, \
+         tempfile.NamedTemporaryFile(suffix=".jsonl") as cf:
+        _monitor_tick([config], {"a": config}, provider_map, state, sf.name, cf.name)
+
+    mock_finish.assert_called_once()
+    assert mock_finish.call_args[0][5] == "completed"
+    assert job.exit_code == 0
+    assert job.idle_since is None  # no idle wait
+    assert mock_notify.call_args[0][1] == "job_complete"
+
+
+@patch("conductor.monitor.send_notification", return_value=False)
+@patch("conductor.monitor._start_unblocked_jobs")
+@patch("conductor.monitor._finish_job")
+@patch("conductor.monitor.fetch_log_tail", return_value="Traceback...\nRuntimeError: size mismatch")
+@patch("conductor.monitor.is_alive", return_value=ProcessStatus("exited", exit_code=1))
+def test_monitor_tick_nonzero_exit_fails_with_log_tail(mock_alive, mock_tail, mock_finish, mock_start, mock_notify):
+    import time as _time
+    job = PodState(name="a", status="running", started_at=_time.time() - 100,
+                   ssh_host="1.2.3.4", ssh_port=22222, pid=123, pod_id="pod123")
+    state = RunState(jobs=[job], budget_usd=40.0)
+    config = _make_config(name="a")
+    provider_map = _mock_provider_map([config])
+
+    with tempfile.NamedTemporaryFile(suffix=".json") as sf, \
+         tempfile.NamedTemporaryFile(suffix=".jsonl") as cf:
+        _monitor_tick([config], {"a": config}, provider_map, state, sf.name, cf.name)
+
+    mock_finish.assert_called_once()
+    assert mock_finish.call_args[0][5] == "failed"
+    error = mock_finish.call_args[1]["error"]
+    assert error.startswith("exit code 1")
+    assert "size mismatch" in error
+    assert job.exit_code == 1
+    mock_tail.assert_called_once_with(job, "/key", "/workspace/proj")
+    assert mock_notify.call_args[0][1] == "job_failed"
+
+
+@patch("conductor.monitor.send_notification", return_value=False)
+@patch("conductor.monitor._start_unblocked_jobs")
+@patch("conductor.monitor._finish_job")
+@patch("conductor.monitor.check_pod_exists", return_value=True)
+@patch("conductor.monitor.is_alive", return_value=ProcessStatus("exited", detail="process gone, no exit file"))
+def test_monitor_tick_no_exit_file_uses_idle_fallback(mock_alive, mock_exists, mock_finish, mock_start, mock_notify):
+    import time as _time
+    job = PodState(name="a", status="running", started_at=_time.time() - 100,
+                   ssh_host="1.2.3.4", ssh_port=22222, pid=123, pod_id="pod123")
+    state = RunState(jobs=[job], budget_usd=40.0)
+    config = _make_config(name="a", idle_timeout_minutes=10)
+    provider_map = _mock_provider_map([config])
+
+    with tempfile.NamedTemporaryFile(suffix=".json") as sf, \
+         tempfile.NamedTemporaryFile(suffix=".jsonl") as cf:
+        _monitor_tick([config], {"a": config}, provider_map, state, sf.name, cf.name)
+
+    assert job.idle_since is not None
+    mock_finish.assert_not_called()
+    assert job.exit_code is None
+
+
+def test_print_status_shows_exit_code(capsys):
+    from conductor.monitor import _print_status
+    state = RunState(jobs=[
+        PodState(name="a", status="failed", exit_code=1),
+        PodState(name="b", status="running"),
+    ])
+    _print_status(state)
+    out = capsys.readouterr().out
+    assert "Exit" in out
+    rows = [l for l in out.splitlines() if l.startswith("a ")]
+    assert rows and " 1 " in rows[0]

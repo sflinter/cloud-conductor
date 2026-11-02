@@ -185,3 +185,29 @@ def test_config_auto_discovery(tmp_dir, monkeypatch):
 
     args.config = "custom.toml"
     assert _resolve_config(args) == "custom.toml"
+
+
+def test_status_shows_exit_code_and_first_error_line(capsys, tmp_dir, monkeypatch):
+    from conductor.state import PodState, RunState, save_state
+    state_path = os.path.join(tmp_dir, "state.json")
+    config_path = os.path.join(tmp_dir, "jobs.toml")
+    with open(config_path, "w") as f:
+        f.write(f'''
+[[jobs]]
+name = "train"
+run_command = "echo hi"
+state_file = "{state_path}"
+''')
+    save_state(RunState(jobs=[
+        PodState(name="train", status="failed", exit_code=2,
+                 error="exit code 2\n--- last 50 log lines ---\nTraceback"),
+    ]), state_path)
+    monkeypatch.setattr("conductor.cli.reconcile_with_provider", lambda: [])
+
+    main(["status", "--config", config_path])
+    out = capsys.readouterr().out
+    assert "Exit" in out
+    row = [l for l in out.splitlines() if l.startswith("train")][0]
+    assert " 2 " in row
+    assert "exit code 2" in row
+    assert "Traceback" not in row

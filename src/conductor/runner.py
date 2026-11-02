@@ -3,11 +3,69 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import dataclass
 
 from conductor.ssh import ssh_exec, _ssh_base
 from conductor.state import PodState
 
 log = logging.getLogger(__name__)
+
+LOG_FILE = "conductor_job.log"
+PID_FILE = ".conductor_pid"
+START_FILE = ".conductor_pid_start"
+EXIT_FILE = ".conductor_exit"
+RUN_SCRIPT = ".conductor_run.sh"
+LAUNCH_SCRIPT = ".conductor_launch.sh"
+LOG_TAIL_LINES = 50
+
+
+@dataclass
+class LaunchResult:
+    pid: int
+    pid_start: str | None = None  # process start time, to detect pid reuse
+
+
+@dataclass
+class ProcessStatus:
+    """Tri-state result of a remote process check.
+
+    state is "running", "exited" (exit_code is None when the process is gone
+    but left no exit file) or "unknown" (SSH failed; nothing can be concluded)."""
+    state: str
+    exit_code: int | None = None
+    detail: str = ""
+
+    @property
+    def running(self) -> bool:
+        return self.state == "running"
+
+    @property
+    def exited(self) -> bool:
+        return self.state == "exited"
+
+    @property
+    def unknown(self) -> bool:
+        return self.state == "unknown"
+
+
+def _start_time_cmd(pid: str) -> str:
+    # Field 22 of /proc/<pid>/stat is the start time in clock ticks since boot.
+    # Strip everything up to the closing paren of the comm field first, so a
+    # command name containing spaces cannot shift the fields. Fall back to
+    # ps lstart (spaces replaced) on systems without /proc.
+    return (
+        f"s=$(sed 's/.*) //' /proc/{pid}/stat 2>/dev/null | awk '{{print $20}}'); "
+        f"[ -z \"$s\" ] && s=$(ps -o lstart= -p {pid} 2>/dev/null | tr -s ' ' | tr ' ' '_'); "
+        f"echo $s"
+    )
+
+
+def _paths(remote_dir: str) -> dict[str, str]:
+    d = remote_dir.rstrip("/")
+    return {
+        "log": f"{d}/{LOG_FILE}", "pid": f"{d}/{PID_FILE}", "start": f"{d}/{START_FILE}",
+        "exit": f"{d}/{EXIT_FILE}", "run": f"{d}/{RUN_SCRIPT}", "launch": f"{d}/{LAUNCH_SCRIPT}",
+    }
 
 
 def launch_direct(
@@ -17,38 +75,59 @@ def launch_direct(
     command: str,
     remote_dir: str = "/workspace/project",
     name: str = "pod",
-) -> int | None:
-    log_file = f"{remote_dir}/conductor_job.log"
-    pid_file = f"{remote_dir}/.conductor_pid"
-    script_file = f"{remote_dir}/.conductor_launch.sh"
+) -> LaunchResult | None:
+    p = _paths(remote_dir)
 
-    script = (
-        f"#!/bin/bash\n"
-        f"cd {remote_dir}\n"
-        f"( {command} ) > {log_file} 2>&1 < /dev/null &\n"
-        f"echo $! > {pid_file}\n"
+    # The user's command lives in its own script so arbitrary quoting is safe.
+    # The exit code is written to the exit file the moment the command ends.
+    run_script = (
+        "#!/bin/bash\n"
+        f"cd {remote_dir} && ( {command} )\n"
+        f"echo $? > {p['exit']}\n"
     )
-    write_result = ssh_exec(ssh_host, ssh_port, ssh_key_path,
-                            f"cat > {script_file} << 'CONDUCTOR_EOF'\n{script}CONDUCTOR_EOF")
+    # setsid + nohup detach the job from the SSH session; the pid and its
+    # start time are recorded so a later check can tell a reused pid apart.
+    # If a previous launch is still running, report it instead of starting twice.
+    launch_script = (
+        "#!/bin/bash\n"
+        f"cd {remote_dir} || exit 1\n"
+        f"if [ -f {p['pid']} ] && [ ! -f {p['exit']} ] && kill -0 \"$(cat {p['pid']})\" 2>/dev/null; then\n"
+        f"  echo \"$(cat {p['pid']}) $(cat {p['start']} 2>/dev/null)\"\n"
+        "  exit 0\n"
+        "fi\n"
+        f"rm -f {p['exit']}\n"
+        f"setsid nohup bash {p['run']} > {p['log']} 2>&1 < /dev/null &\n"
+        "pid=$!\n"
+        f"echo $pid > {p['pid']}\n"
+        f"start=$({_start_time_cmd('$pid')})\n"
+        f"echo \"$start\" > {p['start']}\n"
+        "echo \"$pid $start\"\n"
+    )
+    write_cmd = (
+        f"mkdir -p {remote_dir} && "
+        f"cat > {p['run']} << 'CONDUCTOR_EOF'\n{run_script}CONDUCTOR_EOF\n"
+        f"cat > {p['launch']} << 'CONDUCTOR_EOF'\n{launch_script}CONDUCTOR_EOF"
+    )
+    write_result = ssh_exec(ssh_host, ssh_port, ssh_key_path, write_cmd)
     if write_result.returncode != 0:
         log.error(f"[{name}] Failed to write launch script: {write_result.stderr}")
         return None
 
     log.info(f"[{name}] Launching job")
-    result = ssh_exec(ssh_host, ssh_port, ssh_key_path,
-                      f"bash {script_file} && cat {pid_file}", timeout=30)
+    result = ssh_exec(ssh_host, ssh_port, ssh_key_path, f"bash {p['launch']}", timeout=30)
     if result.returncode != 0:
         log.error(f"[{name}] Launch failed: {result.stderr}")
         return None
 
-    pid_str = result.stdout.strip()
+    parts = result.stdout.split()
     try:
-        pid = int(pid_str)
-        log.info(f"[{name}] Job launched with PID {pid}")
-        return pid
-    except ValueError:
-        log.error(f"[{name}] Could not parse PID from: {pid_str!r}")
+        pid = int(parts[0])
+    except (IndexError, ValueError):
+        log.error(f"[{name}] Could not parse PID from: {result.stdout!r}")
         return None
+    pid_start = parts[1] if len(parts) > 1 else None
+    log.info(f"[{name}] Job launched with PID {pid}" + (f" (start {pid_start})" if pid_start else ""))
+    return LaunchResult(pid=pid, pid_start=pid_start)
 
 
 def exec_foreground(
@@ -63,7 +142,7 @@ def exec_foreground(
     os.execvp("ssh", cmd)
 
 
-def launch(config, pod_state: PodState) -> int | None:
+def launch(config, pod_state: PodState) -> LaunchResult | None:
     from conductor.config import JobConfig
     cfg: JobConfig = config
     return launch_direct(
@@ -76,24 +155,68 @@ def launch(config, pod_state: PodState) -> int | None:
     )
 
 
-def is_alive(pod_state: PodState, key_path: str) -> bool | None:
-    """Check if job process is still running. Returns True/False or None if unreachable."""
-    if not pod_state.pid or not pod_state.ssh_host:
-        return False
+def is_alive(pod_state: PodState, key_path: str, remote_dir: str | None = None) -> ProcessStatus:
+    """Check the job process. Reads the exit file first (immediate, with a
+    real exit code), then falls back to the pid. SSH failure is "unknown"."""
+    if not pod_state.ssh_host:
+        return ProcessStatus("unknown", detail="no ssh host")
+    if not pod_state.pid and not remote_dir:
+        return ProcessStatus("unknown", detail="no pid recorded")
 
-    try:
-        result = ssh_exec(
-            pod_state.ssh_host, pod_state.ssh_port, key_path,
-            f"kill -0 {pod_state.pid} 2>/dev/null && echo alive || echo dead",
-            timeout=15,
+    exit_check = ""
+    if remote_dir:
+        exit_file = _paths(remote_dir)["exit"]
+        exit_check = f"if [ -f {exit_file} ]; then echo \"exited $(cat {exit_file})\"; el"
+
+    if pod_state.pid:
+        pid = pod_state.pid
+        pid_check = (
+            f"if kill -0 {pid} 2>/dev/null; then echo \"running $({_start_time_cmd(str(pid))})\"; "
+            f"else echo gone; fi"
         )
-    except Exception:
-        return None  # SSH unreachable
+    else:
+        pid_check = "if true; then echo nopid; fi"
 
+    cmd = exit_check + pid_check
+
+    result = ssh_exec(pod_state.ssh_host, pod_state.ssh_port, key_path, cmd, timeout=15)
     if result.returncode != 0:
-        return None
+        return ProcessStatus("unknown", detail=f"ssh failed: {result.stderr.strip() or result.returncode}")
 
-    return "alive" in result.stdout
+    return _parse_status(result.stdout, pod_state)
+
+
+def _parse_status(stdout: str, pod_state: PodState) -> ProcessStatus:
+    parts = stdout.split()
+    if not parts:
+        return ProcessStatus("unknown", detail="empty response")
+    word = parts[0]
+    if word == "exited":
+        try:
+            return ProcessStatus("exited", exit_code=int(parts[1]))
+        except (IndexError, ValueError):
+            return ProcessStatus("exited", detail="exit file unreadable")
+    if word == "running":
+        start = parts[1] if len(parts) > 1 else None
+        if start and pod_state.pid_start and start != pod_state.pid_start:
+            return ProcessStatus("exited", detail=f"pid {pod_state.pid} reused by another process")
+        return ProcessStatus("running")
+    if word == "gone":
+        return ProcessStatus("exited", detail="process gone, no exit file")
+    if word == "nopid":
+        return ProcessStatus("unknown", detail="no pid recorded")
+    return ProcessStatus("unknown", detail=f"unexpected response: {stdout.strip()!r}")
+
+
+def fetch_log_tail(pod_state: PodState, key_path: str, remote_dir: str, lines: int = LOG_TAIL_LINES) -> str:
+    if not pod_state.ssh_host:
+        return ""
+    log_file = _paths(remote_dir)["log"]
+    result = ssh_exec(pod_state.ssh_host, pod_state.ssh_port, key_path,
+                      f"tail -n {lines} {log_file} 2>/dev/null", timeout=30)
+    if result.returncode != 0:
+        return ""
+    return result.stdout.rstrip()
 
 
 def get_utilization(pod_state: PodState, key_path: str) -> dict | None:
@@ -105,11 +228,7 @@ def get_utilization(pod_state: PodState, key_path: str) -> dict | None:
         " --format=csv,noheader,nounits 2>/dev/null;"
         f" echo ---; ps -p {pod_state.pid} -o %cpu= 2>/dev/null"
     )
-    try:
-        result = ssh_exec(pod_state.ssh_host, pod_state.ssh_port, key_path, cmd, timeout=10)
-    except Exception:
-        return None
-
+    result = ssh_exec(pod_state.ssh_host, pod_state.ssh_port, key_path, cmd, timeout=10)
     if result.returncode != 0:
         return None
 
@@ -135,4 +254,4 @@ def get_utilization(pod_state: PodState, key_path: str) -> dict | None:
 
 
 def get_log_path(config) -> str:
-    return f"{config.remote_project_dir}/conductor_job.log"
+    return f"{config.remote_project_dir}/{LOG_FILE}"

@@ -102,7 +102,7 @@ The TOML config has a `[global]` section for defaults and `[[jobs]]` entries for
 | `sync_interval_minutes` | `5` | How often to sync during monitoring |
 | `budget_usd` | `0` | Global budget limit (0 = unlimited) |
 | `job_budget_usd` | `0` | Per-job budget limit |
-| `idle_timeout_minutes` | `10` | Teardown pod if process not running for this long |
+| `idle_timeout_minutes` | `5` | Fallback only: teardown if the process vanished without writing an exit file and stayed gone this long |
 | `stall_timeout_minutes` | `0` | Teardown if GPU util stays below threshold (0 = disabled) |
 | `stall_gpu_threshold` | `5` | GPU util % below which the job is considered stalled |
 | `keep_pod_alive` | `false` | Don't teardown on completion (for iterative dev) |
@@ -132,8 +132,8 @@ Provision → Deploy → Launch → Monitor → Teardown
 
 1. **Provision** — create RunPod pod, wait for SSH
 2. **Deploy** — rsync code + run setup command (or skip for prebuilt images)
-3. **Launch** — start `run_command` via nohup
-4. **Monitor** — poll process status, sync results, track costs, handle interruptions
+3. **Launch** — start `run_command` under `setsid nohup`; the exit code is written to `.conductor_exit` when it ends
+4. **Monitor** — poll the exit file and process, sync results, track costs, handle interruptions. Exit 0 completes the job at once; a non-zero exit fails it with the last 50 log lines in the error
 5. **Teardown** — terminate pod (final sync first)
 
 ## Job Dependencies
