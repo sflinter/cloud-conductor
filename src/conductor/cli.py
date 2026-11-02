@@ -371,7 +371,7 @@ def cmd_status(args):
             provider_cache[prov_name] = _configure_provider(prov_name)
         prov = provider_cache[prov_name]
         try:
-            if not prov.check_exists(job.pod_id):
+            if prov.check_exists(job.pod_id) is False:
                 job.status = "terminated"
         except Exception:
             pass

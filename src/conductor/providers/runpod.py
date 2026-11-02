@@ -67,14 +67,9 @@ class RunPodProvider:
                 time.sleep(5)
                 continue
 
-            runtime = pod.get("runtime")
-            if runtime and runtime.get("ports"):
-                for port_info in runtime["ports"]:
-                    if port_info.get("privatePort") == 22:
-                        host = port_info.get("ip")
-                        port = port_info.get("publicPort")
-                        if host and port:
-                            return (host, int(port))
+            ssh = self._pod_ssh(pod)
+            if ssh:
+                return ssh
 
             status = pod.get("desiredStatus", "")
             if status in ("EXITED", "TERMINATED"):
@@ -83,14 +78,35 @@ class RunPodProvider:
             time.sleep(5)
         return None
 
-    def check_exists(self, instance_id: str) -> bool:
+    def get_ssh_info(self, instance_id: str) -> tuple[str, int] | None:
         try:
             pod = runpod.get_pod(instance_id)
-            if pod and pod.get("desiredStatus") not in ("EXITED", "TERMINATED"):
-                return True
-        except Exception:
-            pass
-        return False
+        except Exception as e:
+            log.warning(f"Could not query pod {instance_id} for SSH info: {e}")
+            return None
+        return self._pod_ssh(pod) if pod else None
+
+    @staticmethod
+    def _pod_ssh(pod: dict) -> tuple[str, int] | None:
+        runtime = pod.get("runtime") or {}
+        for port_info in runtime.get("ports") or []:
+            if port_info.get("privatePort") == 22:
+                host = port_info.get("ip")
+                port = port_info.get("publicPort")
+                if host and port:
+                    return (host, int(port))
+        return None
+
+    def check_exists(self, instance_id: str) -> bool | None:
+        try:
+            pod = runpod.get_pod(instance_id)
+        except Exception as e:
+            log.warning(f"Could not check pod {instance_id}: {e}")
+            return None
+        if not isinstance(pod, dict):
+            # None/empty means the API no longer knows the pod
+            return False if pod is None else None
+        return pod.get("desiredStatus") not in ("EXITED", "TERMINATED")
 
     def terminate(self, instance_id: str) -> bool:
         try:

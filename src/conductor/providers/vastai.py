@@ -134,16 +134,36 @@ class VastaiProvider:
             time.sleep(5)
         return None
 
-    def check_exists(self, instance_id: str) -> bool:
+    def _find_instance(self, instance_id: str) -> dict | None:
+        """The raw instance record, or None if the API does not list it.
+        Raises on any transport/JSON error."""
+        resp = self._req("GET", "/instances", params={"owner": "me"})
+        resp.raise_for_status()
+        for inst in resp.json().get("instances", []):
+            if str(inst.get("id")) == str(instance_id):
+                return inst
+        return None
+
+    def get_ssh_info(self, instance_id: str) -> tuple[str, int] | None:
         try:
-            resp = self._req("GET", "/instances", params={"owner": "me"})
-            resp.raise_for_status()
-            for inst in resp.json().get("instances", []):
-                if str(inst.get("id")) == str(instance_id):
-                    return inst.get("actual_status") not in ("exited", "error", None)
-        except Exception:
-            pass
-        return False
+            inst = self._find_instance(instance_id)
+        except Exception as e:
+            log.warning(f"Could not query vast.ai instance {instance_id} for SSH info: {e}")
+            return None
+        if not inst:
+            return None
+        host, port = self._extract_ssh(inst)
+        return (host, port) if host and port else None
+
+    def check_exists(self, instance_id: str) -> bool | None:
+        try:
+            inst = self._find_instance(instance_id)
+        except Exception as e:
+            log.warning(f"Could not check vast.ai instance {instance_id}: {e}")
+            return None
+        if inst is None:
+            return False
+        return inst.get("actual_status") not in ("exited", "error")
 
     def terminate(self, instance_id: str) -> bool:
         try:

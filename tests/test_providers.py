@@ -30,3 +30,77 @@ def test_runpod_catalog_error_is_conductor_error(mock_runpod):
     mock_runpod.get_gpus.side_effect = runpod_error.QueryError("502")
     with pytest.raises(ConductorError):
         RunPodProvider().get_gpu_catalog()
+
+
+@patch("conductor.providers.runpod.runpod")
+def test_runpod_check_exists_tri_state(mock_runpod):
+    provider = RunPodProvider()
+    mock_runpod.get_pod.return_value = {"id": "p", "desiredStatus": "RUNNING"}
+    assert provider.check_exists("p") is True
+    mock_runpod.get_pod.return_value = {"id": "p", "desiredStatus": "EXITED"}
+    assert provider.check_exists("p") is False
+    mock_runpod.get_pod.return_value = None
+    assert provider.check_exists("p") is False
+    mock_runpod.get_pod.side_effect = RuntimeError("502 Bad Gateway")
+    assert provider.check_exists("p") is None
+    mock_runpod.get_pod.side_effect = ValueError("Expecting value: line 1 column 1")  # non-JSON body
+    assert provider.check_exists("p") is None
+
+
+@patch("conductor.providers.runpod.runpod")
+def test_runpod_get_ssh_info(mock_runpod):
+    provider = RunPodProvider()
+    mock_runpod.get_pod.return_value = {
+        "runtime": {"ports": [{"privatePort": 22, "ip": "1.2.3.4", "publicPort": "22222"}]},
+    }
+    assert provider.get_ssh_info("p") == ("1.2.3.4", 22222)
+    mock_runpod.get_pod.return_value = {"runtime": None}
+    assert provider.get_ssh_info("p") is None
+    mock_runpod.get_pod.side_effect = RuntimeError("down")
+    assert provider.get_ssh_info("p") is None
+
+
+def _vast_response(payload=None, status=200, raise_json=False):
+    resp = MagicMock()
+    resp.status_code = status
+    if status >= 400:
+        import httpx
+        resp.raise_for_status.side_effect = httpx.HTTPStatusError(
+            "err", request=MagicMock(), response=MagicMock(status_code=status))
+    if raise_json:
+        import json
+        resp.json.side_effect = json.JSONDecodeError("bad", "<html>", 0)
+    else:
+        resp.json.return_value = payload
+    return resp
+
+
+def test_vastai_check_exists_tri_state():
+    from conductor.providers.vastai import VastaiProvider
+    provider = VastaiProvider()
+    provider.configure("key")
+    with patch.object(provider, "_req") as req:
+        req.return_value = _vast_response({"instances": [{"id": 42, "actual_status": "running"}]})
+        assert provider.check_exists("42") is True
+        req.return_value = _vast_response({"instances": [{"id": 42, "actual_status": "exited"}]})
+        assert provider.check_exists("42") is False
+        req.return_value = _vast_response({"instances": []})
+        assert provider.check_exists("42") is False
+        req.return_value = _vast_response(status=502)
+        assert provider.check_exists("42") is None
+        req.return_value = _vast_response(raise_json=True)
+        assert provider.check_exists("42") is None
+        req.side_effect = OSError("network unreachable")
+        assert provider.check_exists("42") is None
+
+
+def test_vastai_get_ssh_info():
+    from conductor.providers.vastai import VastaiProvider
+    provider = VastaiProvider()
+    with patch.object(provider, "_req") as req:
+        req.return_value = _vast_response({"instances": [
+            {"id": 42, "actual_status": "running", "ssh_host": "ssh.vast.ai", "ssh_port": 1234},
+        ]})
+        assert provider.get_ssh_info("42") == ("ssh.vast.ai", 1234)
+        req.return_value = _vast_response(status=500)
+        assert provider.get_ssh_info("42") is None

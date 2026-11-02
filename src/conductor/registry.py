@@ -137,6 +137,8 @@ def reconcile_with_provider() -> list[PodRecord]:
             exists = prov.check_exists(p.pod_id)
         except Exception:
             continue
+        if exists is None:
+            continue  # could not tell; leave the record alone
         if exists and p.status == "terminated":
             p.status = "running"
             changed = True

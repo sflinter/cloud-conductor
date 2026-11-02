@@ -132,3 +132,23 @@ def test_atomic_write(tmp_dir, monkeypatch):
     save_registry([PodRecord(pod_id="x", name="test")])
     files = [f for f in os.listdir(tmp_dir) if not f.startswith(".")]
     assert files == ["pods.json"]
+
+
+def test_reconcile_ignores_unknown_existence(tmp_dir, monkeypatch):
+    from unittest.mock import MagicMock
+    from conductor.registry import reconcile_with_provider
+    reg_file = os.path.join(tmp_dir, "pods.json")
+    monkeypatch.setattr("conductor.registry.REGISTRY_DIR", tmp_dir)
+    monkeypatch.setattr("conductor.registry.REGISTRY_FILE", reg_file)
+    add_pod(PodRecord(pod_id="a", name="unknown-pod", status="running"))
+    add_pod(PodRecord(pod_id="b", name="gone-pod", status="running"))
+    add_pod(PodRecord(pod_id="c", name="back-pod", status="terminated"))
+
+    prov = MagicMock()
+    prov.check_exists.side_effect = lambda pid: {"a": None, "b": False, "c": True}[pid]
+    monkeypatch.setattr("conductor.providers.get_configured_provider", lambda name: prov)
+
+    pods = {p.pod_id: p for p in reconcile_with_provider()}
+    assert pods["a"].status == "running"      # None: left alone
+    assert pods["b"].status == "terminated"
+    assert pods["c"].status == "running"

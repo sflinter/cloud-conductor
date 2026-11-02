@@ -22,6 +22,7 @@ class PodState:
     idle_since: float | None = None
     stalled_since: float | None = None
     provision_attempts: int = 0
+    gone_confirmations: int = 0    # consecutive ticks the provider reported the pod gone
     cost_usd: float = 0.0
     job_budget_usd: float = 0.0
     depends_on: list[str] = field(default_factory=list)

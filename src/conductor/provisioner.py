@@ -74,8 +74,12 @@ def provision_pod(provider: CloudProvider, config, pod_state: PodState) -> PodSt
     cfg: JobConfig = config
 
     if cfg.keep_pod_alive and pod_state.pod_id:
-        if check_pod_exists(provider, pod_state.pod_id):
+        if check_pod_exists(provider, pod_state.pod_id) is True:
             log.info(f"[{cfg.name}] Reusing existing pod {pod_state.pod_id}")
+            # Ports can be remapped between runs: always re-read SSH info
+            if not refresh_ssh_info(provider, pod_state):
+                log.warning(f"[{cfg.name}] Could not refresh SSH info for {pod_state.pod_id}, "
+                            f"keeping {pod_state.ssh_host}:{pod_state.ssh_port}")
             return pod_state
 
     try:
@@ -140,8 +144,32 @@ def _get_gpu_candidates(provider: CloudProvider, config) -> list[str]:
         return candidates
 
 
-def check_pod_exists(provider: CloudProvider, pod_id: str) -> bool:
-    return provider.check_exists(pod_id)
+def check_pod_exists(provider: CloudProvider, pod_id: str) -> bool | None:
+    """True/False from the provider, None if it could not be determined."""
+    try:
+        return provider.check_exists(pod_id)
+    except Exception as e:
+        log.warning(f"check_exists({pod_id}) raised: {e}")
+        return None
+
+
+def refresh_ssh_info(provider: CloudProvider, pod_state: PodState) -> bool:
+    """Re-read host/port from the provider. Returns True if updated."""
+    if not pod_state.pod_id:
+        return False
+    try:
+        info = provider.get_ssh_info(pod_state.pod_id)
+    except Exception as e:
+        log.warning(f"[{pod_state.name}] get_ssh_info failed: {e}")
+        return False
+    if not isinstance(info, (tuple, list)) or len(info) != 2 or not info[0] or not info[1]:
+        return False
+    host, port = info[0], int(info[1])
+    if (host, port) != (pod_state.ssh_host, pod_state.ssh_port):
+        log.info(f"[{pod_state.name}] SSH endpoint changed: "
+                 f"{pod_state.ssh_host}:{pod_state.ssh_port} → {host}:{port}")
+    pod_state.ssh_host, pod_state.ssh_port = host, port
+    return True
 
 
 def teardown_pod(provider: CloudProvider, pod_id: str) -> bool:

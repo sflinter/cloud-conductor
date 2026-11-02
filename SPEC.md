@@ -216,6 +216,7 @@ cost_per_hour_override = 0.0          # 0 = auto-detect from RunPod API
 # Spot recovery
 max_provision_attempts = 5
 backoff_base_seconds = 30
+recovery_confirmations = 3            # consecutive polls reporting the pod gone before re-provisioning
 
 # Pod reuse
 keep_pod_alive = false                # true = don't teardown on completion, keep for re-launch
@@ -324,6 +325,7 @@ PYTHONUNBUFFERED=1 .venv/bin/python scripts/eval_with_search.py \
       "last_sync_at": 1709149501.2,
       "idle_since": null,
       "provision_attempts": 1,
+      "gone_confirmations": 0,
       "cost_usd": 0.27,
       "job_budget_usd": 5.00,
       "pid": 4242,
@@ -417,7 +419,7 @@ When reusing a pod (`keep_pod_alive`), rsync mode re-syncs code (fast incrementa
 2. If running and sync interval elapsed, trigger sync
 3. If the exit file exists: exit 0 → `completed` immediately; non-zero → `failed` immediately with the exit code and the last 50 log lines in `error`
 4. If the process vanished without an exit file (pod restarted, pid reused, killed): if the pod still exists, start the idle timer and mark `completed` after `idle_timeout_minutes`; if the pod is gone → spot interruption
-5. SSH unreachable → check the pod with the provider; pod gone → spot interruption
+5. SSH unreachable → check the pod with the provider (tri-state). Pod alive → refresh SSH host/port from the API. Pod reported gone on `recovery_confirmations` consecutive polls → spot interruption. API error → nothing concluded
 6. On spot interruption: teardown dead pod, backoff, re-provision, re-deploy, push synced results back, re-launch with same command (should resume via `--resume` or equivalent in the user's command)
 7. On completion: final sync, teardown pod (unless `keep_pod_alive`), send notification
 8. On failure: sync logs, teardown pod, send notification
@@ -491,7 +493,9 @@ Minimal:
 | Process exits with code 0 | Immediately: final sync, mark as `completed`, terminate pod, notify |
 | Process exits with non-zero code | Immediately: final sync, mark as `failed` with the exit code and last 50 log lines in `error`, terminate pod, notify |
 | Process vanishes without an exit file | Idle timer; `completed` after `idle_timeout_minutes` if the pod still exists |
-| Spot interruption (pod evicted) | Automatic recovery: re-provision → re-deploy → push synced results → re-launch. Notify. |
+| Spot interruption (pod evicted) | Only after the provider reports the pod exited or missing, without an API error, on `recovery_confirmations` consecutive polls. Then automatic recovery: re-provision → re-deploy → push synced results → re-launch. Notify. |
+| SSH unreachable but pod exists | Not an interruption. SSH host/port are refreshed from the provider API and the job is re-checked next poll. |
+| Provider API error / non-JSON response | `check_exists()` returns `None`: nothing is concluded, the poll is retried. Never triggers recovery. |
 | Max provision attempts exceeded | Mark job as `failed`, stop retrying, notify |
 | Per-job budget exceeded | Final sync, teardown that pod, mark as `failed`, notify |
 | GPU stall (process alive, GPU idle) | Final sync, teardown pod, mark as `failed`, notify |

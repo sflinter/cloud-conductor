@@ -72,6 +72,7 @@ class JobConfig:
     # Spot recovery
     max_provision_attempts: int = 5
     backoff_base_seconds: int = 30
+    recovery_confirmations: int = 3       # consecutive "pod gone" ticks before recovering
 
     # Pod reuse
     keep_pod_alive: bool = False

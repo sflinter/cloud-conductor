@@ -105,6 +105,7 @@ The TOML config has a `[global]` section for defaults and `[[jobs]]` entries for
 | `idle_timeout_minutes` | `5` | Fallback only: teardown if the process vanished without writing an exit file and stayed gone this long |
 | `stall_timeout_minutes` | `0` | Teardown if GPU util stays below threshold (0 = disabled) |
 | `stall_gpu_threshold` | `5` | GPU util % below which the job is considered stalled |
+| `recovery_confirmations` | `3` | Consecutive ticks the provider must report a pod gone before spot recovery starts |
 | `keep_pod_alive` | `false` | Don't teardown on completion (for iterative dev) |
 | `teardown_on_crash` | `false` | If the orchestrator process itself dies, tear down all live pods (default: leave them and print their IDs) |
 | `depends_on` | `[]` | Job names that must complete before this job starts |

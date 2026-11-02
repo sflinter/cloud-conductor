@@ -26,7 +26,15 @@ class CloudProvider(Protocol):
         """Poll until SSH is ready. Returns (host, port) or None."""
         ...
 
-    def check_exists(self, instance_id: str) -> bool: ...
+    def get_ssh_info(self, instance_id: str) -> tuple[str, int] | None:
+        """Single query for the current (host, port); None if not available."""
+        ...
+
+    def check_exists(self, instance_id: str) -> bool | None:
+        """True if the instance is alive, False if the provider reports it
+        exited or missing, None if the answer could not be obtained
+        (exception, non-JSON body). Callers must not treat None as False."""
+        ...
 
     def terminate(self, instance_id: str) -> bool: ...
 

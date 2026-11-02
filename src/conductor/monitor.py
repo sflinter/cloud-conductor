@@ -14,7 +14,7 @@ from conductor.deployer import deploy
 from conductor.errors import ConductorError, describe
 from conductor.notify import send_notification
 from conductor.providers import CloudProvider, get_provider
-from conductor.provisioner import check_pod_exists, provision_pod, teardown_pod
+from conductor.provisioner import check_pod_exists, provision_pod, refresh_ssh_info, teardown_pod
 from conductor.registry import PodRecord, add_pod as registry_add, update_pod as registry_update
 from conductor.runner import LOG_TAIL_LINES, fetch_log_tail, get_log_path, get_utilization, is_alive, launch
 from conductor.state import (
@@ -220,6 +220,7 @@ def _tick_job(
 
     if status.running:
         job.idle_since = None
+        job.gone_confirmations = 0
 
         # GPU stall detection
         if config.stall_timeout_minutes > 0:
@@ -249,7 +250,9 @@ def _tick_job(
     elif status.exited:
         # Process gone without an exit file (killed, container restarted, pid
         # reused). Fall back to the idle timer if the pod is still there.
-        if job.pod_id and check_pod_exists(prov, job.pod_id):
+        exists = check_pod_exists(prov, job.pod_id) if job.pod_id else False
+        if exists is True:
+            job.gone_confirmations = 0
             if job.idle_since is None:
                 job.idle_since = time.time()
                 log.warning(f"[{job.name}] Process not running ({status.detail}), starting idle timer")
@@ -259,18 +262,45 @@ def _tick_job(
                 send_notification(config.notifications, "job_complete",
                                   job=job.name, cost_usd=job.cost_usd,
                                   gpu_type=job.gpu_type)
-        else:
-            # Pod gone — spot interruption
+        elif _pod_gone_confirmed(job, config, exists):
             log.warning(f"[{job.name}] Spot interruption detected")
             send_notification(config.notifications, "spot_recovery", job=job.name)
             _spot_recover(prov, job, config, state, state_path, cost_log_path)
     elif status.unknown:
-        # SSH unreachable — likely spot interruption
+        # SSH unreachable. Only a provider answer of "gone" on several
+        # consecutive ticks means a spot interruption; an API error or a
+        # live pod with a dead SSH link is not one.
         log.info(f"[{job.name}] Process state unknown ({status.detail})")
-        if job.pod_id and not check_pod_exists(prov, job.pod_id):
+        exists = check_pod_exists(prov, job.pod_id) if job.pod_id else None
+        if exists is True:
+            job.gone_confirmations = 0
+            # The port may have been remapped: refresh before the next tick
+            if refresh_ssh_info(prov, job):
+                log.info(f"[{job.name}] Pod alive; SSH info refreshed to "
+                         f"{job.ssh_host}:{job.ssh_port}")
+        elif _pod_gone_confirmed(job, config, exists):
             log.warning(f"[{job.name}] Pod gone (spot interruption)")
             send_notification(config.notifications, "spot_recovery", job=job.name)
             _spot_recover(prov, job, config, state, state_path, cost_log_path)
+
+
+def _pod_gone_confirmed(job: PodState, config: JobConfig, exists: bool | None) -> bool:
+    """Count consecutive provider answers of 'pod gone'. None (could not
+    tell) neither counts nor resets."""
+    if exists is None:
+        log.warning(f"[{job.name}] Could not determine whether pod {job.pod_id} exists; "
+                    f"will retry next tick")
+        return False
+    if exists:
+        job.gone_confirmations = 0
+        return False
+    job.gone_confirmations += 1
+    needed = max(1, config.recovery_confirmations)
+    if job.gone_confirmations < needed:
+        log.warning(f"[{job.name}] Provider reports pod {job.pod_id} gone "
+                    f"({job.gone_confirmations}/{needed} confirmations)")
+        return False
+    return True
 
 
 def _handle_exit(
@@ -515,6 +545,8 @@ def _spot_recover(
     job.ssh_host = None
     job.ssh_port = None
     job.pid = None
+    job.pid_start = None
+    job.gone_confirmations = 0
 
     # Re-provision, re-deploy, push synced results, re-launch
     _provision_deploy_launch(provider, job, config, state, state_path, cost_log_path)

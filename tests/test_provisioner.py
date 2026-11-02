@@ -119,3 +119,52 @@ def test_provision_catalog_error_fails_job(mock_select):
     assert result.status == "failed"
     assert "GPU catalog" in result.error
     provider.create_instance.assert_not_called()
+
+
+@patch("conductor.provisioner.check_pod_exists", return_value=True)
+def test_pod_reuse_refreshes_ssh_info(mock_exists):
+    provider = _mock_provider()
+    provider.get_ssh_info.return_value = ("9.9.9.9", 44444)
+    config = _make_config(keep_pod_alive=True)
+    pod = _make_pod(pod_id="existing123", ssh_host="1.2.3.4", ssh_port=22222)
+    result = provision_pod(provider, config, pod)
+    assert result.pod_id == "existing123"
+    assert (result.ssh_host, result.ssh_port) == ("9.9.9.9", 44444)
+    provider.get_ssh_info.assert_called_once_with("existing123")
+
+
+@patch("conductor.provisioner.wait_ssh", return_value=True)
+@patch("conductor.provisioner.check_pod_exists", return_value=None)
+def test_pod_reuse_unknown_existence_provisions_fresh(mock_exists, mock_ssh):
+    # None (API error) must not be treated as "pod exists"
+    provider = _mock_provider()
+    provider.create_instance.return_value = {"id": "newpod", "cost_per_hour": 0.1}
+    provider.wait_for_ssh.return_value = ("1.1.1.1", 1)
+    config = _make_config(keep_pod_alive=True)
+    pod = _make_pod(pod_id="old", ssh_host="1.2.3.4", ssh_port=22222)
+    result = provision_pod(provider, config, pod)
+    assert result.pod_id == "newpod"
+
+
+def test_check_pod_exists_tri_state():
+    provider = _mock_provider()
+    provider.check_exists.return_value = None
+    assert check_pod_exists(provider, "pod123") is None
+    provider.check_exists.side_effect = RuntimeError("boom")
+    assert check_pod_exists(provider, "pod123") is None
+
+
+def test_refresh_ssh_info():
+    from conductor.provisioner import refresh_ssh_info
+    provider = _mock_provider()
+    pod = _make_pod(pod_id="p", ssh_host="old", ssh_port=1)
+    provider.get_ssh_info.return_value = None
+    assert refresh_ssh_info(provider, pod) is False
+    assert pod.ssh_host == "old"
+    provider.get_ssh_info.side_effect = RuntimeError("api down")
+    assert refresh_ssh_info(provider, pod) is False
+    provider.get_ssh_info.side_effect = None
+    provider.get_ssh_info.return_value = ("new", "2")
+    assert refresh_ssh_info(provider, pod) is True
+    assert (pod.ssh_host, pod.ssh_port) == ("new", 2)
+    assert refresh_ssh_info(provider, _make_pod()) is False  # no pod_id

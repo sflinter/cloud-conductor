@@ -378,3 +378,112 @@ def test_print_status_shows_exit_code(capsys):
     assert "Exit" in out
     rows = [l for l in out.splitlines() if l.startswith("a ")]
     assert rows and " 1 " in rows[0]
+
+
+def _unknown_job():
+    import time as _time
+    return PodState(name="a", status="running", started_at=_time.time() - 100,
+                    ssh_host="1.2.3.4", ssh_port=22222, pid=123, pod_id="pod123")
+
+
+@patch("conductor.monitor.send_notification", return_value=False)
+@patch("conductor.monitor._start_unblocked_jobs")
+@patch("conductor.monitor._spot_recover")
+@patch("conductor.monitor.check_pod_exists", return_value=False)
+@patch("conductor.monitor.is_alive", return_value=ProcessStatus("unknown", detail="ssh failed"))
+def test_monitor_tick_requires_consecutive_confirmations(mock_alive, mock_exists, mock_recover, mock_start, mock_notify):
+    job = _unknown_job()
+    state = RunState(jobs=[job], budget_usd=40.0)
+    config = _make_config(name="a", recovery_confirmations=3)
+    provider_map = _mock_provider_map([config])
+
+    with tempfile.NamedTemporaryFile(suffix=".json") as sf, \
+         tempfile.NamedTemporaryFile(suffix=".jsonl") as cf:
+        for expected in (1, 2):
+            _monitor_tick([config], {"a": config}, provider_map, state, sf.name, cf.name)
+            assert job.gone_confirmations == expected
+            mock_recover.assert_not_called()
+        _monitor_tick([config], {"a": config}, provider_map, state, sf.name, cf.name)
+        mock_recover.assert_called_once()
+        assert mock_notify.call_args[0][1] == "spot_recovery"
+
+
+@patch("conductor.monitor.send_notification", return_value=False)
+@patch("conductor.monitor._start_unblocked_jobs")
+@patch("conductor.monitor._spot_recover")
+@patch("conductor.monitor.check_pod_exists", return_value=None)
+@patch("conductor.monitor.is_alive", return_value=ProcessStatus("unknown", detail="ssh failed"))
+def test_monitor_tick_api_error_never_recovers(mock_alive, mock_exists, mock_recover, mock_start, mock_notify):
+    job = _unknown_job()
+    state = RunState(jobs=[job], budget_usd=40.0)
+    config = _make_config(name="a", recovery_confirmations=1)
+    provider_map = _mock_provider_map([config])
+
+    with tempfile.NamedTemporaryFile(suffix=".json") as sf, \
+         tempfile.NamedTemporaryFile(suffix=".jsonl") as cf:
+        for _ in range(5):
+            _monitor_tick([config], {"a": config}, provider_map, state, sf.name, cf.name)
+    mock_recover.assert_not_called()
+    assert job.gone_confirmations == 0
+    assert job.status == "running"
+
+
+@patch("conductor.monitor.send_notification", return_value=False)
+@patch("conductor.monitor._start_unblocked_jobs")
+@patch("conductor.monitor._spot_recover")
+@patch("conductor.monitor.check_pod_exists")
+@patch("conductor.monitor.is_alive", return_value=ProcessStatus("unknown", detail="ssh failed"))
+def test_monitor_tick_transient_gone_resets_counter(mock_alive, mock_exists, mock_recover, mock_start, mock_notify):
+    job = _unknown_job()
+    state = RunState(jobs=[job], budget_usd=40.0)
+    config = _make_config(name="a", recovery_confirmations=3)
+    provider_map = _mock_provider_map([config])
+    provider_map["a"].get_ssh_info.return_value = ("1.2.3.4", 22222)
+    mock_exists.side_effect = [False, False, True, False, False]
+
+    with tempfile.NamedTemporaryFile(suffix=".json") as sf, \
+         tempfile.NamedTemporaryFile(suffix=".jsonl") as cf:
+        for _ in range(5):
+            _monitor_tick([config], {"a": config}, provider_map, state, sf.name, cf.name)
+    mock_recover.assert_not_called()
+    assert job.gone_confirmations == 2
+
+
+@patch("conductor.monitor.send_notification", return_value=False)
+@patch("conductor.monitor._start_unblocked_jobs")
+@patch("conductor.monitor._spot_recover")
+@patch("conductor.monitor.check_pod_exists", return_value=True)
+@patch("conductor.monitor.is_alive", return_value=ProcessStatus("unknown", detail="ssh failed"))
+def test_monitor_tick_refreshes_ssh_when_pod_alive(mock_alive, mock_exists, mock_recover, mock_start, mock_notify):
+    job = _unknown_job()
+    state = RunState(jobs=[job], budget_usd=40.0)
+    config = _make_config(name="a")
+    provider_map = _mock_provider_map([config])
+    provider_map["a"].get_ssh_info.return_value = ("5.6.7.8", 33333)
+
+    with tempfile.NamedTemporaryFile(suffix=".json") as sf, \
+         tempfile.NamedTemporaryFile(suffix=".jsonl") as cf:
+        _monitor_tick([config], {"a": config}, provider_map, state, sf.name, cf.name)
+    assert (job.ssh_host, job.ssh_port) == ("5.6.7.8", 33333)
+    assert job.status == "running"
+    mock_recover.assert_not_called()
+
+
+@patch("conductor.monitor.send_notification", return_value=False)
+@patch("conductor.monitor._start_unblocked_jobs")
+@patch("conductor.monitor._spot_recover")
+@patch("conductor.monitor.check_pod_exists", return_value=False)
+@patch("conductor.monitor.is_alive", return_value=ProcessStatus("exited", detail="gone"))
+def test_monitor_tick_process_gone_pod_gone_needs_confirmation(mock_alive, mock_exists, mock_recover, mock_start, mock_notify):
+    job = _unknown_job()
+    state = RunState(jobs=[job], budget_usd=40.0)
+    config = _make_config(name="a", recovery_confirmations=2)
+    provider_map = _mock_provider_map([config])
+
+    with tempfile.NamedTemporaryFile(suffix=".json") as sf, \
+         tempfile.NamedTemporaryFile(suffix=".jsonl") as cf:
+        _monitor_tick([config], {"a": config}, provider_map, state, sf.name, cf.name)
+        mock_recover.assert_not_called()
+        assert job.idle_since is None  # pod is not "alive", so no idle timer either
+        _monitor_tick([config], {"a": config}, provider_map, state, sf.name, cf.name)
+        mock_recover.assert_called_once()
