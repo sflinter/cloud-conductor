@@ -102,7 +102,7 @@ The TOML config has a `[global]` section for defaults and `[[jobs]]` entries for
 | `setup_timeout_seconds` | `1800` | Max time for `setup_command` before the job is marked failed |
 | `deploy_timeout_seconds` | `600` | Max time for each deploy rsync |
 | `sync_timeout_seconds` | `600` | Max time for each result-sync rsync |
-| `sync_paths` | `[]` | `[{remote, local}]` pairs to sync periodically |
+| `sync_paths` | `[]` | `[{remote, local, optional?}]` pairs to sync periodically. A remote path missing on the pod is nothing to sync (not a failure); a transfer failure fails the sync unless `optional = true` |
 | `sync_interval_minutes` | `5` | How often to sync during monitoring |
 | `budget_usd` | `0` | Global budget limit (0 = unlimited) |
 | `job_budget_usd` | `0` | Per-job budget limit |
@@ -112,6 +112,7 @@ The TOML config has a `[global]` section for defaults and `[[jobs]]` entries for
 | `recovery_confirmations` | `3` | Consecutive ticks the provider must report a pod gone before spot recovery starts |
 | `provision_retries` | `3` | Passes over the GPU candidate list when none has capacity right now, with jittered backoff between passes |
 | `keep_pod_alive` | `false` | Don't teardown on completion (for iterative dev) |
+| `keep_pod_on_failure` | `false` | Keep the pod of a *failed* job whose final sync also failed (default: tear it down and record the sync failure in `job.error`) |
 | `teardown_on_crash` | `false` | If the orchestrator process itself dies, tear down all live pods (default: leave them and print their IDs) |
 | `depends_on` | `[]` | Job names that must complete before this job starts |
 
@@ -156,7 +157,7 @@ Provision → Deploy → Launch → Monitor → Teardown
 2. **Deploy** — rsync code + run setup command (or skip for prebuilt images)
 3. **Launch** — start `run_command` under `setsid nohup`; the exit code is written to `.conductor_exit` when it ends
 4. **Monitor** — poll the exit file and process, sync results, track costs, handle interruptions. Exit 0 completes the job at once; a non-zero exit fails it with the last 50 log lines in the error
-5. **Teardown** — final sync (retried; if it keeps failing the pod is kept alive and the job marked `sync_failed`), then terminate and verify with the provider that the pod is gone
+5. **Teardown** — final sync (retried; if it keeps failing after a successful job the pod is kept alive and the job marked `sync_failed`; a failed job is torn down regardless unless `keep_pod_on_failure = true`), then terminate and verify with the provider that the pod is gone
 
 ## Job Dependencies
 

@@ -228,3 +228,28 @@ provision_retries = 1
     cfgs = load_config(path)
     assert cfgs[0].provision_retries == 5 and cfgs[1].provision_retries == 1
     assert JobConfig(name="x", run_command="y").provision_retries == 3
+
+
+def test_sync_path_optional_and_keep_pod_on_failure(tmp_dir):
+    path = os.path.join(tmp_dir, "jobs.toml")
+    with open(path, "w") as f:
+        f.write('''
+[global]
+sync_paths = [
+    { remote = "output/", local = "./results/" },
+    { remote = "profile.json", local = "./results/", optional = true },
+]
+
+[[jobs]]
+name = "a"
+run_command = "echo hi"
+
+[[jobs]]
+name = "b"
+run_command = "echo hi"
+keep_pod_on_failure = true
+''')
+    configs = load_config(path)
+    assert [sp.optional for sp in configs[0].sync_paths] == [False, True]
+    assert configs[0].keep_pod_on_failure is False
+    assert configs[1].keep_pod_on_failure is True

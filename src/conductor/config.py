@@ -10,6 +10,10 @@ from dataclasses import dataclass, field
 class SyncPath:
     remote: str
     local: str
+    # True: any failure to sync this entry is logged and ignored. False (the
+    # default): a source missing on the pod is "nothing to sync", but a
+    # transfer failure of an existing source fails the sync.
+    optional: bool = False
 
 
 @dataclass
@@ -79,6 +83,10 @@ class JobConfig:
     # Pod reuse
     keep_pod_alive: bool = False
 
+    # A job that failed (non-zero exit, stall, ...) is always torn down,
+    # even if its final sync failed, unless this is set
+    keep_pod_on_failure: bool = False
+
     # Crash handling: tear down every live pod if the orchestrator itself dies
     teardown_on_crash: bool = False
 
@@ -107,7 +115,8 @@ _ALL_FIELDS = {f.name for f in JobConfig.__dataclass_fields__.values()}
 
 
 def _parse_sync_paths(raw: list[dict]) -> list[SyncPath]:
-    return [SyncPath(remote=sp["remote"], local=sp["local"]) for sp in raw]
+    return [SyncPath(remote=sp["remote"], local=sp["local"], optional=bool(sp.get("optional", False)))
+            for sp in raw]
 
 
 def _parse_notifications(raw: dict) -> NotificationConfig:

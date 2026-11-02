@@ -77,7 +77,7 @@ Intentionally minimal:
 - Job completion comes from the remote exit file, immediately and with the real exit code; `idle_timeout_minutes` is only the fallback when the process vanished without one
 - Ctrl-C detaches (pods keep running, `conductor run` resumes), also mid-provisioning: waits poll the shutdown flag and the pipeline stops without marking anything failed; `--teardown-on-interrupt` is the destructive variant. One live orchestrator per state file, enforced by the heartbeat thread; `teardown`/`sync` refuse while a run is live unless `--force`
 - Every command that releases a pod records it: registry status, a `pod_stopped` cost event and the job outcome in state (`conductor teardown` writes reason `manual_teardown`, error "torn down manually"). Cost accrues from pod creation in every live state, not only while `running`
-- The final sync is retried and, if it keeps failing, the pod is kept alive and the job marked `sync_failed` rather than losing results; budget stops still force the teardown
+- The final sync is retried and, if it keeps failing after a successful job, the pod is kept alive and the job marked `sync_failed` rather than losing results; a job that failed is torn down anyway (sync failure noted in `job.error`) unless `keep_pod_on_failure = true`; budget stops still force the teardown. A `sync_paths` source missing on the pod is "nothing to sync", not a failure; `optional = true` entries never fail a sync
 - On any abnormal exit, every live pod ID is printed with its job; pods are torn down on a crash only when `teardown_on_crash = true`
 - `run_command` is an opaque user-supplied shell string — the conductor never parses it
 - Per-job overrides: any `[global]` config field can be overridden in a `[[jobs]]` entry

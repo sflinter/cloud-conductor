@@ -524,6 +524,50 @@ def test_finish_job_keeps_pod_when_final_sync_fails(mock_sync, mock_reg, mock_no
 
 @patch("conductor.monitor.send_notification", return_value=False)
 @patch("conductor.monitor.registry_update")
+@patch("conductor.monitor.sync_pull", return_value=False)
+def test_finish_job_tears_down_failed_job_when_final_sync_fails(mock_sync, mock_reg, mock_notify, paths):
+    from conductor.monitor import _finish_job
+    from conductor.state import read_cost_log
+    state_path, cost_path = paths
+    provider = _provider()
+    provider.check_exists.return_value = False
+    job = PodState(name="a", status="running", pod_id="p", ssh_host="h", ssh_port=1, exit_code=3)
+    state = RunState(jobs=[job, PodState(name="b", status="pending", depends_on=["a"])])
+
+    _finish_job(provider, job, _sync_config(name="a"), state, cost_path, "failed",
+                error="exit code 3\n--- last 50 log lines ---\nboom")
+
+    provider.terminate.assert_called_once_with("p")
+    assert job.status == "failed"
+    first_line = job.error.splitlines()[0]
+    assert first_line.startswith("exit code 3; final sync failed after 3 attempts")
+    assert "keep_pod_on_failure" in first_line and job.error.endswith("boom")
+    assert mock_reg.call_args[1]["status"] == "terminated"
+    assert mock_notify.call_args[0][1] == "sync_failed"
+    assert state.jobs[1].status == "skipped"
+    assert read_cost_log(cost_path)[-1]["reason"] == "failed"
+
+
+@patch("conductor.monitor.send_notification", return_value=False)
+@patch("conductor.monitor.registry_update")
+@patch("conductor.monitor.sync_pull", return_value=False)
+def test_finish_job_keep_pod_on_failure_keeps_failed_job_pod(mock_sync, mock_reg, mock_notify, paths):
+    from conductor.monitor import _finish_job
+    state_path, cost_path = paths
+    provider = _provider()
+    job = PodState(name="a", status="running", pod_id="p", ssh_host="h", ssh_port=1, exit_code=3)
+    state = RunState(jobs=[job])
+
+    _finish_job(provider, job, _sync_config(name="a", keep_pod_on_failure=True), state, cost_path,
+                "failed", error="exit code 3")
+
+    provider.terminate.assert_not_called()
+    assert job.status == "sync_failed"
+    assert "intended outcome: failed: exit code 3" in job.error
+
+
+@patch("conductor.monitor.send_notification", return_value=False)
+@patch("conductor.monitor.registry_update")
 @patch("conductor.monitor.sync_pull", side_effect=[False, True])
 def test_finish_job_retries_final_sync(mock_sync, mock_reg, mock_notify, paths):
     from conductor.monitor import _finish_job

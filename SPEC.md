@@ -210,6 +210,7 @@ sync_timeout_seconds = 600            # per sync rsync
 sync_paths = [
     { remote = "models/output/", local = "./results/sync/" },
     { remote = "training.log", local = "./logs/" },
+    { remote = "profile.json", local = "./results/", optional = true },  # never fails the sync
 ]
 
 # Cost controls
@@ -227,6 +228,8 @@ recovery_confirmations = 3            # consecutive polls reporting the pod gone
 
 # Pod reuse
 keep_pod_alive = false                # true = don't teardown on completion, keep for re-launch
+keep_pod_on_failure = false           # true = keep the pod of a job that failed when its final sync also failed
+                                      # (default: a failed job is always torn down; the sync failure goes in job.error)
 
 # Crash handling
 teardown_on_crash = false             # true = if the orchestrator process dies, terminate every live pod.
@@ -428,7 +431,7 @@ When reusing a pod (`keep_pod_alive`), rsync mode re-syncs code (fast incrementa
 
 **`runner.py`** — `launch_direct()` writes `.conductor_run.sh` (which runs the command and writes `$?` to `.conductor_exit`) and `.conductor_launch.sh` (which starts it under `setsid nohup ... > conductor_job.log 2>&1 < /dev/null &` and records the pid and its start time from `/proc/<pid>/stat`), returning a `LaunchResult(pid, pid_start)`. Launching is idempotent: if the previous launch is still running its pid is returned instead of starting a second copy. `exec_foreground()` replaces the process with SSH (used by `conductor pod exec`). `launch()` wraps `launch_direct()` for declarative mode. `is_alive()` returns a `ProcessStatus`: `running`, `exited` (with the exit code from the exit file, or none if the process simply vanished or its pid was reused) or `unknown` (SSH failed). `fetch_log_tail()` returns the last lines of the job log; `get_utilization()` returns GPU/CPU metrics.
 
-**`syncer.py`** — Rsyncs configured `sync_paths` from pod to local machine. Each sync path specifies a remote path (relative to `remote_project_dir`) and a local destination. Also supports push direction (local → remote) for spot recovery checkpoint restoration.
+**`syncer.py`** — Rsyncs configured `sync_paths` from pod to local machine. Each sync path specifies a remote path (relative to `remote_project_dir`), a local destination and an optional `optional` flag. A remote path that does not exist on the pod (rsync exit 23 with `change_dir`/`link_stat ... No such file or directory` naming the source, e.g. a job that died before creating its output directory) is "nothing to sync" and logged at INFO; a transfer failure of an existing source fails the sync unless the entry is `optional = true`, in which case it is logged and ignored. Also supports push direction (local → remote) for spot recovery checkpoint restoration.
 
 **`monitor.py`** — Main monitoring loop:
 1. For each active job, check the process (`runner.is_alive()`): exit file first, then pid
@@ -503,7 +506,7 @@ Minimal:
 2. **Deploy**: Rsync code + run setup (or skip for prebuilt images). Parallel across jobs.
 3. **Launch**: Start `run_command` via nohup. Sequential (fast, just SSH commands).
 4. **Monitor**: Loop until all jobs done. Sync results, track costs, handle interruptions.
-5. **Teardown**: Final sync (retried; a persistent failure keeps the pod and marks the job `sync_failed`), then terminate via the provider API and poll until the provider confirms the pod is gone.
+5. **Teardown**: Final sync (retried; a persistent failure keeps the pod and marks the job `sync_failed` unless the job itself failed, in which case the pod is torn down unless `keep_pod_on_failure = true`), then terminate via the provider API and poll until the provider confirms the pod is gone.
 
 ## Error Handling
 
@@ -513,7 +516,8 @@ Minimal:
 | All GPU types unavailable | Walk the candidate list again after a jittered backoff, up to `provision_retries` passes; then mark job as `failed`, notify, continue other jobs |
 | sshd rejects the key (`Permission denied`, 3 probes in a row) | Terminate the pod, mark job as `failed` with the reason, do not try further GPUs with the same key |
 | SSH never becomes ready (`provision_timeout_seconds`, default 15 min) | Terminate the pod (verified), try the next GPU candidate; when all are exhausted mark job as `failed`, notify |
-| Final sync fails after 3 attempts | Keep the pod alive, mark the job `sync_failed`, notify. `conductor sync --jobs X` then `conductor teardown --jobs X` releases it. A budget stop still tears the pod down |
+| Final sync fails after 3 attempts | For a job that ended successfully: keep the pod alive, mark the job `sync_failed`, notify. `conductor sync --jobs X` then `conductor teardown --jobs X` releases it. For a job that failed (non-zero exit, stall, budget): tear the pod down anyway, record the sync failure on the first line of `job.error`, notify (`sync_failed`); set `keep_pod_on_failure = true` to keep a failed job's pod instead. A budget stop always tears the pod down |
+| `sync_paths` source missing on the pod (rsync exit 23, `change_dir`/`link_stat ... No such file or directory` naming the source) | Not a failure: logged at INFO as nothing to sync. Only a transfer failure of an existing source fails the sync, and not for an entry marked `optional = true` |
 | Terminate not confirmed by the provider | Registry keeps the pod as `running`, `job.error` records it, status shows it; never assumed gone |
 | Deploy/setup command fails | Mark job as `failed`, terminate pod, notify |
 | Process exits with code 0 | Immediately: final sync, mark as `completed`, terminate pod, notify |

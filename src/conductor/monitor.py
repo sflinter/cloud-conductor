@@ -876,9 +876,18 @@ def _finish_job(
 
     The final sync is retried; if it still fails the pod is kept alive and
     the job marked sync_failed so no results are lost, unless
-    force_teardown is set (budget stop, crash teardown)."""
+    force_teardown is set (budget stop, crash teardown) or the job itself
+    failed (then the pod is released unless keep_pod_on_failure is set)."""
     synced = _final_sync(config, job)
-    if not synced and not force_teardown and job.pod_id:
+    if not synced and not force_teardown and job.pod_id and status == "failed" \
+            and not config.keep_pod_on_failure:
+        msg = (f"final sync failed after {FINAL_SYNC_ATTEMPTS} attempts; pod {job.pod_id} torn down "
+               f"because the job failed (keep_pod_on_failure = false)")
+        log.error(f"[{job.name}] {msg}")
+        error = _with_note(error, msg)
+        send_notification(config.notifications, "sync_failed", job=job.name,
+                          error=msg, cost_usd=job.cost_usd)
+    elif not synced and not force_teardown and job.pod_id:
         job.status = "sync_failed"
         intended = f"{status}: {error}" if error else status
         job.error = (f"final sync failed after {FINAL_SYNC_ATTEMPTS} attempts; pod kept alive "
@@ -901,7 +910,7 @@ def _finish_job(
         if not torn_down:
             msg = f"pod {job.pod_id} teardown unverified; it may still be running"
             log.error(f"[{job.name}] {msg}")
-            error = f"{error}; {msg}" if error else msg
+            error = _with_note(error, msg)
 
     elapsed_hours = 0.0
     if job.started_at:
@@ -926,6 +935,15 @@ def _finish_job(
 
     if status == "failed":
         _propagate_failure(job, state)
+
+
+def _with_note(error: str | None, note: str) -> str:
+    """Append a note to the first line of an error (the one the status table
+    shows), keeping any log tail below it."""
+    if not error:
+        return note
+    first, sep, rest = error.partition("\n")
+    return f"{first}; {note}{sep}{rest}"
 
 
 def _final_sync(config: JobConfig, job: PodState) -> bool:
