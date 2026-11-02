@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import logging.handlers
 import os
 import sys
 import textwrap
@@ -26,6 +27,44 @@ from conductor.state import (
 )
 from conductor.syncer import sync_pull
 from conductor.validator import validate
+
+log = logging.getLogger(__name__)
+
+LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
+LOG_FILE_FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
+LOG_FILE_NAME = "conductor.log"
+LOG_FILE_MAX_BYTES = 5 * 1024 * 1024
+LOG_FILE_BACKUPS = 3
+
+
+def configure_logging(level: int = logging.INFO) -> None:
+    """Own the root logger. The runpod SDK calls logging.basicConfig() with
+    its own format when imported, which would make a later basicConfig a
+    no-op; import it first and then replace whatever handlers it left."""
+    try:
+        import runpod  # noqa: F401
+    except ImportError:  # pragma: no cover
+        pass
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter(LOG_FORMAT, datefmt="%H:%M:%S"))
+    logging.basicConfig(level=level, handlers=[handler], force=True)
+
+
+def log_file_for(state_path: str) -> str:
+    return os.path.join(os.path.dirname(state_path) or ".", LOG_FILE_NAME)
+
+
+def add_log_file(path: str) -> logging.Handler | None:
+    """Also log, with full timestamps, to a rotating file in the project dir."""
+    try:
+        handler = logging.handlers.RotatingFileHandler(
+            path, maxBytes=LOG_FILE_MAX_BYTES, backupCount=LOG_FILE_BACKUPS)
+    except OSError as e:
+        log.warning(f"Could not open log file {path}: {e}")
+        return None
+    handler.setFormatter(logging.Formatter(LOG_FILE_FORMAT))
+    logging.getLogger().addHandler(handler)
+    return handler
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -211,8 +250,7 @@ def main(argv=None):
         parser.print_help()
         sys.exit(1)
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
-                        datefmt="%H:%M:%S")
+    configure_logging()
 
     # Commands that don't need a config file
     if args.command in ("version", "init", "completions"):
@@ -338,6 +376,7 @@ def cmd_run(args):
 
     state_path = configs[0].state_file
     cost_log_path = configs[0].cost_log_file
+    add_log_file(log_file_for(state_path))
 
     # Load or init state
     if os.path.exists(state_path):
@@ -365,6 +404,8 @@ def cmd_run(args):
         state = init_state(configs, budget_usd=args.budget or configs[0].budget_usd)
 
     print(f"Run {state.run_id}: pods are named conductor-{state.run_id}-<job>")
+    log.info(f"conductor {__version__} run {state.run_id} started (pid {os.getpid()}); "
+             f"log file {log_file_for(state_path)}")
     if args.teardown_on_interrupt:
         print("Ctrl-C will sync and tear down all pods.")
     else:
@@ -506,6 +547,7 @@ def cmd_sync(args):
         print("No state file found.")
         return
 
+    add_log_file(log_file_for(state_path))
     state = load_state(state_path)
     _refuse_if_live(state, "sync", args)
     for job in state.jobs:
@@ -553,6 +595,7 @@ def cmd_teardown(args):
         print("No state file found.")
         return
 
+    add_log_file(log_file_for(state_path))
     state = load_state(state_path)
     cost_log_path = configs[0].cost_log_file
     _refuse_if_live(state, "teardown", args)
@@ -577,6 +620,7 @@ def cmd_teardown(args):
         cfg = config_map.get(job.name)
         prov = providers.get(cfg.provider) if cfg else providers.get("runpod")
         print(f"Tearing down {job.name} ({job.pod_id})...")
+        log.info(f"[{job.name}] Manual teardown of pod {job.pod_id}")
         ok = teardown_pod(prov, job.pod_id)
         _record_manual_teardown(job, state, cost_log_path, ok)
         if not ok:
