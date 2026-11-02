@@ -195,9 +195,12 @@ pip install -q uv && \
 uv venv --seed .venv && \
 uv sync --frozen
 """
+setup_timeout_seconds = 1800          # setup_command is killed and the job fails after this
+deploy_timeout_seconds = 600          # per deploy rsync
 
 # Result sync
 sync_interval_minutes = 5
+sync_timeout_seconds = 600            # per sync rsync
 sync_paths = [
     { remote = "models/output/", local = "./results/sync/" },
     { remote = "training.log", local = "./logs/" },
@@ -216,6 +219,10 @@ backoff_base_seconds = 30
 
 # Pod reuse
 keep_pod_alive = false                # true = don't teardown on completion, keep for re-launch
+
+# Crash handling
+teardown_on_crash = false             # true = if the orchestrator process dies, terminate every live pod.
+                                      # false (default) = leave pods running, print their IDs, resume with `conductor run`
 
 # State / cost persistence
 state_file = ".conductor_state.json"
@@ -487,7 +494,8 @@ Minimal:
 | Global budget limit reached | Final sync all pods, teardown all pods, notify, exit |
 | Dependency failed | Mark dependent jobs as `skipped`, notify |
 | Ctrl+C | Graceful shutdown: final sync all pods, teardown all pods (unless `keep_pod_alive`), save state, exit |
-| Conductor process dies | State file preserved. `conductor status` still works. `conductor run` resumes from saved state. |
+| Conductor process dies | State saved, every live pod ID printed with its job, `orchestrator_crashed` notification sent. Pods are left running unless `teardown_on_crash = true`. `conductor status` still works; `conductor run` resumes from saved state. |
+| Transport error (SSH timeout, rsync failure, provider API/SDK error) | Returned as a failed result or `ConductorError`; the affected job is marked `failed` with `error` set. The orchestrator never dies from one. |
 
 ## Cost Tracking
 

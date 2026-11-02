@@ -106,3 +106,16 @@ def test_teardown_pod():
     provider.terminate.return_value = True
     assert teardown_pod(provider, "pod123") is True
     provider.terminate.assert_called_once_with("pod123")
+
+
+@patch("conductor.provisioner.select_cheapest_gpus")
+def test_provision_catalog_error_fails_job(mock_select):
+    from conductor.errors import ConductorError
+    mock_select.side_effect = ConductorError("runpod.get_gpus: timeout")
+    provider = _mock_provider()
+    config = _make_config(auto_select_cheapest_gpu=True)
+    pod = _make_pod()
+    result = provision_pod(provider, config, pod)
+    assert result.status == "failed"
+    assert "GPU catalog" in result.error
+    provider.create_instance.assert_not_called()

@@ -26,7 +26,7 @@ def sync_pull(config: JobConfig, pod_state: PodState) -> bool:
         local = sp.local
         os.makedirs(local, exist_ok=True)
         log.info(f"[{config.name}] Syncing {remote} → {local}")
-        result = rsync_pull(remote, local, host, port, key)
+        result = rsync_pull(remote, local, host, port, key, timeout=config.sync_timeout_seconds)
         if result.returncode != 0:
             log.warning(f"[{config.name}] Sync failed for {sp.remote}: {result.stderr}")
             all_ok = False
@@ -52,7 +52,7 @@ def sync_push(config: JobConfig, pod_state: PodState) -> bool:
         remote = f"{remote_base}/{sp.remote}"
         src = local.rstrip("/") + "/"
         log.info(f"[{config.name}] Pushing {src} → {remote}")
-        result = rsync(src, remote, host, port, key)
+        result = rsync(src, remote, host, port, key, timeout=config.sync_timeout_seconds)
         if result.returncode != 0:
             log.warning(f"[{config.name}] Push failed for {sp.remote}: {result.stderr}")
             all_ok = False

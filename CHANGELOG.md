@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.0 (unreleased)
+
+Reliability release — see `RELIABILITY_REVIEW.md` for the findings that drove it.
+
+- Crash-proof the lifecycle: SSH/rsync timeouts and OS errors are returned as failed results, provider/SDK errors are converted to `ConductorError`, and any exception in a job's provision/deploy/launch or monitor tick marks that job `failed` with `job.error` set instead of killing the orchestrator. If the orchestrator does die, `run_lifecycle` saves state, prints every live pod ID with its job, sends an `orchestrator_crashed` notification and (only if `teardown_on_crash = true`) tears the pods down
+- New config fields: `setup_timeout_seconds` (default 1800, was a hard-coded 600), `deploy_timeout_seconds` (600), `sync_timeout_seconds` (600), `teardown_on_crash` (false)
+- Fix rsync install command parenthesisation (install always ran and failed on non-apt images)
+- Fix `RunPodProvider._get_cost` crashing after pod creation when the API returned no `costPerHr`
+
 ## 0.5.1
 
 - Fix `keep_pod_alive` registry bug: pods kept alive on completion were incorrectly marked as `terminated` in the global registry, making them invisible to `conductor status` and preventing reuse

@@ -60,3 +60,47 @@ def test_wait_ssh_timeout():
         mock_time.sleep = MagicMock()
         mock_exec.return_value = subprocess.CompletedProcess([], 255)
         assert wait_ssh("1.2.3.4", 22222, "/key", timeout=10) is False
+
+
+def test_ssh_exec_timeout_returns_failed_result():
+    with patch("conductor.ssh.subprocess.run") as mock_run:
+        mock_run.side_effect = subprocess.TimeoutExpired(cmd=["ssh"], timeout=5)
+        result = ssh_exec("1.2.3.4", 22222, "/key", "sleep 100", timeout=5)
+        assert result.returncode != 0
+        assert "timed out" in result.stderr
+
+
+def test_ssh_exec_oserror_returns_failed_result():
+    with patch("conductor.ssh.subprocess.run") as mock_run:
+        mock_run.side_effect = OSError("ssh: command not found")
+        result = ssh_exec("1.2.3.4", 22222, "/key", "echo ok")
+        assert result.returncode != 0
+        assert "not found" in result.stderr
+
+
+def test_rsync_timeout_is_passed_through():
+    with patch("conductor.ssh.subprocess.run") as mock_run:
+        mock_run.return_value = subprocess.CompletedProcess([], 0)
+        rsync("/src/", "/dst/", "1.2.3.4", 22222, "/key", timeout=42)
+        assert mock_run.call_args[1]["timeout"] == 42
+        rsync_pull("/r", "/l", "1.2.3.4", 22222, "/key", timeout=43)
+        assert mock_run.call_args[1]["timeout"] == 43
+
+
+def test_rsync_pull_timeout_returns_failed_result():
+    with patch("conductor.ssh.subprocess.run") as mock_run:
+        mock_run.side_effect = subprocess.TimeoutExpired(cmd=["rsync"], timeout=600)
+        result = rsync_pull("/r", "/l", "1.2.3.4", 22222, "/key")
+        assert result.returncode != 0
+
+
+def test_wait_ssh_survives_timeout_results():
+    with patch("conductor.ssh.ssh_exec") as mock_exec, \
+         patch("conductor.ssh.time") as mock_time:
+        mock_time.time.side_effect = [0, 1, 2, 100]
+        mock_time.sleep = MagicMock()
+        mock_exec.side_effect = [
+            subprocess.CompletedProcess([], 124, stderr="timed out"),
+            subprocess.CompletedProcess([], 0),
+        ]
+        assert wait_ssh("1.2.3.4", 22222, "/key", timeout=10) is True

@@ -98,3 +98,40 @@ def test_deploy_rsync_failure(mock_ssh, mock_rsync):
     config = _make_config()
     pod = _make_pod()
     assert deploy(config, pod) is False
+
+
+@patch("conductor.deployer.rsync")
+@patch("conductor.deployer.ssh_exec")
+def test_setup_timeout_is_configurable(mock_ssh, mock_rsync):
+    mock_ssh.return_value = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+    mock_rsync.return_value = subprocess.CompletedProcess([], 0)
+    config = _make_config(setup_timeout_seconds=4321, deploy_timeout_seconds=99)
+    assert deploy(config, _make_pod()) is True
+    setup_call = [c for c in mock_ssh.call_args_list if "pip install" in str(c)][0]
+    assert setup_call[1]["timeout"] == 4321
+    assert mock_rsync.call_args[1]["timeout"] == 99
+
+
+@patch("conductor.deployer.rsync")
+@patch("conductor.deployer.ssh_exec")
+def test_setup_timeout_fails_job_not_process(mock_ssh, mock_rsync):
+    # ssh_exec reports a timeout as a failed result; deploy must return False
+    mock_ssh.side_effect = [
+        subprocess.CompletedProcess([], 0, stdout="", stderr=""),   # install rsync
+        subprocess.CompletedProcess([], 0, stdout="", stderr=""),   # mkdir
+        subprocess.CompletedProcess([], 124, stdout="", stderr="timed out after 1800s"),
+    ]
+    mock_rsync.return_value = subprocess.CompletedProcess([], 0)
+    assert deploy(_make_config(), _make_pod()) is False
+
+
+@patch("conductor.deployer.rsync")
+@patch("conductor.deployer.ssh_exec")
+def test_install_rsync_command_is_parenthesised(mock_ssh, mock_rsync):
+    mock_ssh.return_value = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+    mock_rsync.return_value = subprocess.CompletedProcess([], 0)
+    deploy(_make_config(setup_command=""), _make_pod())
+    install_cmd = mock_ssh.call_args_list[0][0][3]
+    assert "which rsync" in install_cmd
+    assert "|| (apt-get update" in install_cmd
+    assert install_cmd.rstrip().endswith("rsync)")

@@ -6,6 +6,7 @@ import time
 
 import runpod
 
+from conductor.errors import guarded
 from conductor.gpu_pricing import GpuInfo
 
 log = logging.getLogger(__name__)
@@ -100,7 +101,7 @@ class RunPodProvider:
             return False
 
     def get_gpu_catalog(self) -> list[GpuInfo]:
-        raw = runpod.get_gpus()
+        raw = guarded("runpod.get_gpus", runpod.get_gpus)
         results = []
         for gpu in raw:
             results.append(GpuInfo(
@@ -123,4 +124,8 @@ class RunPodProvider:
         except Exception:
             pass
         from conductor.gpu_pricing import get_gpu_price
-        return get_gpu_price(gpu_id, cloud_type)
+        try:
+            return get_gpu_price(self, gpu_id, cloud_type)
+        except Exception as e:
+            log.warning(f"Could not look up price for {gpu_id}: {e}")
+            return 0.0

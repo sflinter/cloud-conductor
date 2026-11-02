@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from conductor.config import JobConfig
 from conductor.deployer import deploy
+from conductor.errors import ConductorError, describe
 from conductor.notify import send_notification
 from conductor.providers import CloudProvider, get_provider
 from conductor.provisioner import check_pod_exists, provision_pod, teardown_pod
@@ -77,11 +78,68 @@ def run_lifecycle(
 
         if shutdown["requested"]:
             _graceful_shutdown(configs, config_map, provider_map, state, state_path, cost_log_path)
+    except BaseException as e:
+        _handle_crash(e, configs, config_map, provider_map, state, state_path, cost_log_path)
+        raise
     finally:
         signal.signal(signal.SIGINT, prev_handler)
         save_state(state, state_path)
 
     return state
+
+
+def _handle_crash(
+    exc: BaseException,
+    configs: list[JobConfig],
+    config_map: dict[str, JobConfig],
+    provider_map: dict[str, CloudProvider],
+    state: RunState,
+    state_path: str,
+    cost_log_path: str,
+) -> None:
+    """Last line of defence: never let the orchestrator die with pods unaccounted for."""
+    reason = describe(exc)
+    log.error(f"Orchestrator exiting abnormally: {reason}", exc_info=not isinstance(exc, KeyboardInterrupt))
+    try:
+        save_state(state, state_path)
+    except Exception as save_err:
+        log.error(f"Could not save state: {save_err}")
+
+    live = live_pods(state)
+    print_live_pods(live, header=f"Orchestrator exiting abnormally ({reason}). Live pods:")
+
+    notified = set()
+    for job in live:
+        cfg = config_map.get(job.name)
+        if cfg and cfg.notifications and id(cfg.notifications) not in notified:
+            notified.add(id(cfg.notifications))
+            send_notification(cfg.notifications, "orchestrator_crashed",
+                              error=reason, pods=[(j.name, j.pod_id) for j in live])
+
+    teardown = any(config_map[j.name].teardown_on_crash for j in live if j.name in config_map)
+    if live and teardown:
+        log.warning("teardown_on_crash is set: tearing down all live pods")
+        _teardown_all(configs, config_map, provider_map, state, state_path, cost_log_path,
+                      reason=f"orchestrator crashed: {reason}")
+    elif live:
+        log.warning("Pods are still running and billing. Resume with 'conductor run' "
+                    "or terminate with 'conductor teardown'.")
+
+
+def live_pods(state: RunState) -> list[PodState]:
+    """Jobs whose pod may still exist on the provider."""
+    return [j for j in state.jobs
+            if j.pod_id and j.status in ("provisioning", "deploying", "running")]
+
+
+def print_live_pods(jobs: list[PodState], header: str = "Live pods:") -> None:
+    if not jobs:
+        print("No live pods.", file=sys.stderr)
+        return
+    print(header, file=sys.stderr)
+    for j in jobs:
+        print(f"  {j.name}: {j.pod_id} ({j.status}, {j.gpu_type or '?'}, "
+              f"ssh {j.ssh_host or '?'}:{j.ssh_port or '?'})", file=sys.stderr)
 
 
 def _monitor_tick(
@@ -100,78 +158,114 @@ def _monitor_tick(
         if not config:
             continue
 
-        # Update cost
-        _update_cost(job, state, config, cost_log_path)
-
-        # Check per-job budget
-        if config.job_budget_usd > 0 and job.cost_usd >= config.job_budget_usd:
-            log.warning(f"[{job.name}] Per-job budget exceeded (${job.cost_usd:.2f} >= ${config.job_budget_usd:.2f})")
-            prov = provider_map.get(job.name)
-            _finish_job(prov, job, config, state, cost_log_path, "failed", error="job budget exceeded")
-            send_notification(config.notifications, "job_budget_exceeded",
-                              job=job.name, cost_usd=job.cost_usd)
-            continue
-
         prov = provider_map.get(job.name)
-
-        # Check if process is alive
-        alive = is_alive(job, config.ssh_key_path)
-
-        if alive is True:
-            job.idle_since = None
-
-            # GPU stall detection
-            if config.stall_timeout_minutes > 0:
-                util = get_utilization(job, config.ssh_key_path)
-                gpu_util = util.get("gpu_util") if util else None
-                if gpu_util is not None and gpu_util < config.stall_gpu_threshold:
-                    if job.stalled_since is None:
-                        job.stalled_since = time.time()
-                        log.info(f"[{job.name}] GPU util {gpu_util}% < {config.stall_gpu_threshold}%, starting stall timer")
-                    elif (time.time() - job.stalled_since) / 60 >= config.stall_timeout_minutes:
-                        log.warning(f"[{job.name}] GPU stall timeout reached ({config.stall_timeout_minutes}m)")
-                        _finish_job(prov, job, config, state, cost_log_path, "failed", error="gpu stall detected")
-                        send_notification(config.notifications, "job_failed",
-                                          job=job.name, error="gpu stall detected")
-                        continue
-                else:
-                    if job.stalled_since is not None:
-                        log.info(f"[{job.name}] GPU active again, resetting stall timer")
-                    job.stalled_since = None
-
-            # Periodic sync
-            if config.sync_paths and job.last_sync_at:
-                elapsed_min = (time.time() - job.last_sync_at) / 60
-                if elapsed_min >= config.sync_interval_minutes:
-                    sync_pull(config, job)
-                    job.last_sync_at = time.time()
-        elif alive is False:
-            # Process not running — check if pod is still alive
-            if job.pod_id and check_pod_exists(prov, job.pod_id):
-                # Pod alive but process gone — idle detection
-                if job.idle_since is None:
-                    job.idle_since = time.time()
-                    log.info(f"[{job.name}] Process not running, starting idle timer")
-                elif (time.time() - job.idle_since) / 60 >= config.idle_timeout_minutes:
-                    log.info(f"[{job.name}] Idle timeout reached, marking completed")
-                    _finish_job(prov, job, config, state, cost_log_path, "completed")
-                    send_notification(config.notifications, "job_complete",
-                                      job=job.name, cost_usd=job.cost_usd,
-                                      gpu_type=job.gpu_type)
-            else:
-                # Pod gone — spot interruption
-                log.warning(f"[{job.name}] Spot interruption detected")
-                send_notification(config.notifications, "spot_recovery", job=job.name)
-                _spot_recover(prov, job, config, state, state_path, cost_log_path)
-        elif alive is None:
-            # SSH unreachable — likely spot interruption
-            if job.pod_id and not check_pod_exists(prov, job.pod_id):
-                log.warning(f"[{job.name}] Pod gone (spot interruption)")
-                send_notification(config.notifications, "spot_recovery", job=job.name)
-                _spot_recover(prov, job, config, state, state_path, cost_log_path)
+        try:
+            _tick_job(job, config, prov, state, state_path, cost_log_path)
+        except ConductorError as e:
+            # Transient infrastructure error: keep the job, retry next tick
+            log.warning(f"[{job.name}] Monitor tick failed, will retry: {e}")
+        except Exception as e:
+            log.exception(f"[{job.name}] Unexpected error while monitoring")
+            _fail_job_safely(prov, job, config, state, cost_log_path,
+                             error=f"monitor error: {describe(e)}")
 
     # Start newly unblocked jobs
     _start_unblocked_jobs(configs, config_map, provider_map, state, state_path, cost_log_path)
+
+
+def _fail_job_safely(
+    provider: CloudProvider,
+    job: PodState,
+    config: JobConfig,
+    state: RunState,
+    cost_log_path: str,
+    error: str,
+) -> None:
+    """Mark a job failed and try to release its pod, never raising."""
+    try:
+        _finish_job(provider, job, config, state, cost_log_path, "failed", error=error)
+    except Exception as e:
+        log.error(f"[{job.name}] Could not tear down pod {job.pod_id}: {describe(e)}")
+        job.status = "failed"
+        job.error = f"{error} (pod {job.pod_id} may still be running)"
+        _propagate_failure(job, state)
+    send_notification(config.notifications, "job_failed", job=job.name, error=job.error)
+
+
+def _tick_job(
+    job: PodState,
+    config: JobConfig,
+    prov: CloudProvider,
+    state: RunState,
+    state_path: str,
+    cost_log_path: str,
+) -> None:
+    # Update cost
+    _update_cost(job, state, config, cost_log_path)
+
+    # Check per-job budget
+    if config.job_budget_usd > 0 and job.cost_usd >= config.job_budget_usd:
+        log.warning(f"[{job.name}] Per-job budget exceeded (${job.cost_usd:.2f} >= ${config.job_budget_usd:.2f})")
+        _finish_job(prov, job, config, state, cost_log_path, "failed", error="job budget exceeded")
+        send_notification(config.notifications, "job_budget_exceeded",
+                          job=job.name, cost_usd=job.cost_usd)
+        return
+
+    # Check if process is alive
+    alive = is_alive(job, config.ssh_key_path)
+
+    if alive is True:
+        job.idle_since = None
+
+        # GPU stall detection
+        if config.stall_timeout_minutes > 0:
+            util = get_utilization(job, config.ssh_key_path)
+            gpu_util = util.get("gpu_util") if util else None
+            if gpu_util is not None and gpu_util < config.stall_gpu_threshold:
+                if job.stalled_since is None:
+                    job.stalled_since = time.time()
+                    log.info(f"[{job.name}] GPU util {gpu_util}% < {config.stall_gpu_threshold}%, starting stall timer")
+                elif (time.time() - job.stalled_since) / 60 >= config.stall_timeout_minutes:
+                    log.warning(f"[{job.name}] GPU stall timeout reached ({config.stall_timeout_minutes}m)")
+                    _finish_job(prov, job, config, state, cost_log_path, "failed", error="gpu stall detected")
+                    send_notification(config.notifications, "job_failed",
+                                      job=job.name, error="gpu stall detected")
+                    return
+            else:
+                if job.stalled_since is not None:
+                    log.info(f"[{job.name}] GPU active again, resetting stall timer")
+                job.stalled_since = None
+
+        # Periodic sync
+        if config.sync_paths and job.last_sync_at:
+            elapsed_min = (time.time() - job.last_sync_at) / 60
+            if elapsed_min >= config.sync_interval_minutes:
+                sync_pull(config, job)
+                job.last_sync_at = time.time()
+    elif alive is False:
+        # Process not running — check if pod is still alive
+        if job.pod_id and check_pod_exists(prov, job.pod_id):
+            # Pod alive but process gone — idle detection
+            if job.idle_since is None:
+                job.idle_since = time.time()
+                log.info(f"[{job.name}] Process not running, starting idle timer")
+            elif (time.time() - job.idle_since) / 60 >= config.idle_timeout_minutes:
+                log.info(f"[{job.name}] Idle timeout reached, marking completed")
+                _finish_job(prov, job, config, state, cost_log_path, "completed")
+                send_notification(config.notifications, "job_complete",
+                                  job=job.name, cost_usd=job.cost_usd,
+                                  gpu_type=job.gpu_type)
+        else:
+            # Pod gone — spot interruption
+            log.warning(f"[{job.name}] Spot interruption detected")
+            send_notification(config.notifications, "spot_recovery", job=job.name)
+            _spot_recover(prov, job, config, state, state_path, cost_log_path)
+    elif alive is None:
+        # SSH unreachable — likely spot interruption
+        if job.pod_id and not check_pod_exists(prov, job.pod_id):
+            log.warning(f"[{job.name}] Pod gone (spot interruption)")
+            send_notification(config.notifications, "spot_recovery", job=job.name)
+            _spot_recover(prov, job, config, state, state_path, cost_log_path)
 
 
 def _start_unblocked_jobs(
@@ -236,7 +330,43 @@ def _provision_deploy_launch(
     cost_log_path: str,
     lock: threading.Lock | None = None,
 ) -> None:
+    """Run provision → deploy → launch for one job. Never raises: any error
+    marks the job failed with job.error set, keeping the pod ID in state so
+    it can be torn down or resumed."""
     cm = lock or contextlib.nullcontext()
+    try:
+        _pipeline(provider, job, config, state, state_path, cost_log_path, cm)
+    except Exception as e:
+        if isinstance(e, ConductorError):
+            log.error(f"[{job.name}] {e}")
+        else:
+            log.exception(f"[{job.name}] Unexpected error during {job.status}")
+        job.error = f"{job.status} failed: {describe(e)}"
+        job.status = "failed"
+        if job.pod_id:
+            log.warning(f"[{job.name}] Pod {job.pod_id} may still be running; tearing down")
+            try:
+                teardown_pod(provider, job.pod_id)
+                registry_update(job.pod_id, status="terminated", cost_usd=job.cost_usd)
+            except Exception as td:
+                log.error(f"[{job.name}] Teardown of {job.pod_id} failed: {describe(td)}")
+                job.error += f" (pod {job.pod_id} may still be running)"
+        _propagate_failure(job, state)
+        send_notification(config.notifications, "job_failed", job=job.name, error=job.error)
+    finally:
+        with cm:
+            save_state(state, state_path)
+
+
+def _pipeline(
+    provider: CloudProvider,
+    job: PodState,
+    config: JobConfig,
+    state: RunState,
+    state_path: str,
+    cost_log_path: str,
+    cm,
+) -> None:
     is_reuse = config.keep_pod_alive and job.pod_id is not None
 
     # Terminate any existing pod before provisioning a replacement

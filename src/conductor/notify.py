@@ -50,6 +50,7 @@ def _should_notify(config: NotificationConfig, event: str) -> bool:
         "budget_threshold": config.on_budget_threshold > 0,
         "budget_exceeded": config.on_job_failure,
         "job_budget_exceeded": config.on_job_failure,
+        "orchestrator_crashed": config.on_job_failure,
     }
     return mapping.get(event, True)
 

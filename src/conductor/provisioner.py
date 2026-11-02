@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import time
 
+from conductor.errors import ConductorError
 from conductor.gpu_pricing import select_cheapest_gpus
 from conductor.providers import CloudProvider
 from conductor.registry import PodRecord
@@ -77,7 +78,12 @@ def provision_pod(provider: CloudProvider, config, pod_state: PodState) -> PodSt
             log.info(f"[{cfg.name}] Reusing existing pod {pod_state.pod_id}")
             return pod_state
 
-    gpu_candidates = _get_gpu_candidates(provider, cfg)
+    try:
+        gpu_candidates = _get_gpu_candidates(provider, cfg)
+    except ConductorError as e:
+        pod_state.status = "failed"
+        pod_state.error = f"Could not fetch GPU catalog: {e}"
+        return pod_state
     if not gpu_candidates:
         pod_state.status = "failed"
         pod_state.error = "No GPU candidates available"

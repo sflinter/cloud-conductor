@@ -155,3 +155,37 @@ run_command = "echo hi"
     assert configs[0].notifications.backend == "pushover"
     assert configs[0].notifications.on_job_complete is False
     assert configs[0].notifications.pushover_user_key == "abc"
+
+
+def test_reliability_fields_default_and_override(tmp_dir):
+    path = os.path.join(tmp_dir, "jobs.toml")
+    with open(path, "w") as f:
+        f.write('''
+[global]
+setup_timeout_seconds = 3600
+
+[[jobs]]
+name = "a"
+run_command = "echo hi"
+
+[[jobs]]
+name = "b"
+run_command = "echo hi"
+setup_timeout_seconds = 60
+teardown_on_crash = true
+sync_timeout_seconds = 30
+''')
+    configs = load_config(path)
+    assert configs[0].setup_timeout_seconds == 3600
+    assert configs[0].deploy_timeout_seconds == 600
+    assert configs[0].sync_timeout_seconds == 600
+    assert configs[0].teardown_on_crash is False
+    assert configs[1].setup_timeout_seconds == 60
+    assert configs[1].sync_timeout_seconds == 30
+    assert configs[1].teardown_on_crash is True
+
+
+def test_defaults_without_new_fields(sample_toml):
+    cfg = load_config(sample_toml)[0]
+    assert cfg.setup_timeout_seconds == 1800
+    assert cfg.teardown_on_crash is False

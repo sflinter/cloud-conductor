@@ -53,10 +53,13 @@ class JobConfig:
     ])
     setup_command: str = ""
     upload_paths: list[SyncPath] = field(default_factory=list)
+    setup_timeout_seconds: int = 1800     # max time for setup_command
+    deploy_timeout_seconds: int = 600     # max time for each deploy rsync
 
     # Sync
     sync_interval_minutes: int = 5
     sync_paths: list[SyncPath] = field(default_factory=list)
+    sync_timeout_seconds: int = 600       # max time for each sync rsync
 
     # Cost
     budget_usd: float = 0.0
@@ -72,6 +75,9 @@ class JobConfig:
 
     # Pod reuse
     keep_pod_alive: bool = False
+
+    # Crash handling: tear down every live pod if the orchestrator itself dies
+    teardown_on_crash: bool = False
 
     # State files
     state_file: str = ".conductor_state.json"
