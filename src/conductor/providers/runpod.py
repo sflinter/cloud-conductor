@@ -1,7 +1,10 @@
 # Copyright (c) 2026 Steve Flinter. MIT License.
 from __future__ import annotations
 
+import io
 import logging
+import sys
+import threading
 import time
 
 import runpod
@@ -26,6 +29,44 @@ def _retry_unless_gone(exc: BaseException) -> bool:
     return is_retryable(exc) and not is_not_found_message(str(exc))
 
 
+class _MuteStdout:
+    """Swallow what the SDK prints to stdout (create_pod prints
+    `raw_response: {...}`, which includes the account's public keys).
+    Reference-counted so that pods created from several threads at once
+    share one redirect and the real stdout is restored by the last one
+    out; a plain contextlib.redirect_stdout per thread could restore a
+    sink instead of the terminal."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._depth = 0
+        self._saved = None
+        self._sink = None
+
+    def __enter__(self):
+        with self._lock:
+            if self._depth == 0:
+                self._saved = sys.stdout
+                self._sink = io.StringIO()
+                sys.stdout = self._sink
+            self._depth += 1
+        return self
+
+    def __exit__(self, *exc):
+        with self._lock:
+            self._depth -= 1
+            if self._depth == 0:
+                sys.stdout = self._saved
+                text = self._sink.getvalue().strip()
+                self._saved = self._sink = None
+                if text:
+                    log.debug(f"runpod SDK stdout suppressed: {text[:200]}")
+        return False
+
+
+_mute_sdk_stdout = _MuteStdout()
+
+
 class RunPodProvider:
     name = "runpod"
 
@@ -45,17 +86,18 @@ class RunPodProvider:
         volume_mount_path = provider_kwargs.get("volume_mount_path", "/workspace")
 
         try:
-            pod = runpod.create_pod(
-                name=name,
-                image_name=image_name,
-                gpu_type_id=gpu_type_id,
-                cloud_type=cloud_type,
-                container_disk_in_gb=disk_gb,
-                volume_in_gb=volume_in_gb if volume_in_gb > 0 else None,
-                volume_mount_path=volume_mount_path if volume_in_gb > 0 else None,
-                ports="22/tcp",
-                support_public_ip=True,
-            )
+            with _mute_sdk_stdout:
+                pod = runpod.create_pod(
+                    name=name,
+                    image_name=image_name,
+                    gpu_type_id=gpu_type_id,
+                    cloud_type=cloud_type,
+                    container_disk_in_gb=disk_gb,
+                    volume_in_gb=volume_in_gb if volume_in_gb > 0 else None,
+                    volume_mount_path=volume_mount_path if volume_in_gb > 0 else None,
+                    ports="22/tcp",
+                    support_public_ip=True,
+                )
         except Exception as e:
             if is_capacity_message(str(e)):
                 raise NoCapacityError(f"{gpu_type_id}: {e}") from e

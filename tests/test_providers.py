@@ -272,3 +272,68 @@ def test_vastai_terminate_missing_instance_is_already_gone():
         req.reset_mock()
         req.return_value = _vast_response({"success": False, "msg": "rate limited"})
         assert provider.terminate("1") is False
+
+
+@patch("conductor.providers.runpod.runpod")
+def test_runpod_create_instance_suppresses_sdk_stdout(mock_runpod, capsys):
+    import sys
+    real_stdout = sys.stdout
+
+    def chatty_create_pod(**kwargs):
+        print("raw_response: {'env': ['PUBLIC_KEY=ssh-rsa AAAA...']}")
+        return {"id": "pod1"}
+    mock_runpod.create_pod.side_effect = chatty_create_pod
+    mock_runpod.get_pod.return_value = {"costPerHr": 0.5}
+
+    result = RunPodProvider().create_instance("NVIDIA L4", "img", name="n")
+
+    assert result == {"id": "pod1", "cost_per_hour": 0.5}
+    assert "raw_response" not in capsys.readouterr().out
+    assert sys.stdout is real_stdout
+
+
+@patch("conductor.providers.runpod.runpod")
+def test_runpod_create_instance_restores_stdout_on_error(mock_runpod, capsys):
+    import sys
+    real_stdout = sys.stdout
+
+    def failing_create_pod(**kwargs):
+        print("raw_response: {...}")
+        raise RuntimeError("boom")
+    mock_runpod.create_pod.side_effect = failing_create_pod
+
+    assert RunPodProvider().create_instance("NVIDIA L4", "img", name="n") is None
+    assert sys.stdout is real_stdout
+    assert "raw_response" not in capsys.readouterr().out
+
+
+def test_mute_stdout_is_shared_across_threads(capsys):
+    """Parallel provisioning: nested enter/exit from two threads must end
+    with the real stdout restored, not one thread's sink."""
+    import sys
+    import threading
+    from conductor.providers.runpod import _MuteStdout
+    mute = _MuteStdout()
+    real_stdout = sys.stdout
+    a_in, b_in, a_out = threading.Event(), threading.Event(), threading.Event()
+
+    def thread_a():
+        with mute:
+            print("raw_response: a")
+            a_in.set()
+            b_in.wait(5)
+        a_out.set()
+
+    def thread_b():
+        a_in.wait(5)
+        with mute:
+            print("raw_response: b")
+            b_in.set()
+            a_out.wait(5)
+
+    ta, tb = threading.Thread(target=thread_a), threading.Thread(target=thread_b)
+    ta.start(); tb.start(); ta.join(5); tb.join(5)
+    assert sys.stdout is real_stdout
+    print("visible")
+    out = capsys.readouterr().out
+    assert "raw_response" not in out and "visible" in out
