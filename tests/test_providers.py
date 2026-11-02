@@ -188,3 +188,27 @@ def test_vastai_terminate_retries():
         req.side_effect = [_vast_response(status=502), _vast_response({})]
         assert provider.terminate("1") is True
         assert req.call_count == 2
+
+
+@patch("conductor.providers.runpod.runpod")
+def test_runpod_wait_for_ssh_is_interruptible(mock_runpod):
+    from conductor import shutdown
+    from conductor.shutdown import Interrupted
+    mock_runpod.get_pod.return_value = {"id": "p", "desiredStatus": "RUNNING", "runtime": None}
+    shutdown.request()
+    with pytest.raises(Interrupted):
+        RunPodProvider().wait_for_ssh("p", timeout=900)
+    assert mock_runpod.get_pod.call_count == 1
+
+
+def test_vastai_wait_for_ssh_is_interruptible():
+    from conductor import shutdown
+    from conductor.shutdown import Interrupted
+    from conductor.providers.vastai import VastaiProvider
+    provider = VastaiProvider()
+    with patch.object(provider, "_req") as req:
+        req.return_value = _vast_response({"instances": [{"id": 1, "actual_status": "loading"}]})
+        shutdown.request()
+        with pytest.raises(Interrupted):
+            provider.wait_for_ssh("1", timeout=900)
+        assert req.call_count == 1

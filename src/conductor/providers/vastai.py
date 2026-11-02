@@ -7,13 +7,21 @@ from pathlib import Path
 
 import httpx
 
+from conductor import shutdown
 from conductor.errors import guarded
 from conductor.gpu_pricing import GpuInfo
 from conductor.retry import retry
+from conductor.shutdown import Interrupted
 
 log = logging.getLogger(__name__)
 
 BASE_URL = "https://console.vast.ai/api/v0"
+WAIT_POLL_SECONDS = 5.0
+
+
+def _pause(instance_id: str) -> None:
+    if shutdown.wait(WAIT_POLL_SECONDS):
+        raise Interrupted(f"shutdown requested while waiting for SSH info of {instance_id}")
 
 
 class VastaiProvider:
@@ -117,7 +125,7 @@ class VastaiProvider:
                 resp.raise_for_status()
                 instances = resp.json().get("instances", [])
             except Exception:
-                time.sleep(5)
+                _pause(instance_id)
                 continue
 
             for inst in instances:
@@ -133,7 +141,7 @@ class VastaiProvider:
                     return None
                 break
 
-            time.sleep(5)
+            _pause(instance_id)
         return None
 
     def _list_raw(self) -> list[dict]:

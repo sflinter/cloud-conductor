@@ -3,11 +3,11 @@ from __future__ import annotations
 
 import logging
 import random
-import time
 from typing import Callable, TypeVar
 
 import httpx
 
+from conductor import shutdown
 from conductor.errors import ConductorError, TRANSIENT_ERRORS, describe
 
 log = logging.getLogger(__name__)
@@ -18,7 +18,8 @@ RETRYABLE_HTTP_STATUS = {408, 425, 429, 500, 502, 503, 504}
 
 
 def _sleep(seconds: float) -> None:
-    time.sleep(seconds)
+    # Returns early when shutdown is requested: the next attempt runs at once
+    shutdown.wait(seconds)
 
 
 def is_retryable(exc: BaseException) -> bool:

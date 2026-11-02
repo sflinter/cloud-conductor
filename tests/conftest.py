@@ -18,6 +18,18 @@ def no_retry_sleeps(monkeypatch):
     monkeypatch.setattr("conductor.ssh.RETRY_MAX_SECONDS", 0.0)
     monkeypatch.setattr("conductor.provisioner.TERMINATE_POLL_SECONDS", 0.0)
     monkeypatch.setattr("conductor.provisioner.TERMINATE_VERIFY_SECONDS", 0.0)
+    monkeypatch.setattr("conductor.ssh.WAIT_SSH_POLL_SECONDS", 0.0)
+    monkeypatch.setattr("conductor.providers.runpod.WAIT_POLL_SECONDS", 0.0)
+    monkeypatch.setattr("conductor.providers.vastai.WAIT_POLL_SECONDS", 0.0)
+
+
+@pytest.fixture(autouse=True)
+def clear_shutdown_flag():
+    """The process-wide Ctrl-C flag must never leak between tests."""
+    from conductor import shutdown
+    shutdown.clear()
+    yield
+    shutdown.clear()
 
 
 @pytest.fixture

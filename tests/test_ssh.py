@@ -173,3 +173,25 @@ def test_wait_ssh_uses_single_attempt_probe():
         mock_exec.return_value = subprocess.CompletedProcess([], 0)
         assert wait_ssh("h", 1, "/key", timeout=900) is True
         assert mock_exec.call_args[1]["retries"] == 1
+
+
+def test_wait_ssh_raises_interrupted_on_shutdown():
+    from conductor import shutdown
+    from conductor.shutdown import Interrupted
+    import pytest
+    with patch("conductor.ssh.ssh_exec") as mock_exec:
+        mock_exec.return_value = subprocess.CompletedProcess([], 255, stderr="Connection refused")
+        shutdown.request()
+        with pytest.raises(Interrupted):
+            wait_ssh("1.2.3.4", 22222, "/key", timeout=900)
+        assert mock_exec.call_count == 1  # abandoned after one probe, not after the timeout
+
+
+def test_ssh_exec_stops_retrying_on_shutdown():
+    from conductor import shutdown
+    with patch("conductor.ssh.subprocess.run") as mock_run:
+        mock_run.return_value = subprocess.CompletedProcess([], 255, stdout="", stderr="refused")
+        shutdown.request()
+        result = ssh_exec("1.2.3.4", 22222, "/key", "echo ok")
+        assert result.returncode == 255
+        assert mock_run.call_count == 1

@@ -7,6 +7,9 @@ import random
 import subprocess
 import time
 
+from conductor import shutdown
+from conductor.shutdown import Interrupted
+
 log = logging.getLogger(__name__)
 
 SSH_OPTS = [
@@ -35,6 +38,7 @@ RSYNC_TRANSIENT_RC = {10, 12, 30, 35, 255, RC_TIMEOUT}
 DEFAULT_RETRIES = 3
 RETRY_BASE_SECONDS = 1.0
 RETRY_MAX_SECONDS = 15.0
+WAIT_SSH_POLL_SECONDS = 5.0
 
 
 def _ssh_base(host: str, port: int, key_path: str) -> list[str]:
@@ -69,7 +73,9 @@ def _run(cmd: list[str], timeout: int, retries: int, transient: set[int]) -> sub
         wait = min(delay, RETRY_MAX_SECONDS) * (0.5 + random.random())
         log.warning(f"{cmd[0]} failed with rc {result.returncode} (attempt {attempt}/{attempts}): "
                     f"{(result.stderr or '').strip()[:200]}; retrying in {wait:.1f}s")
-        time.sleep(wait)
+        if shutdown.wait(wait):
+            log.info(f"{cmd[0]}: shutdown requested, not retrying")
+            return result
         delay *= 2
     return result
 
@@ -133,12 +139,16 @@ def rsync_pull(
 
 
 def wait_ssh(host: str, port: int, key_path: str, timeout: int = 900) -> bool:
+    """Probe until SSH answers or `timeout` passes. Raises Interrupted if
+    shutdown is requested between probes, so a Ctrl-C during provisioning
+    returns within one poll interval."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         result = ssh_exec(host, port, key_path, "echo ok", timeout=10, retries=1)
         if result.returncode == 0:
             return True
-        time.sleep(5)
+        if shutdown.wait(WAIT_SSH_POLL_SECONDS):
+            raise Interrupted(f"shutdown requested while waiting for SSH at {host}:{port}")
     return False
 
 

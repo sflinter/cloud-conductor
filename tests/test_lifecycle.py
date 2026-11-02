@@ -665,3 +665,84 @@ def test_lifecycle_heartbeat_stays_fresh_while_start_blocks(mock_rec, mock_tick,
     assert beats == sorted(beats)         # and never went backwards
     assert load_state(state_path).heartbeat_at is None  # cleared on exit
     assert not any(t.name == "conductor-heartbeat" and t.is_alive() for t in __import__("threading").enumerate())
+
+
+# --- Ctrl-C during provisioning ---------------------------------------------
+
+@patch("conductor.monitor.send_notification", return_value=False)
+@patch("conductor.monitor.registry_update")
+@patch("conductor.monitor.registry_add")
+@patch("conductor.monitor.reconcile_run_pods")
+def test_first_ctrl_c_detaches_while_blocked_in_provisioning(mock_rec, mock_add, mock_upd, mock_notify, paths, capsys):
+    """The pod was created and the pipeline is waiting for its SSH info when
+    Ctrl-C arrives: the wait must return within one poll, the pod must be
+    kept (status still provisioning) and the detach message must name it."""
+    import signal
+    from conductor import shutdown
+    state_path, cost_path = paths
+    provider = _provider()
+    provider.create_instance.return_value = {"id": "pod-mid", "cost_per_hour": 0.24}
+
+    def _wait_for_ssh(instance_id, timeout=300):
+        signal.getsignal(signal.SIGINT)(signal.SIGINT, None)   # user presses Ctrl-C
+        shutdown.check("waiting for SSH info")                 # what the real poll loop does
+        raise AssertionError("unreachable")
+    provider.wait_for_ssh.side_effect = _wait_for_ssh
+
+    job = PodState(name="a", status="pending")
+    state = RunState(jobs=[job], run_id="abc123")
+    config = _make_config(name="a", gpu_type_id="NVIDIA RTX A2000", provision_timeout_seconds=900)
+    t0 = time.time()
+    with patch("conductor.monitor.get_provider", return_value=provider):
+        run_lifecycle([config], state, state_path, cost_path)
+    assert time.time() - t0 < 5
+
+    assert job.status == "provisioning" and job.pod_id == "pod-mid"
+    provider.terminate.assert_not_called()
+    saved = load_state(state_path)
+    assert saved.jobs[0].pod_id == "pod-mid" and saved.jobs[0].status == "provisioning"
+    assert saved.heartbeat_at is None
+    err = capsys.readouterr().err
+    assert "Detached" in err and "pod-mid" in err
+    assert not shutdown.requested()  # flag cleared for the next run in this process
+
+
+@patch("conductor.monitor.send_notification", return_value=False)
+@patch("conductor.monitor.registry_update")
+@patch("conductor.monitor.registry_add")
+@patch("conductor.monitor.deploy")
+@patch("conductor.monitor.provision_pod")
+def test_pipeline_does_not_start_deploy_after_ctrl_c(mock_prov, mock_deploy, mock_add, mock_upd, mock_notify, paths):
+    from conductor import shutdown
+    state_path, cost_path = paths
+
+    def _provision(provider, config, pod_state, run_id="", on_created=None, on_released=None):
+        pod_state.pod_id, pod_state.ssh_host, pod_state.ssh_port = "p", "h", 1
+        pod_state.status = "provisioning"
+        shutdown.request()   # Ctrl-C landed while SSH came up
+        return pod_state
+    mock_prov.side_effect = _provision
+    provider = _provider()
+    job = PodState(name="a", status="pending")
+    _provision_deploy_launch(provider, job, _make_config(name="a"), RunState(jobs=[job]), state_path, cost_path)
+    mock_deploy.assert_not_called()
+    provider.terminate.assert_not_called()
+    assert job.status == "provisioning" and job.pod_id == "p"
+
+
+@patch("conductor.monitor.send_notification", return_value=False)
+@patch("conductor.monitor.registry_update")
+@patch("conductor.monitor._provision_deploy_launch")
+def test_spot_recover_backoff_is_interruptible(mock_pdl, mock_upd, mock_notify, paths):
+    from conductor import shutdown
+    from conductor.monitor import _spot_recover
+    state_path, cost_path = paths
+    provider = _provider()
+    provider.check_exists.return_value = False
+    job = PodState(name="a", status="running", pod_id="dead", provision_attempts=1)
+    config = _make_config(name="a", backoff_base_seconds=600)
+    shutdown.request()
+    t0 = time.time()
+    _spot_recover(provider, job, config, RunState(jobs=[job]), state_path, cost_path)
+    assert time.time() - t0 < 2
+    mock_pdl.assert_not_called()

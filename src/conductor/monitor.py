@@ -10,6 +10,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
+from conductor import shutdown as shutdown_flag
 from conductor.config import JobConfig
 from conductor.deployer import deploy
 from conductor.errors import ConductorError, describe
@@ -19,6 +20,7 @@ from conductor.provisioner import check_pod_exists, provision_pod, refresh_ssh_i
 from conductor.registry import PodRecord, add_pod as registry_add, update_pod as registry_update
 from conductor.retry import retry
 from conductor.runner import LOG_TAIL_LINES, fetch_log_tail, get_log_path, get_utilization, is_alive, launch
+from conductor.shutdown import Interrupted
 from conductor.ssh import wait_ssh
 from conductor.state import (
     PodState, RunState, append_cost_event, get_job, pod_name_for, save_state,
@@ -87,6 +89,7 @@ def run_lifecycle(
     config_map = {c.name: c for c in configs}
     provider_map = {c.name: get_provider(c.provider) for c in configs}
     shutdown = {"requested": False, "teardown": teardown_on_interrupt}
+    shutdown_flag.clear()
 
     prev_handler = signal.signal(signal.SIGINT, make_sigint_handler(shutdown, state))
 
@@ -130,6 +133,7 @@ def run_lifecycle(
         raise
     finally:
         signal.signal(signal.SIGINT, prev_handler)
+        shutdown_flag.clear()
         heartbeat.stop()
         # This process no longer owns the run, whatever the exit path
         state.orchestrator_pid = None
@@ -152,6 +156,8 @@ def make_sigint_handler(shutdown: dict, state: RunState, hard_exit=os._exit):
             hard_exit(130)
             return
         shutdown["requested"] = True
+        # Wakes any pipeline thread blocked in an SSH/provider wait
+        shutdown_flag.request()
         if shutdown["teardown"]:
             log.warning("Ctrl-C: will sync and tear down all pods after the current step "
                         "(press again to force quit)")
@@ -254,6 +260,9 @@ def _monitor_tick(
                 _resume_job(prov, job, config, state, state_path, cost_log_path)
                 continue
             _tick_job(job, config, prov, state, state_path, cost_log_path)
+        except Interrupted as e:
+            log.info(f"[{job.name}] {e}; stopping the tick")
+            return
         except ConductorError as e:
             # Transient infrastructure error: keep the job, retry next tick
             log.warning(f"[{job.name}] Monitor tick failed, will retry: {e}")
@@ -438,6 +447,8 @@ def _start_unblocked_jobs(
     state_path: str,
     cost_log_path: str,
 ) -> None:
+    if shutdown_flag.requested():
+        return
     ready = []
     for job in state.jobs:
         if job.status != "pending":
@@ -499,6 +510,11 @@ def _provision_deploy_launch(
     cm = lock or contextlib.nullcontext()
     try:
         _pipeline(provider, job, config, state, state_path, cost_log_path, cm, resume=resume)
+    except Interrupted as e:
+        # Ctrl-C: leave the job exactly as persisted so `conductor run` resumes it
+        kept = (f"pod {job.pod_id} is kept and will be resumed" if job.pod_id
+                else "no pod was created")
+        log.warning(f"[{job.name}] {e} while {job.status}; {kept}")
     except Exception as e:
         if isinstance(e, ConductorError):
             log.error(f"[{job.name}] {e}")
@@ -595,6 +611,7 @@ def _pipeline(
         registry_update(job.pod_id, ssh_host=job.ssh_host, ssh_port=job.ssh_port, status="running")
 
     # Deploy (a resumed job re-runs setup: it may not have finished)
+    shutdown_flag.check(f"[{job.name}] provisioning")
     job.status = "deploying"
     with cm:
         save_state(state, state_path)
@@ -608,6 +625,7 @@ def _pipeline(
                           job=job.name, error=job.error)
         return
 
+    shutdown_flag.check(f"[{job.name}] deploying")
     _launch_job(provider, job, config, state, state_path, cm)
 
 
@@ -817,7 +835,10 @@ def _spot_recover(
     # Backoff
     backoff = config.backoff_base_seconds * (2 ** (job.provision_attempts - 1))
     log.info(f"[{job.name}] Waiting {backoff}s before re-provisioning")
-    time.sleep(backoff)
+    if shutdown_flag.wait(backoff):
+        log.warning(f"[{job.name}] Shutdown requested during recovery backoff; "
+                    f"will re-provision on the next 'conductor run'")
+        return
 
     # Reset pod info
     job.pod_id = None
