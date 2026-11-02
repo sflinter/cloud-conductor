@@ -413,3 +413,43 @@ def test_sync_covers_sync_failed_jobs(tmp_dir, monkeypatch, capsys):
     assert pull.call_count == 1
     out = capsys.readouterr().out
     assert "conductor teardown --jobs train" in out
+
+
+def test_validate_fails_fast_on_passphrase_key(capsys, tmp_dir, monkeypatch):
+    import subprocess
+    key_path = os.path.join(tmp_dir, "enc_key")
+    with open(key_path, "w") as f:
+        f.write("encrypted")
+    os.chmod(key_path, 0o600)
+    config_path = os.path.join(tmp_dir, "jobs.toml")
+    with open(config_path, "w") as f:
+        f.write(f'''
+[[jobs]]
+name = "test"
+run_command = "echo hi"
+ssh_key_path = "{key_path}"
+local_project_dir = "{tmp_dir}"
+''')
+
+    def run(cmd, **kwargs):
+        if cmd[0] == "ssh-keygen" and "-y" in cmd:
+            return subprocess.CompletedProcess(cmd, 255, stdout="", stderr="incorrect passphrase")
+        if cmd[0] == "ssh-keygen":
+            return subprocess.CompletedProcess(cmd, 0, stdout="3072 SHA256:zzz c (RSA)\n", stderr="")
+        return subprocess.CompletedProcess(cmd, 1, stdout="The agent has no identities.\n", stderr="")
+    monkeypatch.setattr("conductor.validator.subprocess.run", run)
+
+    with pytest.raises(SystemExit) as exc:
+        main(["validate", "--config", config_path])
+    assert exc.value.code == 1
+    out = capsys.readouterr().out
+    assert f"ssh-add --apple-use-keychain {key_path}" in out
+
+    # `conductor run` refuses before any provider is configured or pod created
+    from unittest.mock import MagicMock
+    lifecycle = MagicMock()
+    monkeypatch.setattr("conductor.cli.run_lifecycle", lifecycle)
+    monkeypatch.setattr("conductor.cli._configure_provider", lambda name: MagicMock())
+    with pytest.raises(SystemExit):
+        main(["run", "--config", config_path])
+    lifecycle.assert_not_called()

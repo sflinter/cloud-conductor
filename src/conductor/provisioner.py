@@ -5,7 +5,7 @@ import logging
 import time
 from typing import Callable
 
-from conductor.errors import ConductorError
+from conductor.errors import ConductorError, SshAuthError
 from conductor.gpu_pricing import select_cheapest_gpus
 from conductor.providers import CloudProvider
 from conductor.registry import PodRecord
@@ -67,7 +67,14 @@ def provision_pod_direct(
     ssh_host, ssh_port = ssh_info
     log.info(f"[{pod_name}] Waiting for SSH at {ssh_host}:{ssh_port}")
 
-    if not wait_ssh(ssh_host, ssh_port, ssh_key_path, timeout=provision_timeout):
+    try:
+        ready = wait_ssh(ssh_host, ssh_port, ssh_key_path, timeout=provision_timeout)
+    except SshAuthError as e:
+        # The pod is fine and billing; the key is not. Release it and stop.
+        log.error(f"[{pod_name}] {e}")
+        _release(provider, instance_id, pod_name, on_released)
+        raise
+    if not ready:
         log.warning(f"[{pod_name}] SSH timeout for instance {instance_id}")
         _release(provider, instance_id, pod_name, on_released)
         return None
@@ -147,25 +154,14 @@ def provision_pod(
     pod_state.status = "provisioning"
     for gpu_id in gpu_candidates:
         pod_state.provision_attempts += 1
-        record = provision_pod_direct(
-            provider=provider,
-            gpu_type_id=gpu_id,
-            image_name=cfg.image_name,
-            ssh_key_path=cfg.ssh_key_path,
-            name=cfg.name,
-            disk_gb=cfg.container_disk_in_gb,
-            pod_name=pod_name_for(run_id, cfg.name),
-            on_created=_created,
-            on_released=on_released,
-            provision_timeout=cfg.provision_timeout_seconds,
-            cloud_type=cfg.cloud_type,
-            volume_in_gb=cfg.volume_in_gb,
-            volume_mount_path=cfg.volume_mount_path,
-            vastai_min_reliability=cfg.vastai_min_reliability,
-            vastai_bid_price=cfg.vastai_bid_price,
-            vastai_num_gpus=cfg.vastai_num_gpus,
-            vastai_geolocation=cfg.vastai_geolocation,
-        )
+        try:
+            record = _provision_candidate(provider, cfg, gpu_id, run_id, _created, on_released)
+        except SshAuthError as e:
+            # Another GPU with the same key would fail the same way
+            _forget_released_pod(pod_state)
+            pod_state.status = "failed"
+            pod_state.error = str(e)
+            return pod_state
         if record:
             pod_state.pod_id = record.pod_id
             pod_state.gpu_type = record.gpu_type
@@ -177,16 +173,42 @@ def provision_pod(
             else:
                 pod_state.gpu_cost_per_hour = record.gpu_cost_per_hour
             return pod_state
-        if pod_state.pod_id:
-            # Created but never reachable: provision_pod_direct released it
-            # and on_released has recorded the outcome; forget it here
-            pod_state.pod_id = None
-            pod_state.ssh_host = None
-            pod_state.ssh_port = None
+        _forget_released_pod(pod_state)
 
     pod_state.status = "failed"
     pod_state.error = "All GPU types exhausted"
     return pod_state
+
+
+def _provision_candidate(provider, cfg, gpu_id, run_id, on_created, on_released) -> PodRecord | None:
+    return provision_pod_direct(
+        provider=provider,
+        gpu_type_id=gpu_id,
+        image_name=cfg.image_name,
+        ssh_key_path=cfg.ssh_key_path,
+        name=cfg.name,
+        disk_gb=cfg.container_disk_in_gb,
+        pod_name=pod_name_for(run_id, cfg.name),
+        on_created=on_created,
+        on_released=on_released,
+        provision_timeout=cfg.provision_timeout_seconds,
+        cloud_type=cfg.cloud_type,
+        volume_in_gb=cfg.volume_in_gb,
+        volume_mount_path=cfg.volume_mount_path,
+        vastai_min_reliability=cfg.vastai_min_reliability,
+        vastai_bid_price=cfg.vastai_bid_price,
+        vastai_num_gpus=cfg.vastai_num_gpus,
+        vastai_geolocation=cfg.vastai_geolocation,
+    )
+
+
+def _forget_released_pod(pod_state: PodState) -> None:
+    """A pod that was created but never became reachable has been released
+    (on_released recorded the outcome); the job no longer tracks it."""
+    if pod_state.pod_id:
+        pod_state.pod_id = None
+        pod_state.ssh_host = None
+        pod_state.ssh_port = None
 
 
 def _get_gpu_candidates(provider: CloudProvider, config) -> list[str]:

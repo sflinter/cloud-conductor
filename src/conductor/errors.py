@@ -27,6 +27,11 @@ class ConductorError(Exception):
     job failed instead of letting the orchestrator die."""
 
 
+class SshAuthError(ConductorError):
+    """sshd answered but rejected our key. Waiting longer or trying another
+    GPU with the same key cannot help, so the job fails immediately."""
+
+
 # Exceptions that mean "the outside world misbehaved", not "the code is wrong".
 TRANSIENT_ERRORS: tuple[type[BaseException], ...] = (
     subprocess.TimeoutExpired,

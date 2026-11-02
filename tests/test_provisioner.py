@@ -275,3 +275,24 @@ def test_provision_timeout_default(mock_ssh):
     provision_pod(provider, _make_config(), _make_pod())
     assert provider.wait_for_ssh.call_args[1]["timeout"] == 900
     assert mock_ssh.call_args[1]["timeout"] == 900
+
+
+def test_provision_auth_error_fails_job_without_trying_next_gpu():
+    from conductor.errors import SshAuthError
+    provider = _mock_provider()
+    provider.create_instance.return_value = {"id": "pod-key", "cost_per_hour": 0.1}
+    provider.wait_for_ssh.return_value = ("1.2.3.4", 22222)
+    provider.terminate.return_value = True
+    provider.check_exists.return_value = False
+    released = []
+    config = _make_config(gpu_type_ids_fallback=["NVIDIA RTX A4000", "NVIDIA L4"])
+    with patch("conductor.provisioner.wait_ssh",
+               side_effect=SshAuthError("SSH authentication to 1.2.3.4:22222 failed 3 times in a row")):
+        result = provision_pod(provider, config, _make_pod(),
+                               on_released=lambda pid, ok: released.append((pid, ok)))
+    assert result.status == "failed"
+    assert "authentication" in result.error
+    assert provider.create_instance.call_count == 1       # no further GPUs with the same key
+    provider.terminate.assert_called_once_with("pod-key")  # the pod is not left billing
+    assert released == [("pod-key", True)]
+    assert result.pod_id is None

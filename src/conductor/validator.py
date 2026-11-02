@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import stat
+import subprocess
 from dataclasses import dataclass, field
 
 from conductor.config import JobConfig
@@ -68,6 +69,59 @@ def _check_ssh_key(configs: list[JobConfig], result: ValidationResult) -> None:
         perms = stat.S_IMODE(mode)
         if perms & 0o077:
             result.warnings.append(f"SSH key {key} has loose permissions ({oct(perms)}), expected 0o600")
+
+        problem = check_ssh_key_usable(key)
+        if problem:
+            result.errors.append(problem)
+
+
+PASSPHRASE_MESSAGE = ("SSH key is passphrase-protected and not loaded in ssh-agent: "
+                      "run `ssh-add --apple-use-keychain {key}` or use an unencrypted key")
+
+
+def check_ssh_key_usable(key: str) -> str | None:
+    """The conductor runs ssh with BatchMode=yes, so a key must be usable
+    without a prompt: either `ssh-keygen -y -P '' -f <key>` succeeds (no
+    passphrase) or ssh-agent lists its fingerprint. Returns an error
+    message, or None if the key is usable or the check cannot be made."""
+    try:
+        probe = subprocess.run(["ssh-keygen", "-y", "-P", "", "-f", key],
+                               capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log.debug(f"Could not probe SSH key {key}: {e}")
+        return None
+    if probe.returncode == 0:
+        return None
+
+    fingerprint = _key_fingerprint(key)
+    if fingerprint and _agent_lists(fingerprint):
+        return None
+
+    stderr = (probe.stderr or "").strip()
+    if "passphrase" in stderr.lower() or fingerprint:
+        return PASSPHRASE_MESSAGE.format(key=key)
+    return f"SSH key {key} is not a usable private key (ssh-keygen: {stderr.splitlines()[-1] if stderr else 'unknown error'})"
+
+
+def _key_fingerprint(key: str) -> str | None:
+    """SHA256 fingerprint via `ssh-keygen -l -f`, which reads the public
+    part of an OpenSSH key without the passphrase."""
+    try:
+        r = subprocess.run(["ssh-keygen", "-l", "-f", key], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0:
+        return None
+    parts = (r.stdout or "").split()
+    return parts[1] if len(parts) >= 2 else None
+
+
+def _agent_lists(fingerprint: str) -> bool:
+    try:
+        r = subprocess.run(["ssh-add", "-l"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return r.returncode == 0 and fingerprint in (r.stdout or "")
 
 
 def _check_local_dirs(configs: list[JobConfig], result: ValidationResult) -> None:

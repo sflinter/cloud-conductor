@@ -24,6 +24,17 @@ def no_retry_sleeps(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def ssh_key_probe_succeeds(monkeypatch):
+    """The validator shells out to ssh-keygen/ssh-add; by default pretend
+    every key is unencrypted so tests with placeholder key files pass."""
+    import subprocess
+
+    def fake_run(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+    monkeypatch.setattr("conductor.validator.subprocess.run", fake_run)
+
+
+@pytest.fixture(autouse=True)
 def clear_shutdown_flag():
     """The process-wide Ctrl-C flag must never leak between tests."""
     from conductor import shutdown

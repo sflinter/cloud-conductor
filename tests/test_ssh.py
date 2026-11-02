@@ -195,3 +195,42 @@ def test_ssh_exec_stops_retrying_on_shutdown():
         result = ssh_exec("1.2.3.4", 22222, "/key", "echo ok")
         assert result.returncode == 255
         assert mock_run.call_count == 1
+
+
+def _denied(text="root@1.2.3.4: Permission denied (publickey,password)."):
+    return subprocess.CompletedProcess([], 255, stdout="", stderr=text)
+
+
+def test_wait_ssh_fails_fast_on_repeated_auth_rejection():
+    import pytest
+    from conductor.errors import SshAuthError
+    with patch("conductor.ssh.ssh_exec") as mock_exec:
+        mock_exec.return_value = _denied()
+        with pytest.raises(SshAuthError) as exc:
+            wait_ssh("1.2.3.4", 22222, "/key", timeout=900)
+        assert mock_exec.call_count == 3
+        msg = str(exc.value)
+        assert "1.2.3.4:22222" in msg and "/key" in msg and "Permission denied" in msg
+
+
+def test_wait_ssh_auth_counter_resets_on_other_failures():
+    import pytest
+    from conductor.errors import SshAuthError
+    with patch("conductor.ssh.ssh_exec") as mock_exec:
+        mock_exec.side_effect = [
+            _denied(), _denied(),
+            subprocess.CompletedProcess([], 255, stderr="Connection refused"),  # sshd restarted
+            _denied(), _denied(),
+            subprocess.CompletedProcess([], 0),
+        ]
+        assert wait_ssh("1.2.3.4", 22222, "/key", timeout=900) is True
+        assert mock_exec.call_count == 6
+
+    with patch("conductor.ssh.ssh_exec") as mock_exec:
+        mock_exec.side_effect = [
+            _denied("Received disconnect: Too many authentication failures"),
+            _denied("Warning: Identity file /key not accessible: No such file or directory.\nno such identity: /key"),
+            _denied("permission denied (publickey)"),
+        ]
+        with pytest.raises(SshAuthError):
+            wait_ssh("1.2.3.4", 22222, "/key", timeout=900)

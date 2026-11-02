@@ -8,6 +8,7 @@ import subprocess
 import time
 
 from conductor import shutdown
+from conductor.errors import SshAuthError
 from conductor.shutdown import Interrupted
 
 log = logging.getLogger(__name__)
@@ -39,6 +40,10 @@ DEFAULT_RETRIES = 3
 RETRY_BASE_SECONDS = 1.0
 RETRY_MAX_SECONDS = 15.0
 WAIT_SSH_POLL_SECONDS = 5.0
+
+# sshd is up but rejects the key: retrying cannot help
+AUTH_FAILURE_PATTERNS = ("permission denied", "too many authentication failures", "no such identity")
+AUTH_FAILURES_BEFORE_FATAL = 3
 
 
 def _ssh_base(host: str, port: int, key_path: str) -> list[str]:
@@ -138,15 +143,35 @@ def rsync_pull(
     return _run(cmd, timeout, retries, RSYNC_TRANSIENT_RC)
 
 
+def is_auth_failure(result: subprocess.CompletedProcess) -> bool:
+    err = (result.stderr or "").lower()
+    return result.returncode != 0 and any(p in err for p in AUTH_FAILURE_PATTERNS)
+
+
 def wait_ssh(host: str, port: int, key_path: str, timeout: int = 900) -> bool:
-    """Probe until SSH answers or `timeout` passes. Raises Interrupted if
-    shutdown is requested between probes, so a Ctrl-C during provisioning
-    returns within one poll interval."""
+    """Probe until SSH answers or `timeout` passes.
+
+    Raises SshAuthError once sshd has rejected the key
+    AUTH_FAILURES_BEFORE_FATAL times in a row (the pod is up; the key is
+    the problem). Raises Interrupted if shutdown is requested between
+    probes, so a Ctrl-C during provisioning returns within one poll."""
     deadline = time.time() + timeout
+    auth_failures = 0
     while time.time() < deadline:
         result = ssh_exec(host, port, key_path, "echo ok", timeout=10, retries=1)
         if result.returncode == 0:
             return True
+        if is_auth_failure(result):
+            auth_failures += 1
+            if auth_failures >= AUTH_FAILURES_BEFORE_FATAL:
+                detail = (result.stderr or "").strip().splitlines()[-1][:200]
+                raise SshAuthError(
+                    f"SSH authentication to {host}:{port} failed {auth_failures} times in a row "
+                    f"({detail}). The key {key_path} is not accepted: check it is the key "
+                    f"registered with the provider and, if passphrase-protected, that it is "
+                    f"loaded in ssh-agent (ssh-add --apple-use-keychain {key_path})")
+        else:
+            auth_failures = 0
         if shutdown.wait(WAIT_SSH_POLL_SECONDS):
             raise Interrupted(f"shutdown requested while waiting for SSH at {host}:{port}")
     return False
