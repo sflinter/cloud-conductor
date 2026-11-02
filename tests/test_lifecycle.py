@@ -610,3 +610,58 @@ def test_resume_uses_provision_timeout(mock_wait, mock_deploy, mock_launch, mock
     config = _make_config(name="a", provision_timeout_seconds=333)
     _monitor_tick([config], {"a": config}, {"a": provider}, state, *paths)
     assert mock_wait.call_args[1]["timeout"] == 333
+
+
+# --- heartbeat thread ----------------------------------------------------------
+
+def test_heartbeat_thread_refreshes_with_fake_clock(paths):
+    from conductor.monitor import Heartbeat
+    state_path, _ = paths
+    state = RunState(jobs=[PodState(name="a", status="provisioning", pod_id="p")], run_id="abc123")
+    now = {"t": 1000.0}
+    hb = Heartbeat(state, state_path, interval=0.01, clock=lambda: now["t"])
+    hb.start()
+    assert load_state(state_path).heartbeat_at == 1000.0  # first beat is synchronous
+    now["t"] = 2000.0
+    deadline = time.time() + 2
+    while load_state(state_path).heartbeat_at != 2000.0 and time.time() < deadline:
+        time.sleep(0.005)
+    assert load_state(state_path).heartbeat_at == 2000.0
+    hb.stop()
+    now["t"] = 3000.0
+    time.sleep(0.05)
+    assert load_state(state_path).heartbeat_at == 2000.0  # nothing beats after stop
+    assert load_state(state_path).jobs[0].pod_id == "p"   # the rest of the state is intact
+
+
+@patch("conductor.monitor.send_notification", return_value=False)
+@patch("conductor.monitor._monitor_tick")
+@patch("conductor.monitor.reconcile_run_pods")
+def test_lifecycle_heartbeat_stays_fresh_while_start_blocks(mock_rec, mock_tick, mock_notify, paths):
+    """_start_unblocked_jobs can block for provision_timeout_seconds; the run
+    must still read as live to `conductor status` the whole time."""
+    from conductor.monitor import POLL_INTERVAL
+    from conductor.state import run_is_live
+    state_path, cost_path = paths
+    job = PodState(name="a", status="pending")
+    state = RunState(jobs=[job], run_id="abc123")
+    config = _make_config(name="a")
+    samples = []
+
+    def blocking_start(configs, config_map, provider_map, st, sp, cp):
+        for _ in range(8):
+            time.sleep(0.05)
+            loaded = load_state(sp)
+            samples.append((loaded.heartbeat_at, run_is_live(loaded, POLL_INTERVAL)))
+        job.status = "completed"
+
+    with patch("conductor.monitor._start_unblocked_jobs", side_effect=blocking_start), \
+         patch("conductor.monitor.get_provider", return_value=_provider()):
+        run_lifecycle([config], state, state_path, cost_path, heartbeat_interval=0.05)
+
+    assert all(live for _, live in samples)
+    beats = [t for t, _ in samples]
+    assert len(set(beats)) >= 3           # refreshed several times while blocked
+    assert beats == sorted(beats)         # and never went backwards
+    assert load_state(state_path).heartbeat_at is None  # cleared on exit
+    assert not any(t.name == "conductor-heartbeat" and t.is_alive() for t in __import__("threading").enumerate())

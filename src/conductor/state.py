@@ -6,10 +6,16 @@ import json
 import os
 import secrets
 import tempfile
+import threading
 import time
 from dataclasses import asdict, dataclass, field
 
 from conductor.filelock import locked
+
+# Serialises snapshot-and-write of the state file within this process, so a
+# save from one thread (e.g. the heartbeat) can never land a stale snapshot
+# on top of a newer save from another.
+_SAVE_LOCK = threading.Lock()
 
 
 @dataclass
@@ -94,6 +100,11 @@ def load_state(path: str, lock: bool = True) -> RunState:
 
 
 def save_state(state: RunState, path: str, lock: bool = True) -> None:
+    with _SAVE_LOCK:
+        _save_state_unlocked(state, path, lock)
+
+
+def _save_state_unlocked(state: RunState, path: str, lock: bool) -> None:
     data = {
         "jobs": [asdict(j) for j in state.jobs],
         "total_cost_usd": state.total_cost_usd,

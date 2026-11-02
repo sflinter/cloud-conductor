@@ -28,6 +28,43 @@ from conductor.syncer import sync_pull, sync_push
 log = logging.getLogger(__name__)
 
 POLL_INTERVAL = 30
+HEARTBEAT_INTERVAL = POLL_INTERVAL / 2
+
+
+class Heartbeat:
+    """Daemon thread that refreshes state.heartbeat_at every `interval`
+    seconds for the whole lifecycle, so the run reads as live even while the
+    main thread is blocked for minutes in provision/deploy/launch."""
+
+    def __init__(self, state: RunState, state_path: str,
+                 interval: float = HEARTBEAT_INTERVAL, clock=time.time):
+        self.state = state
+        self.state_path = state_path
+        self.interval = interval
+        self.clock = clock
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="conductor-heartbeat", daemon=True)
+
+    def beat(self) -> None:
+        self.state.heartbeat_at = self.clock()
+        save_state(self.state, self.state_path)
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval):
+            try:
+                self.beat()
+            except Exception as e:
+                log.warning(f"Heartbeat could not save state: {describe(e)}")
+
+    def start(self) -> "Heartbeat":
+        self.beat()
+        self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=max(1.0, self.interval * 2))
 
 
 def run_lifecycle(
@@ -38,6 +75,7 @@ def run_lifecycle(
     budget_override: float = 0.0,
     provider: CloudProvider | None = None,
     teardown_on_interrupt: bool = False,
+    heartbeat_interval: float = HEARTBEAT_INTERVAL,
 ) -> RunState:
     if budget_override > 0:
         state.budget_usd = budget_override
@@ -53,9 +91,9 @@ def run_lifecycle(
     prev_handler = signal.signal(signal.SIGINT, make_sigint_handler(shutdown, state))
 
     state.orchestrator_pid = os.getpid()
-    state.heartbeat_at = time.time()
+    heartbeat = Heartbeat(state, state_path, interval=heartbeat_interval)
     try:
-        save_state(state, state_path)
+        heartbeat.start()
 
         # Match the provider's pods to this run before touching anything
         reconcile_run_pods(config_map, provider_map, state, state_path, cost_log_path)
@@ -92,6 +130,7 @@ def run_lifecycle(
         raise
     finally:
         signal.signal(signal.SIGINT, prev_handler)
+        heartbeat.stop()
         # This process no longer owns the run, whatever the exit path
         state.orchestrator_pid = None
         state.heartbeat_at = None
