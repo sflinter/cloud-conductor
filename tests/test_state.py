@@ -153,3 +153,17 @@ def test_run_is_live_and_owner_description(tmp_dir):
     save_state(state, path)
     loaded = load_state(path)
     assert loaded.orchestrator_pid == 4242 and loaded.heartbeat_at == state.heartbeat_at
+
+
+def test_accrue_cost_from_pod_creation():
+    from conductor.state import accrue_cost
+    job = PodState(name="a", status="provisioning", started_at=1000.0, gpu_cost_per_hour=0.5)
+    state = RunState(jobs=[job], total_cost_usd=1.0)
+    assert accrue_cost(job, state, now=1000.0 + 3600) == 0.5
+    assert job.cost_usd == 0.5 and state.total_cost_usd == 1.5
+    assert accrue_cost(job, state, now=1000.0 + 7200) == 0.5
+    assert job.cost_usd == 1.0 and state.total_cost_usd == 2.0
+    # Never goes backwards and never counts a pod with no rate or no start
+    assert accrue_cost(job, state, now=1000.0) == 0.0 and job.cost_usd == 1.0
+    assert accrue_cost(PodState(name="b", started_at=1.0), state) == 0.0
+    assert accrue_cost(PodState(name="c", gpu_cost_per_hour=1.0), state) == 0.0

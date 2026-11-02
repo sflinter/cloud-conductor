@@ -52,6 +52,26 @@ class RunState:
     heartbeat_at: float | None = None    # last tick of the live `conductor run`
 
 
+# Statuses in which the job's pod exists and is billing
+LIVE_STATUSES = ("provisioning", "deploying", "running", "sync_failed")
+
+
+def accrue_cost(job: PodState, state: RunState, now: float | None = None) -> float:
+    """Bring job.cost_usd up to date (elapsed since started_at, i.e. pod
+    creation, times the hourly rate) and add the increase to
+    state.total_cost_usd. Returns the increase."""
+    if not job.started_at or job.gpu_cost_per_hour <= 0:
+        return 0.0
+    now = time.time() if now is None else now
+    new_cost = max(0.0, now - job.started_at) / 3600 * job.gpu_cost_per_hour
+    delta = new_cost - job.cost_usd
+    if delta <= 0:
+        return 0.0
+    job.cost_usd = new_cost
+    state.total_cost_usd += delta
+    return delta
+
+
 def run_is_live(state: RunState, poll_interval: float = 30.0, now: float | None = None) -> bool:
     """True if an orchestrator has heart-beaten this state within the last
     two poll intervals. A detached or finished run clears its heartbeat."""

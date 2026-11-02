@@ -23,7 +23,8 @@ from conductor.runner import LOG_TAIL_LINES, fetch_log_tail, get_log_path, get_u
 from conductor.shutdown import Interrupted
 from conductor.ssh import wait_ssh
 from conductor.state import (
-    PodState, RunState, append_cost_event, get_job, pod_name_for, save_state,
+    LIVE_STATUSES, PodState, RunState, accrue_cost, append_cost_event, get_job, pod_name_for,
+    save_state,
 )
 from conductor.syncer import sync_pull, sync_push
 
@@ -256,7 +257,9 @@ def _monitor_tick(
         try:
             if job.status != "running":
                 # Persisted mid-flight by a previous orchestrator (ticks and
-                # pipelines never overlap, so nobody else is working on it)
+                # pipelines never overlap, so nobody else is working on it).
+                # Its pod has been billing since creation.
+                _update_cost(job, state, config, cost_log_path)
                 _resume_job(prov, job, config, state, state_path, cost_log_path)
                 continue
             _tick_job(job, config, prov, state, state_path, cost_log_path)
@@ -829,7 +832,8 @@ def _spot_recover(
         registry_update(job.pod_id, status="terminated", cost_usd=job.cost_usd)
         append_cost_event(cost_log_path, {
             "event": "pod_stopped", "job": job.name, "pod_id": job.pod_id,
-            "reason": "spot_interruption", "total_cost_usd": job.cost_usd,
+            "gpu_type": job.gpu_type, "reason": "spot_interruption",
+            "total_cost_usd": job.cost_usd,
         })
 
     # Backoff
@@ -906,7 +910,8 @@ def _finish_job(
 
     append_cost_event(cost_log_path, {
         "event": "pod_stopped", "job": job.name, "pod_id": job.pod_id,
-        "reason": status, "total_hours": elapsed_hours, "total_cost_usd": job.cost_usd,
+        "gpu_type": job.gpu_type, "reason": status, "total_hours": elapsed_hours,
+        "total_cost_usd": job.cost_usd,
     })
 
     job.status = status
@@ -946,13 +951,7 @@ def _final_sync(config: JobConfig, job: PodState) -> bool:
 
 
 def _update_cost(job: PodState, state: RunState, config: JobConfig, cost_log_path: str) -> None:
-    if not job.started_at or job.gpu_cost_per_hour <= 0:
-        return
-    elapsed_hours = (time.time() - job.started_at) / 3600
-    new_cost = elapsed_hours * job.gpu_cost_per_hour
-    delta = new_cost - job.cost_usd
-    job.cost_usd = new_cost
-    state.total_cost_usd += delta
+    accrue_cost(job, state)
 
     # Budget threshold notification
     cfg = config
@@ -1052,8 +1051,8 @@ def _graceful_shutdown(
             elapsed_hours = (time.time() - job.started_at) / 3600
             append_cost_event(cost_log_path, {
                 "event": "pod_stopped", "job": job.name, "pod_id": job.pod_id,
-                "reason": "interrupted", "total_hours": elapsed_hours,
-                "total_cost_usd": job.cost_usd,
+                "gpu_type": job.gpu_type, "reason": "interrupted",
+                "total_hours": elapsed_hours, "total_cost_usd": job.cost_usd,
             })
     save_state(state, state_path)
 

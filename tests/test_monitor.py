@@ -487,3 +487,19 @@ def test_monitor_tick_process_gone_pod_gone_needs_confirmation(mock_alive, mock_
         assert job.idle_since is None  # pod is not "alive", so no idle timer either
         _monitor_tick([config], {"a": config}, provider_map, state, sf.name, cf.name)
         mock_recover.assert_called_once()
+
+
+@patch("conductor.monitor.send_notification", return_value=False)
+@patch("conductor.monitor._start_unblocked_jobs")
+@patch("conductor.monitor._resume_job")
+def test_monitor_tick_accrues_cost_while_deploying(mock_resume, mock_start, mock_notify):
+    import time as _time
+    job = PodState(name="a", status="deploying", pod_id="p", started_at=_time.time() - 3600,
+                   gpu_cost_per_hour=0.5)
+    state = RunState(jobs=[job], budget_usd=40.0)
+    config = _make_config(name="a")
+    with tempfile.NamedTemporaryFile(suffix=".json") as sf, \
+         tempfile.NamedTemporaryFile(suffix=".jsonl") as cf:
+        _monitor_tick([config], {"a": config}, _mock_provider_map([config]), state, sf.name, cf.name)
+    assert job.cost_usd > 0.45 and state.total_cost_usd > 0.45
+    mock_resume.assert_called_once()

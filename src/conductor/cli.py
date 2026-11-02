@@ -20,8 +20,9 @@ from conductor.runner import exec_foreground, get_log_path, get_utilization, lau
 from conductor.deployer import deploy_direct
 from conductor.ssh import ssh_exec, ssh_interactive, tail_remote_log, tail_remote_log_subprocess
 from conductor.state import (
-    PodState, RunState, append_cost_event, describe_owner, get_job, init_state, load_state,
-    new_run_id, read_cost_log, reset_job_for_retry, run_is_live, save_state,
+    LIVE_STATUSES, PodState, RunState, accrue_cost, append_cost_event, describe_owner, get_job,
+    init_state, load_state, new_run_id, read_cost_log, reset_job_for_retry, run_is_live,
+    save_state,
 )
 from conductor.syncer import sync_pull
 from conductor.validator import validate
@@ -419,6 +420,11 @@ def cmd_status(args):
     state = load_state(state_path)
     print(f"Run {state.run_id or '(no id)'}: orchestrator {describe_owner(state, POLL_INTERVAL)}")
 
+    # A pod bills from creation, not from the last monitor tick
+    for job in state.jobs:
+        if job.status in LIVE_STATUSES:
+            accrue_cost(job, state)
+
     # Reconcile running jobs against provider to detect terminated pods
     provider_cache: dict[str, CloudProvider] = {}
     for job in state.jobs:
@@ -548,6 +554,7 @@ def cmd_teardown(args):
         return
 
     state = load_state(state_path)
+    cost_log_path = configs[0].cost_log_file
     _refuse_if_live(state, "teardown", args)
     pods = [(j.name, j.pod_id) for j in state.jobs if j.pod_id]
     if not pods:
@@ -563,18 +570,47 @@ def cmd_teardown(args):
             print("Aborted.")
             return
 
+    unverified = []
     for job in state.jobs:
         if not job.pod_id:
             continue
         cfg = config_map.get(job.name)
         prov = providers.get(cfg.provider) if cfg else providers.get("runpod")
         print(f"Tearing down {job.name} ({job.pod_id})...")
-        teardown_pod(prov, job.pod_id)
-        job.status = "failed"
-        job.error = "manual teardown"
+        ok = teardown_pod(prov, job.pod_id)
+        _record_manual_teardown(job, state, cost_log_path, ok)
+        if not ok:
+            unverified.append(job)
 
     save_state(state, state_path)
-    print("All pods terminated.")
+    if unverified:
+        print("Could not confirm termination of: "
+              + ", ".join(f"{j.name} ({j.pod_id})" for j in unverified)
+              + ". They may still be billing; check the provider console.")
+    else:
+        print("All pods terminated.")
+
+
+def _record_manual_teardown(job: PodState, state: RunState, cost_log_path: str, verified: bool) -> None:
+    """Account for a pod released by `conductor teardown`: registry,
+    cost log and the job's outcome in the state file."""
+    accrue_cost(job, state)
+    elapsed_hours = (time.time() - job.started_at) / 3600 if job.started_at else 0.0
+    try:
+        update_pod(job.pod_id, status="terminated" if verified else "running", cost_usd=job.cost_usd)
+    except Exception as e:
+        print(f"  warning: could not update pod registry: {e}", file=sys.stderr)
+    append_cost_event(cost_log_path, {
+        "event": "pod_stopped", "job": job.name, "pod_id": job.pod_id,
+        "gpu_type": job.gpu_type, "reason": "manual_teardown", "verified": verified,
+        "total_hours": elapsed_hours, "total_cost_usd": job.cost_usd,
+    })
+    if job.status in LIVE_STATUSES or job.status == "pending":
+        job.status = "failed"
+    error = "torn down manually"
+    if not verified:
+        error += f"; pod {job.pod_id} teardown unverified, it may still be running"
+    job.error = error
 
 
 def cmd_dry_run(args):
@@ -746,9 +782,12 @@ def cmd_report(args):
             gpu_summary[gpu]["hours"] += hours
             gpu_summary[gpu]["cost"] += cost
 
-        # Handle active (no stop yet)
-        if starts and not stops:
-            start = starts[-1]
+        # Pods started but never stopped are still billing
+        stopped_ids = {e.get("pod_id") for e in stops if e.get("pod_id")}
+        active = [e for e in starts if e.get("pod_id") and e["pod_id"] not in stopped_ids]
+        if not active and len(starts) > len(stops):
+            active = [starts[-1]]   # old logs without pod IDs
+        for start in active:
             gpu = start.get("gpu_type", "unknown")
             cost_per_hr = start.get("cost_per_hour", 0)
             hours = (time.time() - start["ts"]) / 3600

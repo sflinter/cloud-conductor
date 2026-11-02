@@ -453,3 +453,89 @@ local_project_dir = "{tmp_dir}"
     with pytest.raises(SystemExit):
         main(["run", "--config", config_path])
     lifecycle.assert_not_called()
+
+
+def test_teardown_records_outcome_and_cost(tmp_dir, monkeypatch, capsys):
+    import time
+    from unittest.mock import MagicMock
+    from conductor.state import PodState, load_state, read_cost_log
+    config_path, state_path = _write_run_fixture(tmp_dir, [
+        PodState(name="train", status="provisioning", pod_id="p1", gpu_type="RTX 2000 Ada",
+                 gpu_cost_per_hour=0.24, started_at=time.time() - 3600),
+        PodState(name="eval", status="pending"),
+    ])
+    cost_path = os.path.join(tmp_dir, "cost.jsonl")
+    with open(cost_path, "w") as f:
+        f.write(json.dumps({"ts": time.time() - 3600, "event": "pod_started", "job": "train",
+                            "pod_id": "p1", "gpu_type": "RTX 2000 Ada", "cost_per_hour": 0.24}) + "\n")
+    provider = MagicMock()
+    provider.terminate.return_value = True
+    provider.check_exists.return_value = False
+    monkeypatch.setattr("conductor.cli._configure_provider", lambda name: provider)
+    registry = MagicMock()
+    monkeypatch.setattr("conductor.cli.update_pod", registry)
+
+    main(["teardown", "--config", config_path, "--force"])
+
+    provider.terminate.assert_called_once_with("p1")
+    registry.assert_called_once()
+    assert registry.call_args[0][0] == "p1"
+    assert registry.call_args[1]["status"] == "terminated"
+    assert registry.call_args[1]["cost_usd"] > 0.2
+
+    saved = load_state(state_path)
+    train = saved.jobs[0]
+    assert train.status == "failed" and train.error == "torn down manually"
+    assert 0.2 < train.cost_usd < 0.3 and saved.total_cost_usd == train.cost_usd
+    assert saved.jobs[1].status == "pending"  # never had a pod: untouched
+
+    events = read_cost_log(cost_path)
+    stop = [e for e in events if e["event"] == "pod_stopped"]
+    assert len(stop) == 1
+    assert stop[0]["reason"] == "manual_teardown" and stop[0]["pod_id"] == "p1"
+    assert stop[0]["verified"] is True and stop[0]["total_cost_usd"] == train.cost_usd
+    assert stop[0]["gpu_type"] == "RTX 2000 Ada"
+
+    main(["report", "--config", config_path])
+    out = capsys.readouterr().out
+    row = [l for l in out.splitlines() if l.startswith("train")][0]
+    assert "manual_teardown" in row and "running" not in row
+
+
+def test_teardown_unverified_is_recorded_as_such(tmp_dir, monkeypatch, capsys):
+    from unittest.mock import MagicMock
+    from conductor.state import PodState, load_state, read_cost_log
+    config_path, state_path = _write_run_fixture(tmp_dir, [
+        PodState(name="train", status="running", pod_id="p1"),
+        PodState(name="eval", status="pending"),
+    ])
+    provider = MagicMock()
+    provider.terminate.return_value = False
+    monkeypatch.setattr("conductor.cli._configure_provider", lambda name: provider)
+    registry = MagicMock()
+    monkeypatch.setattr("conductor.cli.update_pod", registry)
+
+    main(["teardown", "--config", config_path, "--force"])
+
+    assert registry.call_args[1]["status"] == "running"
+    train = load_state(state_path).jobs[0]
+    assert train.status == "failed" and "unverified" in train.error
+    assert read_cost_log(os.path.join(tmp_dir, "cost.jsonl"))[0]["verified"] is False
+    assert "may still be billing" in capsys.readouterr().out
+
+
+def test_status_accrues_cost_for_provisioning_pod(tmp_dir, monkeypatch, capsys):
+    import time
+    from unittest.mock import MagicMock
+    from conductor.state import PodState
+    config_path, _ = _write_run_fixture(tmp_dir, [
+        PodState(name="train", status="provisioning", pod_id="p1", gpu_cost_per_hour=0.5,
+                 started_at=time.time() - 3600),
+        PodState(name="eval", status="pending"),
+    ])
+    monkeypatch.setattr("conductor.cli.reconcile_with_provider", lambda: [])
+    monkeypatch.setattr("conductor.cli._configure_provider", lambda name: MagicMock())
+    main(["status", "--config", config_path])
+    out = capsys.readouterr().out
+    row = [l for l in out.splitlines() if l.startswith("train")][0]
+    assert "$0.50" in row
