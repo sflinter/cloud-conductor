@@ -385,7 +385,10 @@ cloud-conductor/
 │       ├── syncer.py       # rsync sync_paths from pod to local
 │       ├── monitor.py      # main loop: check status, sync, spot recovery, cost tracking, deps
 │       ├── state.py        # per-run state file + cost log read/write, PodState dataclass
-│       ├── ssh.py          # SSH/rsync helpers (shared by all modules)
+│       ├── ssh.py          # SSH/rsync helpers (shared by all modules), never raise, retry transient rc
+│       ├── errors.py       # ConductorError + guarded(): one exception type for transport/SDK failures
+│       ├── retry.py        # retry(): exponential backoff with jitter for provider calls
+│       ├── filelock.py     # flock on a hidden .lock sibling for state file and registry
 │       ├── gpu_pricing.py  # query RunPod API for GPU types/prices, auto-select cheapest
 │       ├── notify.py       # notification dispatch (terminal-notifier, pushover, command)
 │       └── validator.py    # pre-flight config validation (SSH keys, paths, GPU IDs, etc.)

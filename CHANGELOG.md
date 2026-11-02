@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.6.0 (unreleased)
+## 0.6.0
 
 Reliability release — see `RELIABILITY_REVIEW.md` for the findings that drove it.
 

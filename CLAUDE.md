@@ -27,7 +27,7 @@ Python 3.12+. Uses `uv` for package management (never pip/conda).
 - **Imperative**: `conductor pod provision/deploy/exec/ssh/teardown` — direct pod management, no config file needed
 - **Declarative**: `conductor run -f jobs.toml` — batch lifecycle with dependency resolution
 
-**Lifecycle** (declarative): Provision → Deploy → Launch → Monitor → Teardown (with spot recovery loop back to Provision).
+**Lifecycle** (declarative): Reconcile (match the provider's `conductor-<run_id>-*` pods to state) → Provision → Deploy → Launch → Monitor → Teardown (with spot recovery loop back to Provision). Every run has a short `run_id`; pod IDs are persisted to the state file and registry the instant the provider returns them.
 
 Key modules:
 - `cli.py` — argparse entry point with `pod` subcommand group (imperative) and traditional subcommands (declarative)
@@ -38,18 +38,23 @@ Key modules:
 - `registry.py` — global pod registry (`~/.conductor/pods.json`), tracks all pods regardless of creation mode; `reconcile_with_provider()` verifies pod status against the actual cloud provider
 - `provisioner.py` — provider-agnostic provisioning; `provision_pod_direct()` for imperative, `provision_pod()` for declarative
 - `deployer.py` — `deploy_direct()` for imperative rsync, `deploy()` wrapper for declarative
-- `runner.py` — `launch_direct()` and `exec_foreground()` for imperative, `launch()` wrapper for declarative
-- `monitor.py` — main loop: status checks, periodic sync, spot recovery, cost tracking, GPU stall detection, dependency resolution
-- `state.py` — `PodState` dataclass (includes `idle_since`, `stalled_since`), JSON state file + JSONL cost log I/O
-- `ssh.py` — SSH/rsync helpers (all connections use `-o StrictHostKeyChecking=no` for ephemeral pods)
+- `runner.py` — `launch_direct()` writes `.conductor_run.sh` (`cd <dir> && ( <cmd> ); echo $? > .conductor_exit`) and `.conductor_launch.sh` (`setsid nohup bash .conductor_run.sh > conductor_job.log 2>&1 < /dev/null &`, records pid + start time from `/proc/<pid>/stat`, idempotent: reports an already-running job instead of starting another); `is_alive()` returns a tri-state `ProcessStatus` (running / exited with code / unknown); `fetch_log_tail()`; `exec_foreground()` for imperative, `launch()` wrapper for declarative
+- `monitor.py` — main loop: startup reconciliation by run ID, resume of in-flight jobs, exit-file/process checks, periodic sync, spot recovery (only after `recovery_confirmations` confirmed "pod gone" answers), cost tracking, GPU stall detection, dependency resolution, heartbeat, Ctrl-C detach, crash handler that prints every live pod ID
+- `state.py` — `PodState` dataclass (includes `pid`, `pid_start`, `exit_code`, `gone_confirmations`, `idle_since`, `stalled_since`), `RunState` (`run_id`, `orchestrator_pid`, `heartbeat_at`), JSON state file + JSONL cost log I/O, all under the file lock
+- `ssh.py` — SSH/rsync helpers. Never raise: timeouts/OS errors come back as a failed `CompletedProcess`; ssh rc 255 and rsync transient codes are retried with backoff. Options: `StrictHostKeyChecking=no`, `ConnectTimeout=15`, `ServerAliveInterval=15`, `ServerAliveCountMax=3`, `BatchMode=yes`; rsync `--partial --timeout=120`
+- `errors.py` — `ConductorError` and `guarded()`: the one exception type for SDK/HTTP/JSON/OS failures
+- `retry.py` — `retry()` with exponential backoff and jitter; retries transport errors, 429 and 5xx, never other 4xx or auth errors. Wraps idempotent provider calls only (never instance creation)
+- `filelock.py` — `locked(path)`: `flock` on a hidden `.lock` sibling, used for every read-modify-write of the state file and registry (also serialises pool threads)
 - `gpu_pricing.py` — queries provider GPU catalog for prices, caches 5 min
 - `notify.py` — notification dispatch (terminal-notifier, pushover, or custom command)
 - `validator.py` — pre-flight checks (SSH keys, paths, GPU IDs, dependency cycles)
 
 **State files** (created at runtime, not committed):
 - `~/.conductor/pods.json` — global pod registry (imperative + declarative pods)
-- `.conductor_state.json` — per-project batch run state (source of truth for declarative `conductor status`)
+- `.conductor_state.json` — per-project batch run state (source of truth for declarative `conductor status`); carries `run_id`, `orchestrator_pid`, `heartbeat_at`
 - `.conductor_cost_log.jsonl` — append-only cost events for `conductor report`
+- `.<name>.lock` siblings of the state file and registry — `flock` lock files, safe to leave in place
+- On the pod, in `remote_project_dir`: `conductor_job.log`, `.conductor_pid`, `.conductor_pid_start`, `.conductor_exit`, `.conductor_run.sh`, `.conductor_launch.sh`
 
 ## Dependencies
 
@@ -65,7 +70,12 @@ Intentionally minimal:
 - **Dual-mode CLI**: imperative `conductor pod` commands for ad-hoc work, declarative `conductor run -f` for batch orchestration
 - Core operations (`provision_pod_direct`, `deploy_direct`, `launch_direct`) are decoupled from config — imperative commands use them directly
 - Global pod registry at `~/.conductor/pods.json` tracks all pods (includes `provider` field for teardown without config); `conductor status` reconciles registry bidirectionally against the provider API — marks missing pods as terminated and resurrects terminated pods found still running
-- Before provisioning a replacement pod (spot recovery or re-provision), the old pod is always terminated first to prevent orphans
+- Before provisioning a replacement pod (spot recovery or re-provision), the old pod is always terminated first to prevent orphans; `teardown_pod()` retries and then polls the provider until the pod is confirmed gone, and an unverified teardown is never recorded as terminated
+- A transient failure must never kill the orchestrator or destroy a healthy pod: SSH/rsync return failed results instead of raising, provider calls raise `ConductorError`, any exception in a job pipeline or monitor tick fails only that job, and a pod is treated as reclaimed only after `recovery_confirmations` consecutive confirmed "gone" answers (a `None` from `check_exists()` means "could not tell")
+- Job completion comes from the remote exit file, immediately and with the real exit code; `idle_timeout_minutes` is only the fallback when the process vanished without one
+- Ctrl-C detaches (pods keep running, `conductor run` resumes); `--teardown-on-interrupt` is the destructive variant. One live orchestrator per state file, enforced by the heartbeat; `teardown`/`sync` refuse while a run is live unless `--force`
+- The final sync is retried and, if it keeps failing, the pod is kept alive and the job marked `sync_failed` rather than losing results; budget stops still force the teardown
+- On any abnormal exit, every live pod ID is printed with its job; pods are torn down on a crash only when `teardown_on_crash = true`
 - `run_command` is an opaque user-supplied shell string — the conductor never parses it
 - Per-job overrides: any `[global]` config field can be overridden in a `[[jobs]]` entry
 - `depends_on` supports job ordering with cycle detection; failed dependencies cascade as `skipped`
@@ -76,7 +86,7 @@ Intentionally minimal:
 ## RunPod Operational Notes
 
 - Most RunPod images lack rsync — deploy step must `apt-get install -y rsync` first
-- Use `</dev/null &` with nohup over SSH to prevent hangs
+- Use `setsid nohup ... > log 2>&1 < /dev/null &` over SSH to prevent hangs and detach the job from the SSH session; kill the process group (`kill -- -<pid>`) to stop it
 - Pod SSH ports are dynamic (random public port → container port 22) — query API to discover
 - Always sync results before teardown — data is lost once a pod is terminated
 - Check both pod status (eviction) AND process status (crash) separately
