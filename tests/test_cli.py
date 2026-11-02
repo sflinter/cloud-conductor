@@ -18,6 +18,26 @@ def test_help(capsys):
         assert cmd in captured.out
 
 
+def test_stdout_is_line_buffered(monkeypatch):
+    import io
+    import sys
+    buf = io.BytesIO()
+    out = io.TextIOWrapper(buf, encoding="utf-8")   # block-buffered, like a redirected file
+    monkeypatch.setattr(sys, "stdout", out)
+    assert out.line_buffering is False
+    main(["version"])
+    assert out.line_buffering is True
+    assert b"conductor" in buf.getvalue()   # flushed at the newline, not at exit
+
+
+def test_line_buffer_stdout_tolerates_odd_streams(monkeypatch):
+    import io
+    import sys
+    from conductor.cli import line_buffer_stdout
+    monkeypatch.setattr(sys, "stdout", io.StringIO())   # no reconfigure()
+    line_buffer_stdout()
+
+
 def test_no_command(capsys):
     with pytest.raises(SystemExit) as exc:
         main([])

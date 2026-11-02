@@ -50,6 +50,16 @@ def configure_logging(level: int = logging.INFO) -> None:
     logging.basicConfig(level=level, handlers=[handler], force=True)
 
 
+def line_buffer_stdout() -> None:
+    """print() output (run banner, status tables, teardown progress) must
+    reach a redirected stdout as it happens, interleaved with the log on
+    stderr, not in one block at exit."""
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except (AttributeError, ValueError, OSError):
+        pass
+
+
 def log_file_for(state_path: str) -> str:
     return os.path.join(os.path.dirname(state_path) or ".", LOG_FILE_NAME)
 
@@ -250,6 +260,7 @@ def main(argv=None):
         parser.print_help()
         sys.exit(1)
 
+    line_buffer_stdout()
     configure_logging()
 
     # Commands that don't need a config file
