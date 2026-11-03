@@ -24,7 +24,7 @@ from conductor.shutdown import Interrupted
 from conductor.ssh import wait_ssh
 from conductor.state import (
     LIVE_STATUSES, PodState, RunState, accrue_cost, append_cost_event, budget_exceeded,
-    elapsed_seconds, get_job, pod_name_for, record_pod_stopped, save_state,
+    elapsed_seconds, get_job, pod_name_for, record_pod_stopped, reset_deploy_progress, save_state,
 )
 from conductor.syncer import sync_pull, sync_push
 
@@ -681,12 +681,20 @@ def _pipeline(
     else:
         registry_update(job.pod_id, ssh_host=job.ssh_host, ssh_port=job.ssh_port, status="running")
 
-    # Deploy (a resumed job re-runs setup: it may not have finished)
+    # Deploy. A resumed job continues from its first incomplete deploy
+    # step on the same pod (setup is never run twice); otherwise start over.
     shutdown_flag.check(f"[{job.name}] provisioning")
+    if not adopt:
+        reset_deploy_progress(job)
     job.status = "deploying"
     with cm:
         save_state(state, state_path)
-    if not deploy(config, job, is_reuse=is_reuse):
+
+    def _save_step() -> None:
+        with cm:
+            save_state(state, state_path)
+
+    if not deploy(config, job, is_reuse=is_reuse, on_step=_save_step):
         job.status = "failed"
         job.error = "deploy failed"
         _mark_finished(job)
@@ -780,6 +788,7 @@ def _resume_job(
             job.ssh_port = None
             job.pid = None
             job.pid_start = None
+            reset_deploy_progress(job)
     log.info(f"[{job.name}] Resuming job persisted as '{job.status}'")
     _provision_deploy_launch(provider, job, config, state, state_path, cost_log_path, resume=True)
 
@@ -850,6 +859,7 @@ def reconcile_run_pods(
                 job.ssh_port = None
                 job.pid = None
                 job.pid_start = None
+                reset_deploy_progress(job)
                 if job.status == "running":
                     job.status = "provisioning"
                 _register_pod(job, config, state.run_id)
@@ -921,6 +931,7 @@ def _spot_recover(
     job.ssh_port = None
     job.pid = None
     job.pid_start = None
+    reset_deploy_progress(job)
     job.gone_confirmations = 0
 
     # Re-provision, re-deploy, push synced results, re-launch

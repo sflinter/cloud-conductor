@@ -73,51 +73,75 @@ def deploy_direct(
     return True
 
 
-def deploy(config, pod_state, is_reuse: bool = False) -> bool:
+# Deploy progress, recorded in PodState.deploy_steps as each step finishes
+STEP_SYNCED = "synced"
+STEP_UPLOADED = "uploaded"
+STEP_SETUP_STARTED = "setup_started"
+STEP_SETUP_DONE = "setup_done"
+
+
+def deploy(config, pod_state, is_reuse: bool = False, on_step=None) -> bool:
+    """Code sync → upload_paths → setup, skipping the steps already in
+    pod_state.deploy_steps (a resumed deploy continues from the first
+    incomplete step: setup is never run twice on the same pod). on_step()
+    is called after each recorded step so the caller can persist it."""
     from conductor.config import JobConfig
     cfg: JobConfig = config
 
     host = pod_state.ssh_host
     port = pod_state.ssh_port
     key = cfg.ssh_key_path
+    steps = pod_state.deploy_steps
+    if steps:
+        log.info(f"[{cfg.name}] Resuming deploy; already done: {', '.join(steps)}")
+
+    def _mark(step: str) -> None:
+        if step not in steps:
+            steps.append(step)
+        if on_step is not None:
+            on_step()
 
     if cfg.deploy_method == "image":
         log.info(f"[{cfg.name}] Image deploy — skipping code rsync")
-        if cfg.upload_paths or cfg.setup_command:
-            if cfg.upload_paths:
-                _install_rsync(cfg.name, host, port, key)
+        if cfg.upload_paths and STEP_UPLOADED not in steps:
+            _install_rsync(cfg.name, host, port, key)
+    elif STEP_SYNCED not in steps:
+        if not _install_rsync(cfg.name, host, port, key):
+            return False
+
+        src = cfg.local_project_dir.rstrip("/") + "/"
+        dst = cfg.remote_project_dir.rstrip("/") + "/"
+
+        ssh_exec(host, port, key, f"mkdir -p {dst}")
+
+        log.info(f"[{cfg.name}] Syncing {src} → {dst}")
+        excludes = [*cfg.rsync_excludes, *(e for e in CONDUCTOR_EXCLUDES if e not in cfg.rsync_excludes)]
+        result = rsync(src, dst, host, port, key, excludes=excludes, delete=True,
+                       timeout=cfg.deploy_timeout_seconds)
+        if result.returncode != 0:
+            log.error(f"[{cfg.name}] rsync failed: {result.stderr}")
+            return False
+        _mark(STEP_SYNCED)
+
+    if STEP_UPLOADED not in steps:
+        shutdown.check(f"[{cfg.name}] code sync")
         if not _upload_paths(cfg, host, port, key):
             return False
-        if cfg.setup_command and not is_reuse:
-            return _run_setup(cfg, host, port, key)
+        _mark(STEP_UPLOADED)
+
+    if not cfg.setup_command or is_reuse:
         return True
-
-    # rsync deploy
-    if not _install_rsync(cfg.name, host, port, key):
-        return False
-
-    src = cfg.local_project_dir.rstrip("/") + "/"
-    dst = cfg.remote_project_dir.rstrip("/") + "/"
-
-    ssh_exec(host, port, key, f"mkdir -p {dst}")
-
-    log.info(f"[{cfg.name}] Syncing {src} → {dst}")
-    excludes = [*cfg.rsync_excludes, *(e for e in CONDUCTOR_EXCLUDES if e not in cfg.rsync_excludes)]
-    result = rsync(src, dst, host, port, key, excludes=excludes, delete=True,
-                   timeout=cfg.deploy_timeout_seconds)
-    if result.returncode != 0:
-        log.error(f"[{cfg.name}] rsync failed: {result.stderr}")
-        return False
-
-    shutdown.check(f"[{cfg.name}] code sync")
-    if not _upload_paths(cfg, host, port, key):
-        return False
-
-    if cfg.setup_command and not is_reuse:
-        shutdown.check(f"[{cfg.name}] upload")
-        return _run_setup(cfg, host, port, key)
-
-    return True
+    if STEP_SETUP_DONE in steps:
+        code = pod_state.setup_exit_code
+        log.info(f"[{cfg.name}] Setup already ran on this pod (exit code {code}); skipping")
+        return code == 0
+    shutdown.check(f"[{cfg.name}] upload")
+    code = _run_setup(cfg, host, port, key, started=STEP_SETUP_STARTED in steps,
+                      on_started=lambda: _mark(STEP_SETUP_STARTED))
+    if code is not None:
+        pod_state.setup_exit_code = code
+        _mark(STEP_SETUP_DONE)
+    return code == 0
 
 
 def _install_rsync(name: str, host: str, port: int, key: str) -> bool:
@@ -231,16 +255,35 @@ def setup_log_tail(config, host: str, port: int, key: str, lines: int = SETUP_LO
     return result.stdout.rstrip() if result.returncode == 0 else ""
 
 
-def _run_setup(config, host: str, port: int, key: str) -> bool:
-    log.info(f"[{config.name}] Running setup command detached (timeout {config.setup_timeout_seconds}s, "
-             f"log {config.remote_project_dir.rstrip('/')}/{SETUP_LOG})")
-    if not start_setup(config, host, port, key):
-        return False
+def _run_setup(config, host: str, port: int, key: str, started: bool = False,
+               on_started=None) -> int | None:
+    """Run setup_command detached and wait for it. started: a previous
+    orchestrator already started it on this pod; wait for that run (it may
+    still be going, or have finished) instead of starting it again, unless
+    it is gone without an exit code. Returns the exit code, or None when it
+    timed out, vanished or could not be started."""
+    log_path = f"{config.remote_project_dir.rstrip('/')}/{SETUP_LOG}"
+    if started:
+        state, code = setup_status(config, host, port, key)
+        if state == "gone":
+            log.warning(f"[{config.name}] Setup started by a previous run is gone without an exit "
+                        f"code (pod restarted?); starting it again")
+            started = False
+        else:
+            log.info(f"[{config.name}] Setup was started by a previous run; waiting for it "
+                     f"(log {log_path})")
+    if not started:
+        log.info(f"[{config.name}] Running setup command detached "
+                 f"(timeout {config.setup_timeout_seconds}s, log {log_path})")
+        if not start_setup(config, host, port, key):
+            return None
+        if on_started is not None:
+            on_started()
     code = wait_setup(config, host, port, key)
     if code != 0:
         what = "timed out or vanished" if code is None else f"exited with code {code}"
         tail = setup_log_tail(config, host, port, key)
         log.error(f"[{config.name}] Setup command {what}" + (f":\n{tail}" if tail else ""))
-        return False
+        return code
     log.info(f"[{config.name}] Setup command finished")
-    return True
+    return 0

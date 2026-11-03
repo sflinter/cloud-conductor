@@ -909,3 +909,77 @@ def test_ctrl_c_during_budget_stop_does_not_hard_exit_at_once():
     assert exits == []
     handler(2, None)
     assert exits == [130]
+
+
+# --- deploy progress on resume -------------------------------------------------
+
+@patch("conductor.monitor.send_notification", return_value=False)
+@patch("conductor.monitor._start_unblocked_jobs")
+@patch("conductor.monitor.registry_update")
+@patch("conductor.monitor.registry_add")
+@patch("conductor.monitor.launch")
+@patch("conductor.monitor.wait_ssh", return_value=True)
+@patch("conductor.deployer.rsync")
+@patch("conductor.deployer.ssh_exec")
+def test_resume_of_setup_done_pod_skips_setup(mock_ssh, mock_rsync, mock_wait, mock_launch, mock_add, mock_upd, mock_start, mock_notify, paths):
+    """A job persisted as deploying after its (non-idempotent) setup ran
+    must not run setup again on the same pod."""
+    from conductor.runner import LaunchResult
+    state_path, cost_path = paths
+    provider = _provider()
+    provider.get_ssh_info.return_value = ("9.9.9.9", 4444)
+    mock_launch.return_value = LaunchResult(pid=11, pid_start="5")
+    job = PodState(name="a", status="deploying", pod_id="p-old", ssh_host="1.1.1.1", ssh_port=1,
+                   deploy_steps=["synced", "uploaded", "setup_started", "setup_done"], setup_exit_code=0)
+    state = RunState(jobs=[job], run_id="abc123")
+    config = _make_config(name="a", setup_command="uv venv --seed .venv")
+
+    _monitor_tick([config], {"a": config}, {"a": provider}, state, state_path, cost_path)
+
+    assert not any("uv venv" in str(c) for c in mock_ssh.call_args_list)
+    mock_rsync.assert_not_called()
+    assert job.status == "running" and job.pid == 11
+    assert load_state(state_path).jobs[0].deploy_steps[-1] == "setup_done"
+
+
+@patch("conductor.monitor.send_notification", return_value=False)
+@patch("conductor.monitor.registry_update")
+@patch("conductor.monitor.registry_add")
+@patch("conductor.monitor.launch")
+@patch("conductor.monitor.provision_pod")
+@patch("conductor.deployer.rsync")
+@patch("conductor.deployer.ssh_exec")
+def test_deploy_steps_are_persisted_as_they_complete(mock_ssh, mock_rsync, mock_prov, mock_launch, mock_add, mock_upd, mock_notify, paths):
+    import subprocess
+    from conductor import shutdown
+    state_path, cost_path = paths
+
+    def _provision(provider, config, pod_state, run_id="", on_created=None, on_released=None):
+        pod_state.pod_id, pod_state.ssh_host, pod_state.ssh_port = "p", "h", 1
+        pod_state.status = "provisioning"
+        return pod_state
+    mock_prov.side_effect = _provision
+    mock_rsync.return_value = subprocess.CompletedProcess([], 0)
+
+    def _ssh(host, port, key, cmd, timeout=300, retries=3):
+        if "echo running" in cmd:
+            shutdown.request()     # orchestrator stops while setup runs
+            return subprocess.CompletedProcess([], 0, stdout="running\n", stderr="")
+        return subprocess.CompletedProcess([], 0, stdout="", stderr="")
+    mock_ssh.side_effect = _ssh
+    # Steps left over from an earlier pod must not leak into a fresh deploy
+    job = PodState(name="a", status="pending", deploy_steps=["synced", "uploaded", "setup_done"],
+                   setup_exit_code=0)
+    _provision_deploy_launch(_provider(), job, _make_config(name="a", setup_command="make"),
+                             RunState(jobs=[job]), state_path, cost_path)
+    saved = load_state(state_path).jobs[0]
+    assert saved.status == "deploying"
+    assert saved.deploy_steps == ["synced", "uploaded", "setup_started"]
+    mock_launch.assert_not_called()
+
+
+def test_reset_job_for_retry_clears_deploy_progress():
+    from conductor.state import reset_job_for_retry
+    job = PodState(name="a", status="failed", pod_id="p", deploy_steps=["synced"], setup_exit_code=3)
+    reset_job_for_retry(job, keep_pod=True)
+    assert job.deploy_steps == [] and job.setup_exit_code is None

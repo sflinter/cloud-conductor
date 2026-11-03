@@ -207,3 +207,79 @@ def test_install_rsync_command_is_parenthesised(mock_ssh, mock_rsync):
     assert "which rsync" in install_cmd
     assert "|| (apt-get update" in install_cmd
     assert install_cmd.rstrip().endswith("rsync)")
+
+
+# --- deploy progress steps ----------------------------------------------------
+
+@patch("conductor.deployer.rsync")
+@patch("conductor.deployer.ssh_exec")
+def test_deploy_records_steps_in_order(mock_ssh, mock_rsync):
+    from conductor.config import SyncPath
+    mock_ssh.side_effect = _fake_ssh(setup_states=("running", "exited 0"))
+    mock_rsync.return_value = subprocess.CompletedProcess([], 0)
+    pod = _make_pod()
+    snapshots = []
+    config = _make_config(upload_paths=[SyncPath(local="/src", remote="data/")])
+    assert deploy(config, pod, on_step=lambda: snapshots.append(list(pod.deploy_steps))) is True
+    assert snapshots == [["synced"], ["synced", "uploaded"],
+                         ["synced", "uploaded", "setup_started"],
+                         ["synced", "uploaded", "setup_started", "setup_done"]]
+    assert pod.setup_exit_code == 0
+
+
+@patch("conductor.deployer.rsync")
+@patch("conductor.deployer.ssh_exec")
+def test_deploy_skips_setup_on_setup_done_pod(mock_ssh, mock_rsync):
+    pod = _make_pod()
+    pod.deploy_steps = ["synced", "uploaded", "setup_started", "setup_done"]
+    pod.setup_exit_code = 0
+    assert deploy(_make_config(setup_command="uv venv .venv"), pod) is True
+    mock_ssh.assert_not_called()
+    mock_rsync.assert_not_called()
+
+
+@patch("conductor.deployer.rsync")
+@patch("conductor.deployer.ssh_exec")
+def test_deploy_resumes_from_first_incomplete_step(mock_ssh, mock_rsync):
+    calls = []
+    mock_ssh.side_effect = _fake_ssh(calls=calls)
+    mock_rsync.return_value = subprocess.CompletedProcess([], 0)
+    pod = _make_pod()
+    pod.deploy_steps = ["synced"]
+    assert deploy(_make_config(), pod) is True
+    mock_rsync.assert_not_called()              # code sync not repeated
+    assert any("pip install ." in c for c in calls)
+    assert pod.deploy_steps == ["synced", "uploaded", "setup_started", "setup_done"]
+
+
+@patch("conductor.deployer.rsync")
+@patch("conductor.deployer.ssh_exec")
+def test_deploy_waits_for_setup_started_by_previous_run(mock_ssh, mock_rsync):
+    calls = []
+    mock_ssh.side_effect = _fake_ssh(setup_states=("running", "running", "exited 0"), calls=calls)
+    pod = _make_pod()
+    pod.deploy_steps = ["synced", "uploaded", "setup_started"]
+    assert deploy(_make_config(setup_command="uv venv .venv"), pod) is True
+    assert not any("uv venv" in c for c in calls)   # never started a second time
+    assert pod.deploy_steps[-1] == "setup_done" and pod.setup_exit_code == 0
+
+
+@patch("conductor.deployer.rsync")
+@patch("conductor.deployer.ssh_exec")
+def test_deploy_restarts_setup_that_vanished(mock_ssh, mock_rsync):
+    calls = []
+    mock_ssh.side_effect = _fake_ssh(setup_states=("gone", "exited 0"), calls=calls)
+    pod = _make_pod()
+    pod.deploy_steps = ["synced", "uploaded", "setup_started"]
+    assert deploy(_make_config(setup_command="uv venv .venv"), pod) is True
+    assert len([c for c in calls if "uv venv" in c]) == 1
+
+
+@patch("conductor.deployer.rsync")
+@patch("conductor.deployer.ssh_exec")
+def test_deploy_records_failed_setup_exit_code(mock_ssh, mock_rsync):
+    mock_ssh.side_effect = _fake_ssh(setup_states=("exited 1",))
+    mock_rsync.return_value = subprocess.CompletedProcess([], 0)
+    pod = _make_pod()
+    assert deploy(_make_config(), pod) is False
+    assert pod.setup_exit_code == 1 and "setup_done" in pod.deploy_steps

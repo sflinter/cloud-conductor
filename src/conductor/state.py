@@ -43,6 +43,8 @@ class PodState:
     pid_start: str | None = None   # process start time, detects pid reuse
     exit_code: int | None = None   # from the remote exit file, once the job ends
     finished_at: float | None = None  # when the pod stopped billing for this job
+    deploy_steps: list[str] = field(default_factory=list)  # deploy progress on the current pod
+    setup_exit_code: int | None = None   # setup_command's exit code on the current pod
     error: str | None = None
 
 
@@ -204,6 +206,14 @@ def reset_job_for_retry(job: PodState, keep_pod: bool = False) -> None:
     job.exit_code = None
     job.finished_at = None
     job.error = None
+    reset_deploy_progress(job)
+
+
+def reset_deploy_progress(job: PodState) -> None:
+    """Deploy progress belongs to one pod: forget it whenever the job gets
+    a new (or no) pod."""
+    job.deploy_steps = []
+    job.setup_exit_code = None
 
 
 def elapsed_seconds(job: PodState, now: float | None = None) -> float | None:

@@ -13,7 +13,7 @@ from conductor.providers import CloudProvider
 from conductor.registry import PodRecord
 from conductor.shutdown import Interrupted
 from conductor.ssh import wait_ssh
-from conductor.state import PodState, pod_name_for
+from conductor.state import PodState, pod_name_for, reset_deploy_progress
 
 log = logging.getLogger(__name__)
 
@@ -155,6 +155,7 @@ def provision_pod(
         pod_state.started_at = time.time()
         pod_state.ssh_host = None
         pod_state.ssh_port = None
+        reset_deploy_progress(pod_state)
         pod_state.gpu_cost_per_hour = cfg.cost_per_hour_override if cfg.cost_per_hour_override > 0 else cost
         if on_created:
             on_created(pod_state)
@@ -235,6 +236,7 @@ def _forget_released_pod(pod_state: PodState) -> None:
         pod_state.pod_id = None
         pod_state.ssh_host = None
         pod_state.ssh_port = None
+        reset_deploy_progress(pod_state)
 
 
 def _get_gpu_candidates(provider: CloudProvider, config) -> list[str]:
