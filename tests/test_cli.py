@@ -157,10 +157,49 @@ cost_per_hour_override = 0.5
     assert "train" in captured.out
     assert "eval" in captured.out
     assert "Depends on: train" in captured.out
-    assert "Est. cost: $0.12/hr (NVIDIA RTX A2000)" in captured.out
-    assert "Fallback range: $0.25-$0.43/hr (2 of 3 priced)" in captured.out
+    assert "Est. cost: $0.12/hr (NVIDIA RTX A2000; on-demand, cloud_type ALL" in captured.out
+    assert "Fallback range: $0.25-$0.43/hr (2 of 3 priced, same basis)" in captured.out
     assert "Est. cost: $0.50/hr (cost_per_hour_override)" in captured.out
     assert "Budget: $40.00" in captured.out
+
+
+def test_dry_run_prices_what_create_instance_requests(capsys, tmp_dir, monkeypatch):
+    """cloud_type ALL: RunPod may place the on-demand pod on secure cloud,
+    so the estimate is the secure price, not the cheaper community one."""
+    from unittest.mock import MagicMock
+    from conductor.gpu_pricing import GpuInfo, clear_cache
+    clear_cache()
+    config_path = os.path.join(tmp_dir, "jobs.toml")
+    with open(config_path, "w") as f:
+        f.write('''
+[global]
+gpu_type_id = "NVIDIA GeForce RTX 4090"
+gpu_type_ids_fallback = ["NVIDIA L4"]
+
+[[jobs]]
+name = "all"
+run_command = "x"
+
+[[jobs]]
+name = "community"
+run_command = "x"
+cloud_type = "COMMUNITY"
+''')
+    provider = MagicMock()
+    provider.name = "runpod"
+    provider.get_gpu_catalog.return_value = [
+        GpuInfo(id="NVIDIA GeForce RTX 4090", display_name="4090", memory_mb=24576,
+                community_price=0.34, secure_price=0.89, community_available=True, secure_available=True),
+        GpuInfo(id="NVIDIA L4", display_name="L4", memory_mb=24576,
+                community_price=0.43, secure_price=0.59, community_available=True, secure_available=True),
+    ]
+    monkeypatch.setattr("conductor.cli._configure_provider", lambda name: provider)
+    main(["dry-run", "--config", config_path])
+    out = capsys.readouterr().out
+    assert ("Est. cost: $0.89/hr (NVIDIA GeForce RTX 4090; on-demand, cloud_type ALL: "
+            "community $0.34 or secure $0.89, estimate assumes the higher)") in out
+    assert "Fallback range: $0.59-$0.59/hr" in out
+    assert "Est. cost: $0.34/hr (NVIDIA GeForce RTX 4090; on-demand, community cloud)" in out
 
 
 def test_dry_run_without_prices_says_so(capsys, tmp_dir, monkeypatch):

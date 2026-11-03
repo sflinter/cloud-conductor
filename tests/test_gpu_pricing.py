@@ -119,3 +119,27 @@ def test_get_gpu_price_falls_back_to_gpu_detail():
             return []
     clear_cache()
     assert get_gpu_price(Bare(), "NVIDIA L4", "ALL") == 0.0
+
+
+def test_quote_price_matches_the_request():
+    from conductor.gpu_pricing import quote_price
+    clear_cache()
+    provider = _mock_provider()
+    q = quote_price(provider, "NVIDIA RTX A2000", "ALL")
+    assert (q.price, q.low) == (0.15, 0.12) and "on-demand" in q.label and "secure $0.15" in q.label
+    assert quote_price(provider, "NVIDIA RTX A2000", "COMMUNITY").price == 0.12
+    assert quote_price(provider, "NVIDIA RTX A2000", "SECURE").price == 0.15
+    # secure not available: ALL can only land on community
+    q = quote_price(provider, "NVIDIA RTX A4000", "ALL")
+    assert q.price == 0.25 and "community cloud" in q.label
+    assert quote_price(provider, "FAKE", "ALL") is None
+
+
+def test_quote_price_vastai_on_demand_and_bid():
+    from conductor.gpu_pricing import quote_price
+    clear_cache()
+    provider = _mock_provider()
+    provider.name = "vastai"
+    assert quote_price(provider, "NVIDIA RTX A2000").label == "on-demand, cheapest offer"
+    q = quote_price(provider, "NVIDIA RTX A2000", bid_price=0.07)
+    assert q.price == 0.07 and "interruptible" in q.label

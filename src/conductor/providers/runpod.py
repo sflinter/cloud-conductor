@@ -231,9 +231,12 @@ class RunPodProvider:
                 return float(cost)
         except Exception:
             pass
-        from conductor.gpu_pricing import get_gpu_price
+        # No costPerHr yet: bill at the highest price this on-demand
+        # request can land on, never the cheaper cloud's
+        from conductor.gpu_pricing import quote_price
         try:
-            return get_gpu_price(self, gpu_id, cloud_type)
+            quote = quote_price(self, gpu_id, cloud_type)
+            return quote.price if quote else 0.0
         except Exception as e:
             log.warning(f"Could not look up price for {gpu_id}: {e}")
             return 0.0

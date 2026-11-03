@@ -12,7 +12,7 @@ from pathlib import Path
 
 from conductor import __version__
 from conductor.config import load_config
-from conductor.gpu_pricing import get_gpu_price, select_cheapest_gpus
+from conductor.gpu_pricing import quote_price, select_cheapest_gpus
 from conductor.monitor import POLL_INTERVAL, TERMINAL_STATUSES, format_elapsed, run_lifecycle
 from conductor.providers import CloudProvider
 from conductor.provisioner import provision_pod_direct, teardown_pod
@@ -699,42 +699,49 @@ def cmd_dry_run(args):
 
 
 def _print_price_estimate(cfg, prov) -> None:
-    """Best effort: catalog prices, falling back to a per-GPU lookup."""
+    """Best effort: the price of what provisioning will request (on-demand
+    vs bid, cloud_type), from catalog prices or a per-GPU lookup."""
     if cfg.cost_per_hour_override > 0:
         print(f"  Est. cost: ${cfg.cost_per_hour_override:.2f}/hr (cost_per_hour_override)")
         return
+    bid = cfg.vastai_bid_price if cfg.provider == "vastai" else 0.0
+
+    def _quote(gpu_id):
+        try:
+            return quote_price(prov, gpu_id, cfg.cloud_type, bid_price=bid)
+        except Exception as e:
+            log.debug(f"No price for {gpu_id}: {e}")
+            return None
+
     if cfg.auto_select_cheapest_gpu:
         try:
             gpus = select_cheapest_gpus(prov, cfg.gpu_min_vram_gb, cfg.cloud_type)
         except Exception as e:
             print(f"  Est. cost: unavailable (could not fetch GPU prices: {e})")
             return
-        if gpus:
-            print(f"  Cheapest GPU: {gpus[0].id} (${gpus[0].community_price:.2f}/hr)")
+        quote = _quote(gpus[0].id) if gpus else None
+        if quote:
+            print(f"  Cheapest GPU: {gpus[0].id} (${quote.price:.2f}/hr, {quote.label})")
         else:
             print("  Est. cost: unavailable (no priced GPU matches)")
         return
     if not cfg.gpu_type_id:
         return
-    candidates = [cfg.gpu_type_id, *cfg.gpu_type_ids_fallback]
-    prices: dict[str, float] = {}
-    for gpu_id in candidates:
-        try:
-            price = get_gpu_price(prov, gpu_id, cfg.cloud_type)
-        except Exception as e:
-            log.debug(f"No price for {gpu_id}: {e}")
-            continue
-        if price > 0:
-            prices[gpu_id] = price
-    primary = prices.get(cfg.gpu_type_id)
+    quotes = {}
+    for gpu_id in [cfg.gpu_type_id, *cfg.gpu_type_ids_fallback]:
+        q = _quote(gpu_id)
+        if q and q.price > 0:
+            quotes[gpu_id] = q
+    primary = quotes.get(cfg.gpu_type_id)
     if primary:
-        print(f"  Est. cost: ${primary:.2f}/hr ({cfg.gpu_type_id})")
+        print(f"  Est. cost: ${primary.price:.2f}/hr ({cfg.gpu_type_id}; {primary.label})")
     else:
         print(f"  Est. cost: unavailable (no price for {cfg.gpu_type_id})")
-    fallback = [p for g, p in prices.items() if g != cfg.gpu_type_id]
+    fallback = [q for g, q in quotes.items() if g != cfg.gpu_type_id]
     if fallback:
-        print(f"  Fallback range: ${min(fallback):.2f}-${max(fallback):.2f}/hr "
-              f"({len(fallback)} of {len(cfg.gpu_type_ids_fallback)} priced)")
+        prices = [q.price for q in fallback]
+        print(f"  Fallback range: ${min(prices):.2f}-${max(prices):.2f}/hr "
+              f"({len(fallback)} of {len(cfg.gpu_type_ids_fallback)} priced, same basis)")
 
 
 def cmd_validate(args):

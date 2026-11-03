@@ -99,6 +99,65 @@ def get_gpu_price(provider: CloudProvider, gpu_id: str, cloud_type: str = "ALL")
     return _get_best_price(detail, cloud_type) if detail else 0.0
 
 
+@dataclass
+class PriceQuote:
+    """The hourly price of what create_instance would actually request.
+    price is the estimate (the highest price the request can be billed at);
+    low is the lowest; label says which offer type and cloud it is."""
+    price: float
+    low: float
+    label: str
+
+
+def _gpu_info(provider: CloudProvider, gpu_id: str) -> GpuInfo | None:
+    """The catalog entry if it carries a price, else the per-GPU detail."""
+    for g in get_gpu_types(provider):
+        if g.id == gpu_id:
+            if g.community_price > 0 or g.secure_price > 0:
+                return g
+            break
+    return get_gpu_detail(provider, gpu_id)
+
+
+def quote_price(provider: CloudProvider, gpu_id: str, cloud_type: str = "ALL",
+                bid_price: float = 0.0) -> PriceQuote | None:
+    """Price the request create_instance makes for gpu_id, labelled.
+
+    RunPod pods are created on-demand (podFindAndDeployOnDemand) in
+    cloud_type; with ALL RunPod may place the pod on community or secure
+    cloud, so the estimate is the higher of the two on-demand prices (a
+    pod reported at the community price was billed at the secure one).
+    Vast.ai rents the cheapest matching on-demand offer, or bids
+    vastai_bid_price for an interruptible instance. None if unknown."""
+    if provider.name == "vastai" and bid_price > 0:
+        return PriceQuote(bid_price, bid_price, "interruptible, vastai_bid_price")
+    info = _gpu_info(provider, gpu_id)
+    if info is None:
+        return None
+    if provider.name == "vastai":
+        price = info.community_price or info.secure_price
+        return PriceQuote(price, price, "on-demand, cheapest offer") if price > 0 else None
+    if cloud_type in ("COMMUNITY", "SECURE"):
+        price = info.community_price if cloud_type == "COMMUNITY" else info.secure_price
+        if price <= 0:
+            return None
+        return PriceQuote(price, price, f"on-demand, {cloud_type.lower()} cloud")
+    options = {}
+    if info.community_price > 0 and (info.community_available or not info.secure_available):
+        options["community"] = info.community_price
+    if info.secure_price > 0 and (info.secure_available or not info.community_available):
+        options["secure"] = info.secure_price
+    if not options:
+        return None
+    if len(options) == 1 or len(set(options.values())) == 1:
+        cloud, price = next(iter(options.items()))
+        where = cloud if len(options) == 1 else "community or secure"
+        return PriceQuote(price, price, f"on-demand, cloud_type ALL: {where} cloud")
+    low, high = min(options.values()), max(options.values())
+    return PriceQuote(high, low, f"on-demand, cloud_type ALL: community ${options['community']:.2f} "
+                                 f"or secure ${options['secure']:.2f}, estimate assumes the higher")
+
+
 def get_gpu_detail(provider: CloudProvider, gpu_id: str) -> GpuInfo | None:
     """One GPU type with prices, via the provider's optional
     get_gpu_detail(gpu_id); cached for _CACHE_TTL. None if unsupported or
