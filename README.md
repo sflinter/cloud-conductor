@@ -8,7 +8,7 @@ Cloud Conductor is **project-agnostic**: it runs arbitrary shell commands on GPU
 
 - **TOML-driven** — all configuration in one file, no CLI flags for job settings
 - **Multi-job orchestration** — run multiple GPU jobs in parallel with dependency ordering
-- **Spot recovery** — automatic re-provision, re-deploy, and resume on spot interruptions
+- **Spot recovery** — automatic re-provision, re-deploy, push of synced results (before relaunch) and resume on spot interruptions
 - **Cost controls** — global and per-job budgets, idle detection, automatic teardown
 - **Result syncing** — periodic rsync of configurable paths from pod to local machine
 - **Pod reuse** — skip provisioning on re-runs for fast iteration (`keep_pod_alive`)
@@ -76,7 +76,7 @@ conductor run [--config jobs.toml] [--jobs name1,name2] [--budget 40.00] [--retr
 conductor status [--config jobs.toml]
 conductor sync [--config jobs.toml] [--jobs name1,name2] [--force]
 conductor teardown [--config jobs.toml] [--jobs name1,name2] [--force]   # --jobs: only those jobs' pods
-conductor dry-run [--config jobs.toml]
+conductor dry-run [--config jobs.toml]   # price shown is what provisioning requests (on-demand vs bid, cloud_type), labelled
 conductor validate [--config jobs.toml]
 conductor logs <job-name> [--tail] [--config jobs.toml]
 conductor ssh <job-name> [--config jobs.toml]
@@ -99,12 +99,13 @@ The TOML config has a `[global]` section for defaults and `[[jobs]]` entries for
 | `provision_timeout_seconds` | `900` | Max wait for a new pod's SSH to come up before it is terminated and the next GPU tried |
 | `deploy_method` | `"rsync"` | `"rsync"` or `"image"` (prebuilt Docker) |
 | `setup_command` | `""` | Shell command run after rsync (install deps, etc.) |
-| `setup_timeout_seconds` | `1800` | Max time for `setup_command` before the job is marked failed |
+| `setup_timeout_seconds` | `1800` | Max time for `setup_command` (runs detached on the pod, output in `conductor_setup.log`) before it is killed and the job marked failed |
 | `deploy_timeout_seconds` | `600` | Max time for each deploy rsync |
 | `sync_timeout_seconds` | `600` | Max time for each result-sync rsync |
 | `sync_paths` | `[]` | `[{remote, local, optional?}]` pairs to sync periodically. A remote path missing on the pod is nothing to sync (not a failure); a transfer failure fails the sync unless `optional = true` |
+| `upload_paths` | `[]` | `[{local, remote}]` pairs pushed to the pod on deploy. A missing local source never fails the deploy: a directory path ending in `/` is created empty, anything else is skipped with a warning |
 | `sync_interval_minutes` | `5` | How often to sync during monitoring |
-| `budget_usd` | `0` | Global budget limit (0 = unlimited) |
+| `budget_usd` | `0` | Global budget limit (0 = unlimited); checked every 15 s across all live pods, even while pods are being provisioned or set up |
 | `job_budget_usd` | `0` | Per-job budget limit |
 | `idle_timeout_minutes` | `5` | Fallback only: teardown if the process vanished without writing an exit file and stayed gone this long |
 | `stall_timeout_minutes` | `0` | Fail the job and teardown if GPU util stays below threshold this long (0 = disabled, the default: CPU-only jobs show 0% GPU) |
@@ -136,12 +137,12 @@ Every `conductor run` gets a short run ID (printed at start, stored in `.conduct
 Running `conductor run` again with an existing state file:
 
 - lists the provider's pods, adopts any `conductor-<run_id>-*` pod missing from state, and terminates (loudly) any such pod that no job tracks
-- resumes jobs persisted as `provisioning`/`deploying` on their existing pod (re-deploy, launch) and relaunches a `running` job that has no recorded pid
+- resumes jobs persisted as `provisioning`/`deploying` on their existing pod from the first incomplete deploy step (setup is never run twice on a pod; a setup still running from the previous run is waited for), then launches; relaunches a `running` job that has no recorded pid
 - skips `completed`/`failed`/`skipped` jobs unless you pass `--retry-failed` (also un-skips their dependents) or `--retry-completed`
 
 **Ctrl-C detaches.** The orchestrator stops after its current step (within one poll interval, even while it is still waiting for a new pod's SSH), prints the live pod IDs and exits; nothing is marked failed and no pod is terminated. Run `conductor run` again to resume monitoring, or `conductor teardown` to terminate. Use `conductor run --teardown-on-interrupt` for the old behaviour (final sync, then terminate everything). A second Ctrl-C hard-exits after printing the pod IDs.
 
-**One orchestrator per state file.** A live run writes a heartbeat to the state file every 15 s from a background thread, so it stays live throughout provisioning. `conductor run` refuses to start while another run is live, and `conductor teardown` / `conductor sync` refuse too, so two processes never fight over the same pods; pass `--force` if the other process is really dead. `conductor status` shows whether the orchestrator is live. `run`, `teardown` and `sync` also write a rotating `conductor.log` next to the state file.
+**One orchestrator per state file.** A live run writes a heartbeat to the state file every 15 s from a background thread, so it stays live throughout provisioning. `conductor run` refuses to start while another run is live, and `conductor teardown` / `conductor sync` refuse too, so two processes never fight over the same pods; pass `--force` if the other process is really dead. A run whose orchestrator pid is gone on this host (e.g. after a hard exit) is not live, so the next `conductor run` starts at once. `conductor status` shows whether the orchestrator is live. `run`, `teardown` and `sync` also write a rotating `conductor.log` next to the state file.
 
 **`conductor teardown`** records what it did: the registry, a `pod_stopped` cost event (reason `manual_teardown`, with the cost accrued since the pod was created) and the job's status (`failed`, "torn down manually"), so `conductor status` and `conductor report` agree with the provider afterwards.
 

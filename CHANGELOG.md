@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.6.3
+
+Fixes from live use on 2 and 3 November 2026.
+
+- The budget is enforced from the heartbeat thread. Every beat (15 s) it accrues the cost of every live pod (`provisioning`/`deploying`/`running`/`sync_failed`) and, on a breach, sets the shutdown flag: blocking waits abort as they do for Ctrl-C, no further pod is created, and the run tears every live pod down with force and sends `budget_exceeded`. Previously the budget was only checked per monitor tick, so spending reached $2.66 against a $2.00 cap while the main thread sat in provisioning and setup. A Ctrl-C during a budget stop is not taken as the first press of a hard exit
+- `setup_command` runs detached on the pod (`setsid nohup`, output in `conductor_setup.log`, exit code in `.conductor_setup_exit`) and is polled every 10 s instead of being one blocking SSH call, so neither Ctrl-C nor a budget stop waits for a 40-minute setup; `setup_timeout_seconds` kills it, and a failure logs the setup log's tail. The code rsync no longer ships or deletes the conductor's own files on the pod
+- Deploy progress is recorded per pod in state (`deploy_steps`: `synced`, `uploaded`, `setup_started`, `setup_done`; `setup_exit_code`). Resuming a job persisted as `deploying` continues from the first incomplete step: a `setup_done` pod skips setup, a setup started by the previous orchestrator is waited for rather than started again (`uv venv` failed on a resumed pod because the venv existed)
+- A missing local `upload_paths` source no longer fails the deploy and tears the pod down: a path ending in `/` is created empty and uploaded, anything else is skipped with a warning. A single-file source is uploaded to its remote file path
+- Pushing a single-file `sync_paths` entry back to a recovered pod failed with "destination must be a directory when copying more than 1 file". The push is now the inverse of the pull: a directory entry's contents go to the remote directory, a file entry's file to the remote's parent directory (created first)
+- Spot recovery pushes the synced results to the new pod before launching the job, not after (persisted as `push_pending`, so a resumed pipeline pushes too)
+- After a hard exit (second Ctrl-C) the next `conductor run` no longer refuses for up to 60 s: the state file records `orchestrator_host`, and a run whose `orchestrator_pid` is dead on this host is not live. A run on another host is still judged by its heartbeat
+- `conductor dry-run` prices what provisioning requests, labelled: RunPod pods are on-demand in `cloud_type`, and with `ALL` the estimate is the higher of the community and secure prices (both shown) instead of the cheaper one (RTX 4090 showed $0.34/hr, billed $0.89/hr); Vast.ai shows the on-demand offer or the `vastai_bid_price` bid. RunPod's cost fallback before `costPerHr` is known uses the same quote
+- A job that never started (still provisioning/deploying) is torn down without a final sync
+- New state fields: `deploy_steps`, `setup_exit_code`, `push_pending` (per job), `orchestrator_host`. No config changes
+
 ## 0.6.2
 
 Fixes from the second live RunPod trial of 0.6.1 and a benchmark run.

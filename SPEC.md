@@ -90,7 +90,8 @@ Full lifecycle: provision → deploy → launch → monitor → sync → teardow
 - Tears down each pod when its job completes or fails
 - Sends notifications on job completion, failure, or budget threshold
 - Exits when all jobs are done
-- Refuses to start if the state file's heartbeat shows another `conductor run` is live (override with `--force`). Its own heartbeat is written by a daemon thread every 15 s for the whole run, including while the main thread is blocked provisioning
+- Refuses to start if the state file's heartbeat shows another `conductor run` is live (override with `--force`). Its own heartbeat is written by a daemon thread every 15 s for the whole run, including while the main thread is blocked provisioning. A heartbeat written on this host by a pid that no longer exists (a hard exit) does not count as live
+- Enforces `budget_usd` from the same thread: every beat it accrues the cost of every live pod and, on a breach, sets the shutdown flag (blocking waits, including a running setup, abort as for Ctrl-C and no further pod is created), then tears every live pod down with force and sends `budget_exceeded`
 - Ctrl+C detaches: prints the live pod IDs, marks nothing failed, exits; `--teardown-on-interrupt` instead does a final sync and tears down all pods. A second Ctrl+C hard-exits after printing the pod IDs. The first Ctrl+C also takes effect while a pod is still being provisioned: the SSH waits and backoffs check a shutdown flag between polls, so the run detaches within one poll interval and the job keeps its pod ID and status for the next `conductor run`
 - Logs to stderr and to a rotating `conductor.log` next to the state file (so do `teardown` and `sync`)
 
@@ -116,7 +117,7 @@ Terminates the pods tracked in the state file (only those of the jobs named with
 
 ### `conductor dry-run`
 
-Prints what would be provisioned (GPU type, image, disk, estimated cost) without creating anything. The estimate is best effort from the provider's catalog: the primary GPU's hourly price (`Est. cost`), the price range over the priced fallbacks (`Fallback range`), the cheapest match for `auto_select_cheapest_gpu`, or `cost_per_hour_override` when set. RunPod's catalog list carries no prices, so each candidate is looked up individually (`runpod.get_gpu`, cached 5 min); a GPU without a price is reported as unavailable rather than silently omitted.
+Prints what would be provisioned (GPU type, image, disk, estimated cost) without creating anything. The estimate is best effort from the provider's catalog and prices what provisioning actually requests, labelled: RunPod pods are created on-demand in `cloud_type` (the community or secure on-demand price; with `ALL` RunPod may place the pod on either, so the estimate is the higher price and both are shown), Vast.ai rents the cheapest on-demand offer or bids `vastai_bid_price` for an interruptible instance. It shows the primary GPU's hourly price (`Est. cost`), the price range over the priced fallbacks on the same basis (`Fallback range`), the cheapest match for `auto_select_cheapest_gpu`, or `cost_per_hour_override` when set. RunPod's catalog list carries no prices, so each candidate is looked up individually (`runpod.get_gpu`, cached 5 min); a GPU without a price is reported as unavailable rather than silently omitted.
 
 ### `conductor validate`
 
@@ -201,7 +202,7 @@ pip install -q uv && \
 uv venv --seed .venv && \
 uv sync --frozen
 """
-setup_timeout_seconds = 1800          # setup_command is killed and the job fails after this
+setup_timeout_seconds = 1800          # setup_command (run detached, polled) is killed and the job fails after this
 deploy_timeout_seconds = 600          # per deploy rsync
 
 # Result sync
@@ -344,7 +345,10 @@ PYTHONUNBUFFERED=1 .venv/bin/python scripts/eval_with_search.py \
       "pid": 4242,
       "pid_start": "1234567",
       "exit_code": null,
-      "finished_at": null
+      "finished_at": null,
+      "deploy_steps": ["synced", "uploaded", "setup_started", "setup_done"],
+      "setup_exit_code": 0,
+      "push_pending": false
     },
     {
       "name": "eval_4p",
@@ -358,11 +362,12 @@ PYTHONUNBUFFERED=1 .venv/bin/python scripts/eval_with_search.py \
   "budget_usd": 40.00,
   "run_id": "a1b2c3",
   "orchestrator_pid": 4242,
+  "orchestrator_host": "my-laptop.local",
   "heartbeat_at": 1709149531.0
 }
 ```
 
-`finished_at` is set when the pod stops billing for the job (final teardown, manual teardown, interrupt): cost never accrues past it and the status table's `Elapsed` stops there. `orchestrator_pid` and `heartbeat_at` identify the live `conductor run`; the heartbeat is refreshed every 15 s by a daemon thread (so it stays fresh while the main thread is blocked provisioning) and cleared when the run detaches or finishes. A run is considered live while the heartbeat is fresher than two poll intervals (60 s). `run_id` names this run's pods (`conductor-<run_id>-<job>`) so they can be matched to the run from the provider's pod list. The state file and the registry are protected by a cross-process lock (`flock` on a hidden `.lock` sibling) for every read-modify-write.
+`finished_at` is set when the pod stops billing for the job (final teardown, manual teardown, interrupt): cost never accrues past it and the status table's `Elapsed` stops there. `orchestrator_pid` and `heartbeat_at` identify the live `conductor run`; the heartbeat is refreshed every 15 s by a daemon thread (so it stays fresh while the main thread is blocked provisioning) and cleared when the run detaches or finishes. A run is considered live while the heartbeat is fresher than two poll intervals (60 s), unless `orchestrator_host` is this host and `orchestrator_pid` no longer exists (the run was hard-killed): then it is not live at once. A run on another host is judged by its heartbeat alone. `deploy_steps` records deploy progress on the job's current pod (cleared whenever it gets a new pod) and `setup_exit_code` the setup's exit code, so a resumed deploy continues from its first incomplete step; `push_pending` marks a spot-recovered job whose synced results still have to be pushed to its new pod before launch. `run_id` names this run's pods (`conductor-<run_id>-<job>`) so they can be matched to the run from the provider's pod list. The state file and the registry are protected by a cross-process lock (`flock` on a hidden `.lock` sibling) for every read-modify-write.
 
 The state file is updated after every significant event (provision, deploy, sync, status check, teardown). It is the source of truth for `conductor status`.
 
@@ -428,14 +433,16 @@ cloud-conductor/
 Calls `on_created(instance_id, gpu, cost)` the instant the provider returns an ID so the caller can persist it, then waits for SSH to become available (polls the provider API for port mapping, then tests SSH connectivity). A pod that never becomes reachable is terminated and reported through `on_released(instance_id, terminated)`. If sshd rejects the key three probes in a row (`SshAuthError`) the pod is terminated and the job fails at once, without trying another GPU. When a provider reports no capacity for a candidate (`NoCapacityError`), the rest of the list is tried and, if nothing was created, the whole list is walked again after a jittered backoff, up to `provision_retries` passes; each pass counts one provision attempt. Returns a `PodRecord` with host/port/pod_id/gpu_type/cost_per_hour. Supports pod reuse: if `keep_pod_alive` is set and a pod from a previous run still exists, skips provisioning, refreshes its SSH info and reuses it.
 
 **`deployer.py`** — `deploy_direct()` takes explicit SSH/path parameters (used by `conductor pod deploy`). `deploy()` wraps it for declarative mode. Two deploy methods:
-- `rsync`: Installs rsync on the pod (if needed), rsyncs `local_project_dir` to `remote_project_dir` with configured excludes, then runs `setup_command` via SSH.
+- `rsync`: Installs rsync on the pod (if needed), rsyncs `local_project_dir` to `remote_project_dir` with configured excludes (plus the conductor's own `.conductor_*`, `conductor_job.log` and `conductor_setup.log`, which are never shipped or deleted), uploads `upload_paths`, then runs `setup_command`.
 - `image`: Skips rsync and setup (image has everything). Optionally syncs specific files (like seed checkpoints) listed in the config.
+
+`setup_command` runs detached like the job (`setsid nohup bash .conductor_setup.sh > conductor_setup.log`, exit code to `.conductor_setup_exit`) and is polled every 10 s: a Ctrl-C or budget stop abandons the wait at the next poll (`Interrupted`; the setup keeps running on the pod), `setup_timeout_seconds` kills it, and a failure logs the tail of the setup log. Each finished step (`synced`, `uploaded`, `setup_started`, `setup_done`) is recorded in the job's `deploy_steps` and saved; a resumed deploy skips the steps already done, waits for a setup a previous orchestrator started instead of starting it again (unless it vanished without an exit code), and never re-runs setup on a `setup_done` pod. A missing local `upload_paths` source never fails the deploy: a path ending in `/` is created empty, anything else is skipped with a warning. A file source is uploaded to the remote file path.
 
 When reusing a pod (`keep_pod_alive`), rsync mode re-syncs code (fast incremental) but skips `setup_command` (deps already installed).
 
 **`runner.py`** — `launch_direct()` writes `.conductor_run.sh` (which runs the command and writes `$?` to `.conductor_exit`) and `.conductor_launch.sh` (which starts it under `setsid nohup ... > conductor_job.log 2>&1 < /dev/null &` and records the pid and its start time from `/proc/<pid>/stat`), returning a `LaunchResult(pid, pid_start)`. Launching is idempotent: if the previous launch is still running its pid is returned instead of starting a second copy. `exec_foreground()` replaces the process with SSH (used by `conductor pod exec`). `launch()` wraps `launch_direct()` for declarative mode. `is_alive()` returns a `ProcessStatus`: `running`, `exited` (with the exit code from the exit file, or none if the process simply vanished or its pid was reused) or `unknown` (SSH failed). `fetch_log_tail()` returns the last lines of the job log; `get_utilization()` returns GPU/CPU metrics.
 
-**`syncer.py`** — Rsyncs configured `sync_paths` from pod to local machine. Each sync path specifies a remote path (relative to `remote_project_dir`), a local destination and an optional `optional` flag. A remote path that does not exist on the pod (rsync exit 23 with `change_dir`/`link_stat ... No such file or directory` naming the source, e.g. a job that died before creating its output directory) is "nothing to sync" and logged at INFO; a transfer failure of an existing source fails the sync unless the entry is `optional = true`, in which case it is logged and ignored. Also supports push direction (local → remote) for spot recovery checkpoint restoration.
+**`syncer.py`** — Rsyncs configured `sync_paths` from pod to local machine. Each sync path specifies a remote path (relative to `remote_project_dir`), a local destination and an optional `optional` flag. A remote path that does not exist on the pod (rsync exit 23 with `change_dir`/`link_stat ... No such file or directory` naming the source, e.g. a job that died before creating its output directory) is "nothing to sync" and logged at INFO; a transfer failure of an existing source fails the sync unless the entry is `optional = true`, in which case it is logged and ignored. Also supports push direction (local → remote) for spot recovery checkpoint restoration, as the inverse of the pull: a remote ending in `/` receives the local directory's contents; any other entry (a file such as `train.log`, pulled into the local directory under its own name) pushes that item into the remote's parent directory. The remote directory is created first; an entry with nothing synced locally is skipped.
 
 **`monitor.py`** — Main monitoring loop:
 1. For each active job, check the process (`runner.is_alive()`): exit file first, then pid
@@ -443,12 +450,12 @@ When reusing a pod (`keep_pod_alive`), rsync mode re-syncs code (fast incrementa
 3. If the exit file exists: exit 0 → `completed` immediately; non-zero → `failed` immediately with the exit code and the last 50 log lines in `error`
 4. If the process vanished without an exit file (pod restarted, pid reused, killed): if the pod still exists, start the idle timer and mark `completed` after `idle_timeout_minutes`; if the pod is gone → spot interruption
 5. SSH unreachable → check the pod with the provider (tri-state). Pod alive → refresh SSH host/port from the API. Pod reported gone on `recovery_confirmations` consecutive polls → spot interruption. API error → nothing concluded
-6. On spot interruption: teardown dead pod, backoff, re-provision, re-deploy, push synced results back, re-launch with same command (should resume via `--resume` or equivalent in the user's command)
+6. On spot interruption: teardown dead pod, backoff, re-provision, re-deploy, push synced results back (before launch; persisted as `push_pending` so a resumed pipeline pushes too), re-launch with same command (should resume via `--resume` or equivalent in the user's command)
 7. On completion: final sync, teardown pod (unless `keep_pod_alive`), send notification
 8. On failure: sync logs, teardown pod, send notification
 9. Update cost tracking based on elapsed time and GPU hourly rate
 10. If per-job budget exceeded, teardown that job's pod, send notification
-11. If global budget exceeded, teardown all pods, send notification, exit
+11. If global budget exceeded, teardown all pods, send notification, exit (also enforced between ticks by the heartbeat thread's budget watchdog)
 12. Check `depends_on`: if a completed job unblocks pending jobs, start provisioning them
 13. Print status table (including each job's exit code)
 14. Append cost event to cost log
@@ -524,16 +531,17 @@ Minimal:
 | `sync_paths` source missing on the pod (rsync exit 23, `change_dir`/`link_stat ... No such file or directory` naming the source) | Not a failure: logged at INFO as nothing to sync. Only a transfer failure of an existing source fails the sync, and not for an entry marked `optional = true` |
 | Terminate not confirmed by the provider | Registry keeps the pod as `running`, `job.error` records it, status shows it; never assumed gone |
 | Deploy/setup command fails | Mark job as `failed`, terminate pod, notify |
+| `upload_paths` source missing locally | Not a failure: a path ending in `/` is created empty and uploaded, anything else is skipped with a warning |
 | Process exits with code 0 | Immediately: final sync, mark as `completed`, terminate pod, notify |
 | Process exits with non-zero code | Immediately: final sync, mark as `failed` with the exit code and last 50 log lines in `error`, terminate pod, notify |
 | Process vanishes without an exit file | Idle timer; `completed` after `idle_timeout_minutes` if the pod still exists |
-| Spot interruption (pod evicted) | Only after the provider reports the pod exited or missing, without an API error, on `recovery_confirmations` consecutive polls. Then automatic recovery: re-provision → re-deploy → push synced results → re-launch. Notify. |
+| Spot interruption (pod evicted) | Only after the provider reports the pod exited or missing, without an API error, on `recovery_confirmations` consecutive polls. Then automatic recovery: re-provision → re-deploy → push synced results → re-launch (the push always precedes the launch). Notify. |
 | SSH unreachable but pod exists | Not an interruption. SSH host/port are refreshed from the provider API and the job is re-checked next poll. |
 | Provider API error / non-JSON response | `check_exists()` returns `None`: nothing is concluded, the poll is retried. Never triggers recovery. |
 | Max provision attempts exceeded | Mark job as `failed`, stop retrying, notify |
 | Per-job budget exceeded | Final sync, teardown that pod, mark as `failed`, notify |
 | GPU stall (process alive, GPU idle) | Final sync, teardown pod, mark as `failed`, notify |
-| Global budget limit reached | Final sync all pods, teardown all pods, notify, exit |
+| Global budget limit reached | Detected by the heartbeat thread within 15 s even while the main thread is blocked provisioning or deploying: blocking waits abort, no new pod is created, final sync of running pods, forced teardown of all live pods, `budget_exceeded` notification, exit |
 | Dependency failed | Mark dependent jobs as `skipped`, notify |
 | Ctrl+C | Detach: save state, print live pod IDs and how to resume, exit. Nothing marked failed, nothing terminated. Works during provisioning too (the waits check the shutdown flag between polls). With `--teardown-on-interrupt`: final sync all pods, teardown all pods (unless `keep_pod_alive`), save state, exit |
 | Second Ctrl+C | Print live pod IDs, hard exit |
@@ -546,7 +554,9 @@ The conductor tracks cost per pod based on:
 - `elapsed_time × cost_per_hour`
 - `cost_per_hour` is either auto-fetched from the RunPod API (`runpod.get_gpu_types()`) or manually set via `cost_per_hour_override` in config
 - Total cost across all jobs is summed and compared against `budget_usd`
-- When total cost exceeds budget, all pods are torn down immediately
+- Cost is accrued for every live pod (from creation) by the heartbeat thread every 15 s, not only by the monitor tick
+- When total cost exceeds budget, all pods are torn down immediately, even if the main thread is in the middle of provisioning or a long setup
+- When the provider has not reported a pod's `costPerHr` yet, the rate is the quote for the on-demand request (the higher price for `cloud_type = "ALL"`)
 
 ## Job Supervision and Idle Detection
 
@@ -576,7 +586,7 @@ When `conductor run` is invoked and a state file exists:
    - that belongs to no job in state, or to a job that is already finished: **terminated**, logged loudly
    - that duplicates a job's tracked pod: the extra is terminated unless the tracked pod is confirmed gone, in which case the extra is adopted
 2. Jobs with status `completed`, `failed` or `skipped` are skipped, unless `--retry-failed` / `--retry-completed` is passed, which returns them (and, for `--retry-failed`, their skipped dependents) to `pending`
-3. Jobs with status `provisioning` or `deploying` are resumed: the pod is re-checked; if it exists, SSH info is refreshed, code is re-deployed (setup re-run) and the job launched; if it is gone, a fresh pod is provisioned
+3. Jobs with status `provisioning` or `deploying` are resumed: the pod is re-checked; if it exists, SSH info is refreshed, the deploy continues from its first incomplete step (`deploy_steps`: a pod with `setup_done` skips setup, one with `setup_started` waits for that setup), pending synced results are pushed and the job launched; if it is gone, a fresh pod is provisioned
 4. Jobs with status `running` are monitored as usual; one with no recorded pid is launched (the launcher reports an already-running job rather than starting a second copy)
 5. Jobs with status `pending` are started from scratch
 
