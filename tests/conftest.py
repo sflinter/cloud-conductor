@@ -19,6 +19,7 @@ def no_retry_sleeps(monkeypatch):
     monkeypatch.setattr("conductor.provisioner.TERMINATE_POLL_SECONDS", 0.0)
     monkeypatch.setattr("conductor.provisioner.TERMINATE_VERIFY_SECONDS", 0.0)
     monkeypatch.setattr("conductor.ssh.WAIT_SSH_POLL_SECONDS", 0.0)
+    monkeypatch.setattr("conductor.deployer.SETUP_POLL_SECONDS", 0.0)
     monkeypatch.setattr("conductor.providers.runpod.WAIT_POLL_SECONDS", 0.0)
     monkeypatch.setattr("conductor.providers.vastai.WAIT_POLL_SECONDS", 0.0)
 

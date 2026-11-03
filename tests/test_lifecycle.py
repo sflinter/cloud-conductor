@@ -818,3 +818,94 @@ def test_spot_recover_backoff_is_interruptible(mock_pdl, mock_upd, mock_notify, 
     _spot_recover(provider, job, config, RunState(jobs=[job]), state_path, cost_path)
     assert time.time() - t0 < 2
     mock_pdl.assert_not_called()
+
+
+# --- budget watchdog ----------------------------------------------------------
+
+def test_budget_watchdog_accrues_live_pods_and_requests_stop():
+    from conductor import shutdown as flag
+    from conductor.monitor import make_budget_watchdog
+    now = time.time()
+    provisioning = PodState(name="a", status="provisioning", pod_id="p1",
+                            started_at=now - 3600, gpu_cost_per_hour=1.0)
+    deploying = PodState(name="b", status="deploying", pod_id="p2",
+                         started_at=now - 3600, gpu_cost_per_hour=1.0)
+    done = PodState(name="c", status="completed", pod_id="p3", started_at=now - 3600,
+                    finished_at=now - 3500, gpu_cost_per_hour=100.0)
+    state = RunState(jobs=[provisioning, deploying, done], budget_usd=1.5)
+    shutdown = {"requested": False, "teardown": False}
+
+    make_budget_watchdog(state, shutdown)()
+
+    assert provisioning.cost_usd == pytest.approx(1.0, rel=0.01)
+    assert deploying.cost_usd == pytest.approx(1.0, rel=0.01)
+    assert done.cost_usd == 0.0
+    assert shutdown["budget"] and shutdown["requested"] and shutdown["teardown"]
+    assert flag.requested()
+
+
+def test_budget_watchdog_quiet_under_budget():
+    from conductor import shutdown as flag
+    from conductor.monitor import make_budget_watchdog
+    job = PodState(name="a", status="running", pod_id="p", started_at=time.time() - 60,
+                   gpu_cost_per_hour=1.0)
+    state = RunState(jobs=[job], budget_usd=5.0)
+    shutdown = {"requested": False, "teardown": False}
+    make_budget_watchdog(state, shutdown)()
+    assert not shutdown["requested"] and not flag.requested()
+    assert job.cost_usd > 0
+
+
+@patch("conductor.monitor.send_notification", return_value=False)
+@patch("conductor.monitor.registry_update")
+@patch("conductor.monitor._monitor_tick")
+@patch("conductor.monitor.reconcile_run_pods")
+def test_budget_stop_while_main_thread_blocked_in_setup(mock_rec, mock_tick, mock_upd, mock_notify, paths):
+    """The main thread sits in _start_unblocked_jobs (a long setup); the
+    budget is breached meanwhile. The watchdog must abort the wait and the
+    run must tear the pod down with force, without a monitor tick."""
+    from conductor import shutdown as flag
+    from conductor.shutdown import Interrupted
+    from conductor.config import NotificationConfig
+    state_path, cost_path = paths
+    provider = _provider()
+    provider.check_exists.return_value = False
+    job = PodState(name="a", status="deploying", pod_id="p-setup", ssh_host="h", ssh_port=1,
+                   started_at=time.time() - 2 * 3600, gpu_cost_per_hour=1.0)
+    state = RunState(jobs=[job], run_id="abc123", budget_usd=1.0)
+    config = _make_config(name="a", notifications=NotificationConfig())
+    waited = {}
+
+    def blocking_start(configs, config_map, provider_map, st, sp, cp):
+        t0 = time.time()
+        try:
+            while time.time() - t0 < 30:          # a 40-minute setup, in miniature
+                if flag.wait(0.01):
+                    raise Interrupted("shutdown requested while setup is running on the pod")
+        except Interrupted:
+            waited["s"] = time.time() - t0
+
+    t0 = time.time()
+    with patch("conductor.monitor._start_unblocked_jobs", side_effect=blocking_start), \
+         patch("conductor.monitor.get_provider", return_value=provider):
+        run_lifecycle([config], state, state_path, cost_path, heartbeat_interval=0.05)
+
+    assert time.time() - t0 < 10 and waited["s"] < 10
+    mock_tick.assert_not_called()
+    provider.terminate.assert_called_with("p-setup")
+    assert job.status == "failed" and job.error == "budget_exceeded"
+    assert any(c.args[1] == "budget_exceeded" for c in mock_notify.call_args_list)
+    saved = load_state(state_path)
+    assert saved.jobs[0].status == "failed" and saved.heartbeat_at is None
+
+
+def test_ctrl_c_during_budget_stop_does_not_hard_exit_at_once():
+    from conductor.monitor import make_sigint_handler
+    state = RunState(jobs=[PodState(name="a", status="running", pod_id="p")])
+    shutdown = {"requested": True, "teardown": True, "budget": True}
+    exits = []
+    handler = make_sigint_handler(shutdown, state, hard_exit=exits.append)
+    handler(2, None)
+    assert exits == []
+    handler(2, None)
+    assert exits == [130]

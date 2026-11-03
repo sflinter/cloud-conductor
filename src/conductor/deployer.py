@@ -2,10 +2,27 @@
 from __future__ import annotations
 
 import logging
+import time
 
+from conductor import shutdown
+from conductor.shutdown import Interrupted
 from conductor.ssh import rsync, ssh_exec
 
 log = logging.getLogger(__name__)
+
+# setup_command runs detached on the pod, like the job, and is polled through
+# its exit file: a Ctrl-C or a budget stop never waits for a long setup, and
+# a setup that outlives the orchestrator can be picked up again on resume.
+SETUP_SCRIPT = ".conductor_setup.sh"
+SETUP_PID_FILE = ".conductor_setup_pid"
+SETUP_EXIT_FILE = ".conductor_setup_exit"
+SETUP_LOG = "conductor_setup.log"
+SETUP_POLL_SECONDS = 10.0
+SETUP_LOG_TAIL_LINES = 30
+
+# The conductor's own files in remote_project_dir: never shipped from the
+# local tree and never deleted from the pod by the code rsync's --delete
+CONDUCTOR_EXCLUDES = [".conductor_*", "conductor_job.log", SETUP_LOG]
 
 # Only install rsync when it is missing; the subshell keeps "||" from
 # swallowing the apt-get chain on images that already have it.
@@ -85,16 +102,19 @@ def deploy(config, pod_state, is_reuse: bool = False) -> bool:
     ssh_exec(host, port, key, f"mkdir -p {dst}")
 
     log.info(f"[{cfg.name}] Syncing {src} → {dst}")
-    result = rsync(src, dst, host, port, key, excludes=cfg.rsync_excludes, delete=True,
+    excludes = [*cfg.rsync_excludes, *(e for e in CONDUCTOR_EXCLUDES if e not in cfg.rsync_excludes)]
+    result = rsync(src, dst, host, port, key, excludes=excludes, delete=True,
                    timeout=cfg.deploy_timeout_seconds)
     if result.returncode != 0:
         log.error(f"[{cfg.name}] rsync failed: {result.stderr}")
         return False
 
+    shutdown.check(f"[{cfg.name}] code sync")
     if not _upload_paths(cfg, host, port, key):
         return False
 
     if cfg.setup_command and not is_reuse:
+        shutdown.check(f"[{cfg.name}] upload")
         return _run_setup(cfg, host, port, key)
 
     return True
@@ -126,14 +146,101 @@ def _upload_paths(config, host: str, port: int, key: str) -> bool:
     return True
 
 
-def _run_setup(config, host: str, port: int, key: str) -> bool:
-    log.info(f"[{config.name}] Running setup command (timeout {config.setup_timeout_seconds}s)")
-    result = ssh_exec(
-        host, port, key,
-        f"cd {config.remote_project_dir} && {config.setup_command}",
-        timeout=config.setup_timeout_seconds,
+def _setup_paths(remote_dir: str) -> dict[str, str]:
+    d = remote_dir.rstrip("/")
+    return {"script": f"{d}/{SETUP_SCRIPT}", "pid": f"{d}/{SETUP_PID_FILE}",
+            "exit": f"{d}/{SETUP_EXIT_FILE}", "log": f"{d}/{SETUP_LOG}"}
+
+
+def start_setup(config, host: str, port: int, key: str) -> bool:
+    """Write the setup script and start it detached (setsid nohup); its
+    exit code lands in the setup exit file."""
+    d = config.remote_project_dir.rstrip("/")
+    p = _setup_paths(d)
+    script = (
+        "#!/bin/bash\n"
+        f"cd {d} && ( {config.setup_command} )\n"
+        f"echo $? > {p['exit']}\n"
     )
+    cmd = (
+        f"mkdir -p {d} && cat > {p['script']} << 'CONDUCTOR_EOF'\n{script}CONDUCTOR_EOF\n"
+        f"rm -f {p['exit']} && "
+        f"setsid nohup bash {p['script']} > {p['log']} 2>&1 < /dev/null & "
+        f"echo $! > {p['pid']}"
+    )
+    result = ssh_exec(host, port, key, cmd, timeout=60)
     if result.returncode != 0:
-        log.error(f"[{config.name}] Setup command failed: {result.stderr}")
+        log.error(f"[{config.name}] Could not start setup command: {result.stderr}")
         return False
+    return True
+
+
+def setup_status(config, host: str, port: int, key: str) -> tuple[str, int | None]:
+    """("exited", code), ("running", None), ("gone", None) when the setup
+    process vanished without an exit file (or never started), or
+    ("unknown", None) when SSH failed."""
+    p = _setup_paths(config.remote_project_dir)
+    cmd = (
+        f"if [ -f {p['exit']} ]; then echo \"exited $(cat {p['exit']})\"; "
+        f"elif [ -f {p['pid']} ] && kill -0 \"$(cat {p['pid']})\" 2>/dev/null; then echo running; "
+        f"else echo gone; fi"
+    )
+    result = ssh_exec(host, port, key, cmd, timeout=30)
+    if result.returncode != 0:
+        return "unknown", None
+    parts = result.stdout.split()
+    if not parts:
+        return "unknown", None
+    if parts[0] == "exited":
+        try:
+            return "exited", int(parts[1])
+        except (IndexError, ValueError):
+            return "exited", 1
+    if parts[0] in ("running", "gone"):
+        return parts[0], None
+    return "unknown", None
+
+
+def wait_setup(config, host: str, port: int, key: str) -> int | None:
+    """Poll the detached setup until it exits (returns its exit code) or
+    setup_timeout_seconds pass (kills it, returns None). Raises Interrupted
+    between polls when shutdown is requested; the setup keeps running on
+    the pod."""
+    deadline = time.time() + config.setup_timeout_seconds
+    while True:
+        state, code = setup_status(config, host, port, key)
+        if state == "exited":
+            return code
+        if state == "gone":
+            log.error(f"[{config.name}] Setup process is gone without an exit code")
+            return None
+        if time.time() >= deadline:
+            log.error(f"[{config.name}] Setup command timed out after {config.setup_timeout_seconds}s; "
+                      f"killing it")
+            p = _setup_paths(config.remote_project_dir)
+            ssh_exec(host, port, key, f"kill -- -\"$(cat {p['pid']})\" 2>/dev/null; "
+                                      f"kill \"$(cat {p['pid']})\" 2>/dev/null; true", timeout=30)
+            return None
+        if shutdown.wait(SETUP_POLL_SECONDS):
+            raise Interrupted(f"shutdown requested while setup is running on the pod")
+
+
+def setup_log_tail(config, host: str, port: int, key: str, lines: int = SETUP_LOG_TAIL_LINES) -> str:
+    p = _setup_paths(config.remote_project_dir)
+    result = ssh_exec(host, port, key, f"tail -n {lines} {p['log']} 2>/dev/null", timeout=30)
+    return result.stdout.rstrip() if result.returncode == 0 else ""
+
+
+def _run_setup(config, host: str, port: int, key: str) -> bool:
+    log.info(f"[{config.name}] Running setup command detached (timeout {config.setup_timeout_seconds}s, "
+             f"log {config.remote_project_dir.rstrip('/')}/{SETUP_LOG})")
+    if not start_setup(config, host, port, key):
+        return False
+    code = wait_setup(config, host, port, key)
+    if code != 0:
+        what = "timed out or vanished" if code is None else f"exited with code {code}"
+        tail = setup_log_tail(config, host, port, key)
+        log.error(f"[{config.name}] Setup command {what}" + (f":\n{tail}" if tail else ""))
+        return False
+    log.info(f"[{config.name}] Setup command finished")
     return True

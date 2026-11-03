@@ -356,9 +356,13 @@ def test_provision_backoff_is_interruptible(mock_ssh):
     from conductor import shutdown
     from conductor.shutdown import Interrupted
     provider = _mock_provider()
-    provider.create_instance.side_effect = _no_capacity("A")
+    no_capacity = _no_capacity("A")
+
+    def _create(**kw):
+        shutdown.request()   # Ctrl-C lands while the provider answers "no capacity"
+        raise no_capacity
+    provider.create_instance.side_effect = _create
     config = _make_config(gpu_type_id="A", provision_retries=3, backoff_base_seconds=600)
-    shutdown.request()
     import time as _t
     t0 = _t.time()
     with patch("conductor.provisioner.random.random", return_value=0.5):
@@ -378,3 +382,16 @@ def test_provision_retries_disabled_with_single_pass(mock_ssh):
         result = provision_pod(provider, config, _make_pod())
     assert result.status == "failed" and result.error == "All GPU types exhausted"
     mock_wait.assert_not_called()
+
+
+@patch("conductor.provisioner.wait_ssh", return_value=True)
+def test_provision_creates_nothing_once_shutdown_requested(mock_ssh):
+    """A budget stop or Ctrl-C must never be followed by another create."""
+    import pytest
+    from conductor import shutdown
+    from conductor.shutdown import Interrupted
+    provider = _mock_provider()
+    shutdown.request()
+    with pytest.raises(Interrupted):
+        provision_pod(provider, _make_config(gpu_type_id="A"), _make_pod())
+    provider.create_instance.assert_not_called()

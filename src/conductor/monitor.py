@@ -23,8 +23,8 @@ from conductor.runner import LOG_TAIL_LINES, fetch_log_tail, get_log_path, get_u
 from conductor.shutdown import Interrupted
 from conductor.ssh import wait_ssh
 from conductor.state import (
-    PodState, RunState, accrue_cost, append_cost_event, elapsed_seconds, get_job, pod_name_for,
-    record_pod_stopped, save_state,
+    LIVE_STATUSES, PodState, RunState, accrue_cost, append_cost_event, budget_exceeded,
+    elapsed_seconds, get_job, pod_name_for, record_pod_stopped, save_state,
 )
 from conductor.syncer import sync_pull, sync_push
 
@@ -37,18 +37,25 @@ HEARTBEAT_INTERVAL = POLL_INTERVAL / 2
 class Heartbeat:
     """Daemon thread that refreshes state.heartbeat_at every `interval`
     seconds for the whole lifecycle, so the run reads as live even while the
-    main thread is blocked for minutes in provision/deploy/launch."""
+    main thread is blocked for minutes in provision/deploy/launch. on_beat
+    (the budget watchdog) runs before each save."""
 
     def __init__(self, state: RunState, state_path: str,
-                 interval: float = HEARTBEAT_INTERVAL, clock=time.time):
+                 interval: float = HEARTBEAT_INTERVAL, clock=time.time, on_beat=None):
         self.state = state
         self.state_path = state_path
         self.interval = interval
         self.clock = clock
+        self.on_beat = on_beat
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="conductor-heartbeat", daemon=True)
 
     def beat(self) -> None:
+        if self.on_beat is not None:
+            try:
+                self.on_beat()
+            except Exception as e:
+                log.warning(f"Budget watchdog failed: {describe(e)}")
         self.state.heartbeat_at = self.clock()
         save_state(self.state, self.state_path)
 
@@ -95,7 +102,8 @@ def run_lifecycle(
     prev_handler = signal.signal(signal.SIGINT, make_sigint_handler(shutdown, state))
 
     state.orchestrator_pid = os.getpid()
-    heartbeat = Heartbeat(state, state_path, interval=heartbeat_interval)
+    heartbeat = Heartbeat(state, state_path, interval=heartbeat_interval,
+                          on_beat=make_budget_watchdog(state, shutdown))
     try:
         heartbeat.start()
 
@@ -115,16 +123,18 @@ def run_lifecycle(
             if shutdown["requested"]:
                 break
 
-            # Check global budget
-            if state.budget_usd > 0 and state.total_cost_usd >= state.budget_usd:
-                log.warning("Global budget exceeded! Tearing down all pods.")
-                _teardown_all(configs, config_map, provider_map, state, state_path, cost_log_path, reason="budget_exceeded")
+            # The watchdog checks every heartbeat; this catches a breach
+            # caused by the tick's own accrual without waiting for it
+            if budget_exceeded(state):
+                _request_budget_stop(state, shutdown)
                 break
 
             _print_status(state)
             _sleep_unless(shutdown, POLL_INTERVAL)
 
-        if shutdown["requested"]:
+        if shutdown.get("budget"):
+            _budget_stop(configs, config_map, provider_map, state, state_path, cost_log_path)
+        elif shutdown["requested"]:
             if shutdown["teardown"]:
                 _graceful_shutdown(configs, config_map, provider_map, state, state_path, cost_log_path)
             else:
@@ -144,17 +154,69 @@ def run_lifecycle(
     return state
 
 
+def make_budget_watchdog(state: RunState, shutdown: dict):
+    """Runs on the heartbeat thread: accrues cost for every live pod and, on
+    a budget breach, requests a forced teardown. Blocking waits in the
+    pipeline (SSH, provider polling, setup, backoffs) abort on the shutdown
+    flag as they do for Ctrl-C, so the stop never waits for a long
+    provision or setup; the main thread then tears everything down."""
+    def _check() -> None:
+        for job in state.jobs:
+            if job.pod_id and job.status in LIVE_STATUSES:
+                accrue_cost(job, state)
+        if budget_exceeded(state) and not shutdown.get("budget"):
+            _request_budget_stop(state, shutdown)
+    return _check
+
+
+def _request_budget_stop(state: RunState, shutdown: dict) -> None:
+    if shutdown.get("budget"):
+        return
+    log.warning(f"Global budget exceeded (${state.total_cost_usd:.2f} >= ${state.budget_usd:.2f}): "
+                f"stopping and tearing down all pods")
+    shutdown["budget"] = True
+    shutdown["teardown"] = True
+    shutdown["requested"] = True
+    shutdown_flag.request()
+
+
+def _budget_stop(
+    configs: list[JobConfig],
+    config_map: dict[str, JobConfig],
+    provider_map: dict[str, CloudProvider],
+    state: RunState,
+    state_path: str,
+    cost_log_path: str,
+) -> None:
+    log.warning(f"Budget stop: tearing down all live pods (spent ${state.total_cost_usd:.2f} "
+                f"of ${state.budget_usd:.2f})")
+    _teardown_all(configs, config_map, provider_map, state, state_path, cost_log_path,
+                  reason="budget_exceeded")
+    notified = set()
+    for cfg in configs:
+        if cfg.notifications and id(cfg.notifications) not in notified:
+            notified.add(id(cfg.notifications))
+            send_notification(cfg.notifications, "budget_exceeded",
+                              total_cost=state.total_cost_usd, budget=state.budget_usd)
+
+
 def make_sigint_handler(shutdown: dict, state: RunState, hard_exit=os._exit):
     """First Ctrl-C: stop after the current step (detach, or tear down when
     shutdown["teardown"] is set). Second Ctrl-C: print the live pod IDs and
-    hard-exit; the pods and their IDs are already persisted."""
+    hard-exit; the pods and their IDs are already persisted. A budget stop
+    in progress does not count as the first Ctrl-C."""
     def _handler(sig, frame):
-        if shutdown["requested"]:
+        if shutdown.get("sigint"):
             print_live_pods(live_pods(state),
                             header="Force quit. These pods are STILL RUNNING and billing:")
             print("Resume with 'conductor run --force' or terminate with "
                   "'conductor teardown --force'.", file=sys.stderr)
             hard_exit(130)
+            return
+        shutdown["sigint"] = True
+        if shutdown.get("budget"):
+            log.warning("Ctrl-C: a budget stop is already tearing down all pods "
+                        "(press again to force quit)")
             return
         shutdown["requested"] = True
         # Wakes any pipeline thread blocked in an SSH/provider wait
@@ -968,6 +1030,9 @@ def _with_note(error: str | None, note: str) -> str:
 
 def _final_sync(config: JobConfig, job: PodState) -> bool:
     if not config.sync_paths:
+        return True
+    if job.status in ("provisioning", "deploying"):
+        # The job never started: there are no results to pull
         return True
     if not job.ssh_host:
         log.warning(f"[{job.name}] No SSH info; skipping final sync")

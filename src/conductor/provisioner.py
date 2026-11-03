@@ -165,6 +165,8 @@ def provision_pod(
         pod_state.provision_attempts += 1
         no_capacity = []
         for gpu_id in gpu_candidates:
+            # Never create another pod once shutdown (Ctrl-C, budget stop) is requested
+            shutdown.check(f"provisioning of {cfg.name}")
             try:
                 record = _provision_candidate(provider, cfg, gpu_id, run_id, _created, on_released)
             except NoCapacityError as e:
