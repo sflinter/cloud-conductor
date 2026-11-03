@@ -75,13 +75,13 @@ def test_deploy_image_mode_runs_setup(mock_ssh, mock_rsync):
 
 @patch("conductor.deployer.rsync")
 @patch("conductor.deployer.ssh_exec")
-def test_deploy_image_mode_upload_paths(mock_ssh, mock_rsync):
+def test_deploy_image_mode_upload_paths(mock_ssh, mock_rsync, tmp_dir):
     from conductor.config import SyncPath
     mock_ssh.return_value = subprocess.CompletedProcess([], 0, stdout="", stderr="")
     mock_rsync.return_value = subprocess.CompletedProcess([], 0)
     config = _make_config(
         deploy_method="image", setup_command="",
-        upload_paths=[SyncPath(local="/local/seed/", remote="models/seed/")],
+        upload_paths=[SyncPath(local=tmp_dir + "/", remote="models/seed/")],
     )
     pod = _make_pod()
     assert deploy(config, pod) is True
@@ -283,3 +283,54 @@ def test_deploy_records_failed_setup_exit_code(mock_ssh, mock_rsync):
     pod = _make_pod()
     assert deploy(_make_config(), pod) is False
     assert pod.setup_exit_code == 1 and "setup_done" in pod.deploy_steps
+
+
+# --- upload_paths sources -----------------------------------------------------
+
+@patch("conductor.deployer.rsync")
+@patch("conductor.deployer.ssh_exec")
+def test_missing_upload_file_is_skipped_not_fatal(mock_ssh, mock_rsync, tmp_dir, caplog):
+    import os
+    from conductor.config import SyncPath
+    mock_ssh.side_effect = _fake_ssh()
+    mock_rsync.return_value = subprocess.CompletedProcess([], 0)
+    missing = os.path.join(tmp_dir, "nope.pkl")
+    config = _make_config(setup_command="", upload_paths=[SyncPath(local=missing, remote="seed.pkl")])
+    assert deploy(config, _make_pod()) is True
+    assert mock_rsync.call_count == 1            # the code sync only
+    assert not os.path.exists(missing)
+    assert "does not exist; skipping" in caplog.text
+
+
+@patch("conductor.deployer.rsync")
+@patch("conductor.deployer.ssh_exec")
+def test_missing_upload_dir_is_created_and_uploaded(mock_ssh, mock_rsync, tmp_dir):
+    import os
+    from conductor.config import SyncPath
+    mock_ssh.side_effect = _fake_ssh()
+    mock_rsync.return_value = subprocess.CompletedProcess([], 0)
+    missing = os.path.join(tmp_dir, "models", "run_1x") + "/"
+    config = _make_config(setup_command="",
+                          upload_paths=[SyncPath(local=missing, remote="models/run_1x/")])
+    assert deploy(config, _make_pod()) is True
+    assert os.path.isdir(missing)
+    src, dst = mock_rsync.call_args_list[1][0][:2]
+    assert src == missing and dst == "/workspace/proj/models/run_1x/"
+
+
+@patch("conductor.deployer.rsync")
+@patch("conductor.deployer.ssh_exec")
+def test_upload_single_file_goes_to_remote_file_path(mock_ssh, mock_rsync, tmp_dir):
+    import os
+    from conductor.config import SyncPath
+    calls = []
+    mock_ssh.side_effect = _fake_ssh(calls=calls)
+    mock_rsync.return_value = subprocess.CompletedProcess([], 0)
+    f = os.path.join(tmp_dir, "params.pkl")
+    open(f, "w").close()
+    config = _make_config(setup_command="",
+                          upload_paths=[SyncPath(local=f, remote="seed/params.pkl")])
+    assert deploy(config, _make_pod()) is True
+    src, dst = mock_rsync.call_args_list[1][0][:2]
+    assert (src, dst) == (f, "/workspace/proj/seed/params.pkl")
+    assert "mkdir -p /workspace/proj/seed" in calls

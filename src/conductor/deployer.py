@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 
 from conductor import shutdown
@@ -154,16 +155,38 @@ def _install_rsync(name: str, host: str, port: int, key: str) -> bool:
 
 
 def _upload_paths(config, host: str, port: int, key: str) -> bool:
+    """Push each upload_paths entry. A local source that does not exist
+    never fails the deploy: a directory path (ending in '/') is created
+    empty and uploaded, anything else is skipped with a warning. A file is
+    uploaded as itself; a directory's contents go into the remote dir."""
     if not config.upload_paths:
         return True
     remote_base = config.remote_project_dir.rstrip("/")
     for up in config.upload_paths:
         remote = f"{remote_base}/{up.remote}"
-        src = up.local.rstrip("/") + "/"
-        ssh_exec(host, port, key, f"mkdir -p {remote}")
-        log.info(f"[{config.name}] Uploading {src} → {remote}")
-        result = rsync(src, remote.rstrip("/") + "/", host, port, key,
-                       timeout=config.deploy_timeout_seconds)
+        local = up.local
+        if not os.path.exists(local):
+            if local.endswith("/"):
+                log.warning(f"[{config.name}] upload_paths source {local} does not exist; "
+                            f"creating it empty")
+                try:
+                    os.makedirs(local, exist_ok=True)
+                except OSError as e:
+                    log.warning(f"[{config.name}] Could not create {local} ({e}); skipping it")
+                    continue
+            else:
+                log.warning(f"[{config.name}] upload_paths source {local} does not exist; skipping it")
+                continue
+        if os.path.isfile(local):
+            # remote ending in '/' is the directory to put the file in
+            parent = remote.rstrip("/") if remote.endswith("/") else os.path.dirname(remote)
+            src, dst = local, remote
+        else:
+            parent = remote.rstrip("/")
+            src, dst = local.rstrip("/") + "/", remote.rstrip("/") + "/"
+        ssh_exec(host, port, key, f"mkdir -p {parent}")
+        log.info(f"[{config.name}] Uploading {src} → {dst}")
+        result = rsync(src, dst, host, port, key, timeout=config.deploy_timeout_seconds)
         if result.returncode != 0:
             log.error(f"[{config.name}] Upload failed for {up.local}: {result.stderr}")
             return False
