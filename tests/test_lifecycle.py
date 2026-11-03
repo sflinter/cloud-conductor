@@ -983,3 +983,73 @@ def test_reset_job_for_retry_clears_deploy_progress():
     job = PodState(name="a", status="failed", pod_id="p", deploy_steps=["synced"], setup_exit_code=3)
     reset_job_for_retry(job, keep_pod=True)
     assert job.deploy_steps == [] and job.setup_exit_code is None
+
+
+# --- spot recovery push ordering ---------------------------------------------
+
+@patch("conductor.monitor.send_notification", return_value=False)
+@patch("conductor.monitor.registry_update")
+@patch("conductor.monitor.registry_add")
+@patch("conductor.monitor.provision_pod")
+def test_spot_recover_pushes_synced_results_before_launch(mock_prov, mock_add, mock_upd, mock_notify, paths):
+    from conductor.config import SyncPath
+    from conductor.monitor import _spot_recover
+    from conductor.runner import LaunchResult
+    state_path, cost_path = paths
+    order = []
+
+    def _provision(provider, config, pod_state, run_id="", on_created=None, on_released=None):
+        pod_state.pod_id, pod_state.ssh_host, pod_state.ssh_port = "p-new", "h", 1
+        pod_state.status = "provisioning"
+        return pod_state
+    mock_prov.side_effect = _provision
+
+    def _deploy(config, job, is_reuse=False, on_step=None):
+        order.append("deploy")
+        return True
+
+    def _push(config, job):
+        order.append(("push", job.pod_id))
+        return True
+
+    def _launch(config, job):
+        order.append("launch")
+        return LaunchResult(pid=7)
+
+    provider = _provider()
+    job = PodState(name="a", status="running", pod_id="p-dead", provision_attempts=1)
+    config = _make_config(name="a", backoff_base_seconds=0,
+                          sync_paths=[SyncPath(remote="out/", local="./out/")])
+    with patch("conductor.monitor.deploy", side_effect=_deploy), \
+         patch("conductor.monitor.sync_push", side_effect=_push), \
+         patch("conductor.monitor.launch", side_effect=_launch):
+        _spot_recover(provider, job, config, RunState(jobs=[job]), state_path, cost_path)
+
+    assert order == ["deploy", ("push", "p-new"), "launch"]
+    assert job.status == "running" and not job.push_pending
+
+
+@patch("conductor.monitor.send_notification", return_value=False)
+@patch("conductor.monitor._start_unblocked_jobs")
+@patch("conductor.monitor.registry_update")
+@patch("conductor.monitor.registry_add")
+@patch("conductor.monitor.wait_ssh", return_value=True)
+def test_resumed_recovery_still_pushes_before_launch(mock_wait, mock_add, mock_upd, mock_start, mock_notify, paths):
+    """The orchestrator died between re-provisioning and launch: the push
+    is persisted and done by the resumed pipeline, still before launch."""
+    from conductor.config import SyncPath
+    from conductor.runner import LaunchResult
+    state_path, cost_path = paths
+    order = []
+    provider = _provider()
+    provider.get_ssh_info.return_value = ("h", 1)
+    job = PodState(name="a", status="deploying", pod_id="p-new", ssh_host="h", ssh_port=1,
+                   push_pending=True)
+    config = _make_config(name="a", sync_paths=[SyncPath(remote="out/", local="./out/")])
+    with patch("conductor.monitor.deploy", return_value=True), \
+         patch("conductor.monitor.sync_push", side_effect=lambda c, j: order.append("push") or True), \
+         patch("conductor.monitor.launch", side_effect=lambda c, j: order.append("launch") or LaunchResult(pid=3)):
+        _monitor_tick([config], {"a": config}, {"a": provider}, RunState(jobs=[job], run_id="r"),
+                      state_path, cost_path)
+    assert order == ["push", "launch"]
+    assert not load_state(state_path).jobs[0].push_pending

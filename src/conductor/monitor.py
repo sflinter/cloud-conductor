@@ -706,6 +706,16 @@ def _pipeline(
         return
 
     shutdown_flag.check(f"[{job.name}] deploying")
+    if job.push_pending:
+        # Spot recovery: the results synced from the lost pod must be on
+        # the new one before the job starts (and resumes from them)
+        if config.sync_paths and not sync_push(config, job):
+            log.warning(f"[{job.name}] Pushing synced results to the new pod failed; "
+                        f"launching anyway")
+        job.push_pending = False
+        with cm:
+            save_state(state, state_path)
+        shutdown_flag.check(f"[{job.name}] pushing synced results")
     _launch_job(provider, job, config, state, state_path, cm)
 
 
@@ -934,12 +944,10 @@ def _spot_recover(
     reset_deploy_progress(job)
     job.gone_confirmations = 0
 
-    # Re-provision, re-deploy, push synced results, re-launch
+    # Re-provision, re-deploy, push synced results, re-launch (the push
+    # happens in the pipeline, before launch; persisted so a resume does it too)
+    job.push_pending = bool(config.sync_paths)
     _provision_deploy_launch(provider, job, config, state, state_path, cost_log_path)
-
-    if job.status == "running" and config.sync_paths:
-        # Push previously synced results back to pod
-        sync_push(config, job)
 
 
 FINAL_SYNC_ATTEMPTS = 3

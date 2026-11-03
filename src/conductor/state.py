@@ -45,6 +45,7 @@ class PodState:
     finished_at: float | None = None  # when the pod stopped billing for this job
     deploy_steps: list[str] = field(default_factory=list)  # deploy progress on the current pod
     setup_exit_code: int | None = None   # setup_command's exit code on the current pod
+    push_pending: bool = False     # spot recovery: push sync_paths to the new pod before launch
     error: str | None = None
 
 
@@ -206,6 +207,7 @@ def reset_job_for_retry(job: PodState, keep_pod: bool = False) -> None:
     job.exit_code = None
     job.finished_at = None
     job.error = None
+    job.push_pending = False
     reset_deploy_progress(job)
 
 
