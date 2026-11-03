@@ -5,6 +5,7 @@ import contextlib
 import json
 import os
 import secrets
+import socket
 import tempfile
 import threading
 import time
@@ -57,6 +58,7 @@ class RunState:
     run_id: str = ""  # short id naming this run's pods: conductor-<run_id>-<job>
     orchestrator_pid: int | None = None  # pid of the live `conductor run`, if any
     heartbeat_at: float | None = None    # last tick of the live `conductor run`
+    orchestrator_host: str | None = None  # hostname the live `conductor run` runs on
 
 
 # Statuses in which the job's pod exists and is billing
@@ -87,16 +89,47 @@ def budget_exceeded(state: RunState) -> bool:
     return state.budget_usd > 0 and state.total_cost_usd >= state.budget_usd
 
 
+def this_host() -> str:
+    return socket.gethostname()
+
+
+def pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True   # exists, owned by someone else
+    except OSError:
+        return True   # cannot tell: assume alive
+    return True
+
+
+def orchestrator_dead(state: RunState) -> bool:
+    """True only when the recorded orchestrator ran on this host and its
+    pid no longer exists (a hard exit leaves a fresh heartbeat behind).
+    A run on another host cannot be checked and is never called dead."""
+    return bool(state.orchestrator_pid and state.orchestrator_host
+                and state.orchestrator_host == this_host()
+                and not pid_alive(state.orchestrator_pid))
+
+
 def run_is_live(state: RunState, poll_interval: float = 30.0, now: float | None = None) -> bool:
     """True if an orchestrator has heart-beaten this state within the last
-    two poll intervals. A detached or finished run clears its heartbeat."""
+    two poll intervals and is not known to be dead. A detached or finished
+    run clears its heartbeat."""
     if not state.heartbeat_at:
         return False
     now = time.time() if now is None else now
-    return (now - state.heartbeat_at) < 2 * poll_interval
+    if (now - state.heartbeat_at) >= 2 * poll_interval:
+        return False
+    return not orchestrator_dead(state)
 
 
 def describe_owner(state: RunState, poll_interval: float = 30.0) -> str:
+    if state.heartbeat_at and orchestrator_dead(state):
+        return (f"not running (orchestrator pid {state.orchestrator_pid} on this host is gone; "
+                f"crashed or hard-killed)")
     if run_is_live(state, poll_interval):
         age = int(time.time() - state.heartbeat_at)
         return f"live (pid {state.orchestrator_pid}, heartbeat {age}s ago)"
@@ -131,6 +164,7 @@ def load_state(path: str, lock: bool = True) -> RunState:
         run_id=data.get("run_id", ""),
         orchestrator_pid=data.get("orchestrator_pid"),
         heartbeat_at=data.get("heartbeat_at"),
+        orchestrator_host=data.get("orchestrator_host"),
     )
 
 
@@ -147,6 +181,7 @@ def _save_state_unlocked(state: RunState, path: str, lock: bool) -> None:
         "run_id": state.run_id,
         "orchestrator_pid": state.orchestrator_pid,
         "heartbeat_at": state.heartbeat_at,
+        "orchestrator_host": state.orchestrator_host,
     }
     dir_name = os.path.dirname(path) or "."
     with locked(path) if lock else contextlib.nullcontext():

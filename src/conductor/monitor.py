@@ -25,6 +25,7 @@ from conductor.ssh import wait_ssh
 from conductor.state import (
     LIVE_STATUSES, PodState, RunState, accrue_cost, append_cost_event, budget_exceeded,
     elapsed_seconds, get_job, pod_name_for, record_pod_stopped, reset_deploy_progress, save_state,
+    this_host,
 )
 from conductor.syncer import sync_pull, sync_push
 
@@ -102,6 +103,7 @@ def run_lifecycle(
     prev_handler = signal.signal(signal.SIGINT, make_sigint_handler(shutdown, state))
 
     state.orchestrator_pid = os.getpid()
+    state.orchestrator_host = this_host()
     heartbeat = Heartbeat(state, state_path, interval=heartbeat_interval,
                           on_beat=make_budget_watchdog(state, shutdown))
     try:
@@ -148,6 +150,7 @@ def run_lifecycle(
         heartbeat.stop()
         # This process no longer owns the run, whatever the exit path
         state.orchestrator_pid = None
+        state.orchestrator_host = None
         state.heartbeat_at = None
         save_state(state, state_path)
 

@@ -407,6 +407,26 @@ def test_run_refuses_when_live(tmp_dir, monkeypatch, capsys):
     lifecycle.assert_called_once()
 
 
+def test_run_proceeds_after_hard_exit_with_fresh_heartbeat(tmp_dir, monkeypatch):
+    """Second Ctrl-C hard-exits leaving a fresh heartbeat; the dead pid on
+    this host means the next run need not wait out the heartbeat."""
+    import subprocess
+    from unittest.mock import MagicMock
+    from conductor.state import load_state, save_state, this_host
+    config_path, state_path = _live_fixture(tmp_dir)
+    dead = subprocess.Popen(["true"])
+    dead.wait()
+    state = load_state(state_path)
+    state.orchestrator_pid = dead.pid
+    state.orchestrator_host = this_host()
+    save_state(state, state_path)
+    monkeypatch.setattr("conductor.cli._configure_provider", lambda name: MagicMock())
+    lifecycle = MagicMock()
+    monkeypatch.setattr("conductor.cli.run_lifecycle", lifecycle)
+    main(["run", "--config", config_path])
+    lifecycle.assert_called_once()
+
+
 def test_run_proceeds_when_heartbeat_stale(tmp_dir, monkeypatch):
     from unittest.mock import MagicMock
     config_path, _ = _live_fixture(tmp_dir, fresh=False)

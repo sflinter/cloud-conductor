@@ -202,3 +202,41 @@ def test_reset_job_for_retry_clears_finished_at():
     job = PodState(name="a", status="failed", pod_id="p", started_at=1.0, finished_at=2.0)
     reset_job_for_retry(job, keep_pod=True)
     assert job.finished_at is None and job.pod_id == "p"
+
+
+def _dead_pid() -> int:
+    import subprocess
+    p = subprocess.Popen(["true"])
+    p.wait()
+    return p.pid
+
+
+def test_run_is_live_false_when_orchestrator_pid_dead_on_this_host(tmp_dir):
+    import time
+    from conductor.state import describe_owner, run_is_live, this_host
+    state = RunState(jobs=[], run_id="abc123", orchestrator_pid=_dead_pid(),
+                     orchestrator_host=this_host(), heartbeat_at=time.time() - 2)
+    assert run_is_live(state, poll_interval=30) is False
+    assert "is gone" in describe_owner(state)
+    path = os.path.join(tmp_dir, "state.json")
+    save_state(state, path)
+    assert load_state(path).orchestrator_host == this_host()
+
+
+def test_run_is_live_true_when_orchestrator_pid_alive_on_this_host():
+    import time
+    from conductor.state import run_is_live, this_host
+    state = RunState(jobs=[], orchestrator_pid=os.getpid(), orchestrator_host=this_host(),
+                     heartbeat_at=time.time() - 2)
+    assert run_is_live(state, poll_interval=30) is True
+
+
+def test_run_is_live_trusts_heartbeat_from_another_host():
+    import time
+    from conductor.state import run_is_live
+    state = RunState(jobs=[], orchestrator_pid=_dead_pid(), orchestrator_host="some-other-host.invalid",
+                     heartbeat_at=time.time() - 2)
+    assert run_is_live(state, poll_interval=30) is True
+    # older state files carry no host: the heartbeat alone decides
+    state.orchestrator_host = None
+    assert run_is_live(state, poll_interval=30) is True
