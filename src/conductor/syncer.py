@@ -7,7 +7,7 @@ import re
 import subprocess
 
 from conductor.config import JobConfig
-from conductor.ssh import rsync_pull, rsync
+from conductor.ssh import rsync, rsync_pull, ssh_exec
 from conductor.state import PodState
 
 log = logging.getLogger(__name__)
@@ -70,8 +70,25 @@ def sync_pull(config: JobConfig, pod_state: PodState) -> bool:
     return all_ok
 
 
+def push_spec(remote_base: str, sp) -> tuple[str, str, str]:
+    """(local source, remote destination, remote dir to create) for pushing
+    a sync_paths entry back to the pod: the inverse of sync_pull, which
+    always pulls into the local directory. A remote ending in '/' is a
+    directory whose contents were pulled into `local`; anything else (a
+    file, or a directory named without a trailing '/') was pulled into
+    `local` under its own name, so that item is pushed to the remote's
+    parent directory."""
+    remote = f"{remote_base}/{sp.remote}"
+    if sp.remote.endswith("/"):
+        return sp.local.rstrip("/") + "/", remote, remote.rstrip("/")
+    name = os.path.basename(sp.remote.rstrip("/"))
+    parent = os.path.dirname(remote.rstrip("/"))
+    return os.path.join(sp.local, name), parent + "/", parent
+
+
 def sync_push(config: JobConfig, pod_state: PodState) -> bool:
-    """Push local synced results back to pod (for spot recovery)."""
+    """Push local synced results back to the pod (spot recovery). An entry
+    with nothing synced locally yet is skipped."""
     if not config.sync_paths:
         return True
 
@@ -82,13 +99,13 @@ def sync_push(config: JobConfig, pod_state: PodState) -> bool:
     all_ok = True
 
     for sp in config.sync_paths:
-        local = sp.local
-        if not os.path.exists(local):
+        src, dst, remote_dir = push_spec(remote_base, sp)
+        if not os.path.exists(src.rstrip("/") or src):
+            log.info(f"[{config.name}] Nothing to push for {sp.remote}: {src} does not exist locally")
             continue
-        remote = f"{remote_base}/{sp.remote}"
-        src = local.rstrip("/") + "/"
-        log.info(f"[{config.name}] Pushing {src} → {remote}")
-        result = rsync(src, remote, host, port, key, timeout=config.sync_timeout_seconds)
+        ssh_exec(host, port, key, f"mkdir -p {remote_dir}")
+        log.info(f"[{config.name}] Pushing {src} → {dst}")
+        result = rsync(src, dst, host, port, key, timeout=config.sync_timeout_seconds)
         if result.returncode != 0:
             log.warning(f"[{config.name}] Push failed for {sp.remote}: {result.stderr}")
             all_ok = False

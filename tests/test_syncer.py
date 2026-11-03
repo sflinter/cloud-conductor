@@ -40,9 +40,10 @@ def test_sync_pull_empty():
     assert sync_pull(config, pod) is True
 
 
+@patch("conductor.syncer.ssh_exec")
 @patch("conductor.syncer.rsync")
 @patch("conductor.syncer.os.path.exists", return_value=True)
-def test_sync_push(mock_exists, mock_rsync):
+def test_sync_push(mock_exists, mock_rsync, mock_ssh):
     mock_rsync.return_value = subprocess.CompletedProcess([], 0)
     config = _make_config(sync_paths=[
         SyncPath(remote="output/", local="./results/"),
@@ -122,3 +123,53 @@ def test_sync_pull_one_failure_fails_the_sync(mock_mkdir, mock_rsync):
     ])
     assert sync_pull(config, _make_pod()) is False
     assert mock_rsync.call_count == 3
+
+
+@patch("conductor.syncer.ssh_exec")
+@patch("conductor.syncer.rsync")
+def test_sync_push_file_and_directory_entries(mock_rsync, mock_ssh, tmp_dir):
+    """A file entry was pulled into the local directory under its own name:
+    push that file to the remote file path, not the whole local directory
+    ("destination must be a directory when copying more than 1 file")."""
+    import os
+    mock_rsync.return_value = subprocess.CompletedProcess([], 0)
+    mock_ssh.return_value = subprocess.CompletedProcess([], 0)
+    logs = os.path.join(tmp_dir, "logs") + "/"
+    results = os.path.join(tmp_dir, "results") + "/"
+    os.makedirs(logs)
+    os.makedirs(results)
+    for f in ("train.log", "other.txt"):
+        open(os.path.join(logs, f), "w").close()
+    open(os.path.join(results, "ckpt.pt"), "w").close()
+    config = _make_config(sync_paths=[
+        SyncPath(remote="out/train.log", local=logs),
+        SyncPath(remote="output/", local=results),
+    ])
+    assert sync_push(config, _make_pod()) is True
+
+    (f_src, f_dst), (d_src, d_dst) = [c[0][:2] for c in mock_rsync.call_args_list]
+    assert f_src == os.path.join(logs, "train.log")
+    assert f_dst == "/workspace/proj/out/"          # lands as /workspace/proj/out/train.log
+    assert d_src == results and d_dst == "/workspace/proj/output/"
+    mkdirs = [c[0][3] for c in mock_ssh.call_args_list]
+    assert mkdirs == ["mkdir -p /workspace/proj/out", "mkdir -p /workspace/proj/output"]
+
+
+@patch("conductor.syncer.ssh_exec")
+@patch("conductor.syncer.rsync")
+def test_sync_push_skips_entries_never_synced(mock_rsync, mock_ssh, tmp_dir):
+    import os
+    config = _make_config(sync_paths=[
+        SyncPath(remote="out/train.log", local=os.path.join(tmp_dir, "logs") + "/"),
+        SyncPath(remote="output/", local=os.path.join(tmp_dir, "missing") + "/"),
+    ])
+    assert sync_push(config, _make_pod()) is True
+    mock_rsync.assert_not_called()
+    mock_ssh.assert_not_called()
+
+
+def test_push_spec_is_inverse_of_pull():
+    from conductor.syncer import push_spec
+    assert push_spec("/w", SyncPath(remote="a/b/", local="./x/")) == ("./x/", "/w/a/b/", "/w/a/b")
+    assert push_spec("/w", SyncPath(remote="a/f.log", local="./x/")) == ("./x/f.log", "/w/a/", "/w/a")
+    assert push_spec("/w", SyncPath(remote="models", local="./x")) == ("./x/models", "/w/", "/w")
